@@ -238,9 +238,14 @@ class PlayKeychainDB: NSObject {
     private func connectToDB() -> OpaquePointer? {
         var sqlite3DB: OpaquePointer?
         let bundleID = Bundle.main.infoDictionary?["CFBundleIdentifier"] as? String ?? "Shared"
-        let keychainDB = URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")
+        let playChainDir = URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")
             .appendingPathComponent("PlayChain")
-            .appendingPathComponent("\(bundleID).db")
+        do {
+            try FileManager.default.createDirectory(at: playChainDir, withIntermediateDirectories: true)
+        } catch {
+            PlayKeychain.debugLogger("Failed to create PlayChain directory: \(error)")
+        }
+        let keychainDB = playChainDir.appendingPathComponent("\(bundleID).db")
 
         let alreadyCreated = FileManager.default.fileExists(atPath: keychainDB.path)
 

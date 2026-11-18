@@ -7,6 +7,8 @@
 
 #import "NSObject+Swizzle.h"
 #import <objc/runtime.h>
+#import <dlfcn.h>
+#import <os/lock.h>
 #import "CoreGraphics/CoreGraphics.h"
 #import "UIKit/UIKit.h"
 #import <PlayTools/PlayTools-Swift.h>
@@ -25,9 +27,15 @@ __attribute__((visibility("hidden")))
 - (void) swizzleInstanceMethod:(SEL)origSelector withMethod:(SEL)newSelector
 {
     Class cls = [self class];
+    if (!cls) {
+        return;
+    }
     // If current class doesn't exist selector, then get super
     Method originalMethod = class_getInstanceMethod(cls, origSelector);
     Method swizzledMethod = class_getInstanceMethod(cls, newSelector);
+    if (!originalMethod || !swizzledMethod) {
+        return;
+    }
     
     // Add selector if it doesn't exist, implement append with method
     if (class_addMethod(cls,
@@ -56,17 +64,29 @@ __attribute__((visibility("hidden")))
 - (void) swizzleExchangeMethod:(SEL)origSelector withMethod:(SEL)newSelector
 {
     Class cls = [self class];
+    if (!cls) {
+        return;
+    }
     // If current class doesn't exist selector, then get super
     Method originalMethod = class_getInstanceMethod(cls, origSelector);
     Method swizzledMethod = class_getInstanceMethod(cls, newSelector);
+    if (!originalMethod || !swizzledMethod) {
+        return;
+    }
     
     method_exchangeImplementations(originalMethod, swizzledMethod);
 }
 
 + (void) swizzleClassMethod:(SEL)origSelector withMethod:(SEL)newSelector {
     Class cls = object_getClass((id)self);
+    if (!cls) {
+        return;
+    }
     Method originalMethod = class_getClassMethod(cls, origSelector);
     Method swizzledMethod = class_getClassMethod(cls, newSelector);
+    if (!originalMethod || !swizzledMethod) {
+        return;
+    }
 
     if (class_addMethod(cls,
                         origSelector,
@@ -151,6 +171,401 @@ __attribute__((visibility("hidden")))
 
 - (CGRect) hook_boundsResizable {
     return [PlayScreen boundsResizable:[self hook_boundsResizable]];
+}
+
+- (CGRect) hook_nativeBoundsResizable {
+    return [PlayScreen nativeBoundsResizable:[self hook_nativeBoundsResizable]];
+}
+
+- (void) hook_uiwindow_layoutSubviews {
+    [self hook_uiwindow_layoutSubviews];
+    if ([self isKindOfClass:[UIWindow class]]) {
+        [PlayScreen onWindowLayoutSubviews:(UIWindow *)self];
+    }
+}
+
+- (void) hook_uiwindow_setFrame:(CGRect)frame {
+    if ([self isKindOfClass:[UIWindow class]]
+        && [PlayScreen interceptWindowSetFrame:(UIWindow *)self frame:frame]) {
+        return;
+    }
+    [self hook_uiwindow_setFrame:frame];
+}
+
+- (void) hook_uiwindow_setBounds:(CGRect)bounds {
+    if ([self isKindOfClass:[UIWindow class]]
+        && [PlayScreen interceptWindowSetBounds:(UIWindow *)self bounds:bounds]) {
+        return;
+    }
+    [self hook_uiwindow_setBounds:bounds];
+}
+
+- (void) hook_uiwindow_setRootViewController:(UIViewController *)rootViewController {
+    if ([self isKindOfClass:[UIWindow class]]) {
+        [PlayScreen onWindowWillSetRootViewController:(UIWindow *)self];
+    }
+    [self hook_uiwindow_setRootViewController:rootViewController];
+}
+
+- (void) hook_uiwindow_didAddSubview:(UIView *)subview {
+    [self hook_uiwindow_didAddSubview:subview];
+    if ([self isKindOfClass:[UIWindow class]] && subview) {
+        [PlayScreen onWindow:(UIWindow *)self didAddSubview:subview];
+    }
+}
+
+- (void) hook_vc_viewWillLayoutSubviews {
+    [self hook_vc_viewWillLayoutSubviews];
+    if ([self isKindOfClass:[UIViewController class]]) {
+        [PlayScreen onViewControllerLayout:(UIViewController *)self];
+    }
+}
+
+- (void) hook_vc_viewDidAppear:(BOOL)animated {
+    [self hook_vc_viewDidAppear:animated];
+    if ([self isKindOfClass:[UIViewController class]]) {
+        [PlayScreen onViewControllerLayout:(UIViewController *)self];
+    }
+}
+
+typedef CGSize (*PTLayoutContentSizeIMP)(id, SEL);
+typedef void (*PTLayoutPrepareIMP)(id, SEL);
+
+static os_unfair_lock sCustomLayoutHookLock = OS_UNFAIR_LOCK_INIT;
+static Method sBaseLayoutPrepareMethod = NULL;
+static Method sBaseLayoutContentSizeMethod = NULL;
+
+static NSMutableSet<NSValue *> *PTCheckedLayoutClasses(void) {
+    static NSMutableSet<NSValue *> *set = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        set = [NSMutableSet set];
+    });
+    return set;
+}
+
+static NSMutableSet<NSValue *> *PTHookedCustomLayoutClasses(void) {
+    static NSMutableSet<NSValue *> *set = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        set = [NSMutableSet set];
+    });
+    return set;
+}
+
+static NSMutableSet<NSValue *> *PTHookedLayoutMethods(void) {
+    static NSMutableSet<NSValue *> *set = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        set = [NSMutableSet set];
+    });
+    return set;
+}
+
+static NSHashTable *PTPreparedLayouts(void) {
+    static NSHashTable *table = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        table = [NSHashTable weakObjectsHashTable];
+    });
+    return table;
+}
+
+static NSHashTable *PTCurrentlyPreparingLayouts(void) {
+    static NSHashTable *table = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        table = [NSHashTable weakObjectsHashTable];
+    });
+    return table;
+}
+
+static NSMapTable<UICollectionViewLayout *, NSValue *> *PTPrimedLayoutBounds(void) {
+    static NSMapTable<UICollectionViewLayout *, NSValue *> *map = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        map = [NSMapTable weakToStrongObjectsMapTable];
+    });
+    return map;
+}
+
+static NSMapTable<UICollectionViewLayout *, NSValue *> *PTLayoutSubviewsInvalidatedBounds(void) {
+    static NSMapTable<UICollectionViewLayout *, NSValue *> *map = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        map = [NSMapTable weakToStrongObjectsMapTable];
+    });
+    return map;
+}
+
+static NSMutableSet<NSValue *> *PTActiveLazyLayoutCalculations(void) {
+    static NSMutableSet<NSValue *> *active = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        active = [NSMutableSet set];
+    });
+    return active;
+}
+
+static BOOL PTCollectionViewHasAnyItems(UICollectionView *cv) {
+    NSInteger sections = [cv numberOfSections];
+    for (NSInteger s = 0; s < sections; s++) {
+        if ([cv numberOfItemsInSection:s] > 0) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL PTShouldPrimeLayoutAtSize(UICollectionViewLayout *layout, CGSize size) {
+    NSValue *primedVal = [PTPrimedLayoutBounds() objectForKey:layout];
+    if (!primedVal) {
+        return YES;
+    }
+    CGSize prev = [primedVal CGSizeValue];
+    return (fabs(prev.width - size.width) > 0.5 || fabs(prev.height - size.height) > 0.5);
+}
+
+static BOOL PTShouldInvalidateInLayoutSubviews(UICollectionViewLayout *layout, CGSize size) {
+    NSValue *prevVal = [PTLayoutSubviewsInvalidatedBounds() objectForKey:layout];
+    if (!prevVal) {
+        return YES;
+    }
+    CGSize prev = [prevVal CGSizeValue];
+    return (fabs(prev.width - size.width) > 0.5 || fabs(prev.height - size.height) > 0.5);
+}
+
+static BOOL PTIsSystemOrPlayToolsIMP(IMP imp) {
+    if (!imp) {
+        return YES;
+    }
+    Dl_info info;
+    if (dladdr((const void *)imp, &info) == 0 || !info.dli_fname) {
+        return YES;
+    }
+    static const void *sSelfBase = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Dl_info selfInfo;
+        if (dladdr((const void *)&PTIsSystemOrPlayToolsIMP, &selfInfo) != 0) {
+            sSelfBase = selfInfo.dli_fbase;
+        }
+    });
+    if (sSelfBase && info.dli_fbase == sSelfBase) {
+        return YES;
+    }
+    NSString *fname = [NSString stringWithUTF8String:info.dli_fname];
+    if ([fname hasPrefix:@"/System/"] ||
+        [fname hasPrefix:@"/usr/lib/"] ||
+        [fname hasPrefix:@"/Library/Apple/"]) {
+        return YES;
+    }
+    return NO;
+}
+
+static BOOL PTIsHookedCustomLayout(UICollectionViewLayout *layout) {
+    if (!layout) {
+        return NO;
+    }
+    Class cls = [layout class];
+    if (!cls) {
+        return NO;
+    }
+    NSValue *clsKey = [NSValue valueWithPointer:(__bridge const void *)cls];
+    os_unfair_lock_lock(&sCustomLayoutHookLock);
+    BOOL hooked = [PTHookedCustomLayoutClasses() containsObject:clsKey];
+    os_unfair_lock_unlock(&sCustomLayoutHookLock);
+    return hooked;
+}
+
+static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *layout) {
+    if (!layout || ![layout isKindOfClass:[UICollectionViewLayout class]]) {
+        return;
+    }
+    Class cls = [layout class];
+    if (!cls) {
+        return;
+    }
+    NSValue *clsKey = [NSValue valueWithPointer:(__bridge const void *)cls];
+    os_unfair_lock_lock(&sCustomLayoutHookLock);
+    if ([PTCheckedLayoutClasses() containsObject:clsKey]) {
+        os_unfair_lock_unlock(&sCustomLayoutHookLock);
+        return;
+    }
+
+    SEL csSel = @selector(collectionViewContentSize);
+    Method csMethod = class_getInstanceMethod(cls, csSel);
+    if (!csMethod || csMethod == sBaseLayoutContentSizeMethod) {
+        [PTCheckedLayoutClasses() addObject:clsKey];
+        os_unfair_lock_unlock(&sCustomLayoutHookLock);
+        return;
+    }
+
+    NSValue *csMethodKey = [NSValue valueWithPointer:(const void *)csMethod];
+    BOOL hasCustomCS = [PTHookedLayoutMethods() containsObject:csMethodKey];
+    if (!hasCustomCS) {
+        IMP csImp = method_getImplementation(csMethod);
+        if (PTIsSystemOrPlayToolsIMP(csImp)) {
+            [PTCheckedLayoutClasses() addObject:clsKey];
+            os_unfair_lock_unlock(&sCustomLayoutHookLock);
+            return;
+        }
+        PTLayoutContentSizeIMP origContentSize = (PTLayoutContentSizeIMP)csImp;
+        IMP wrappedCS = imp_implementationWithBlock(^CGSize(UICollectionViewLayout *selfLayout) {
+            CGSize cs = origContentSize(selfLayout, csSel);
+            if (cs.width > 0.5 && cs.height > 0.5) {
+                return cs;
+            }
+            if (![NSThread isMainThread] || !selfLayout) {
+                return cs;
+            }
+            if (![PTPreparedLayouts() containsObject:selfLayout] ||
+                [PTCurrentlyPreparingLayouts() containsObject:selfLayout]) {
+                return cs;
+            }
+            NSValue *instanceKey = [NSValue valueWithPointer:(__bridge const void *)selfLayout];
+            NSMutableSet<NSValue *> *active = PTActiveLazyLayoutCalculations();
+            if ([active containsObject:instanceKey]) {
+                return cs;
+            }
+            UICollectionView *cv = selfLayout.collectionView;
+            if (!cv || cv.bounds.size.width <= 1.0 || cv.bounds.size.height <= 1.0) {
+                return cs;
+            }
+            CGSize boundsSize = cv.bounds.size;
+            if (!PTShouldPrimeLayoutAtSize(selfLayout, boundsSize)) {
+                return cs;
+            }
+            if (!PTCollectionViewHasAnyItems(cv)) {
+                return cs;
+            }
+            [PTPrimedLayoutBounds() setObject:[NSValue valueWithCGSize:boundsSize] forKey:selfLayout];
+            [active addObject:instanceKey];
+            @try {
+                CGRect queryRect = CGRectMake(cv.bounds.origin.x,
+                                              cv.bounds.origin.y,
+                                              MAX(boundsSize.width, 1.0),
+                                              MAX(boundsSize.height, 1.0));
+                [selfLayout layoutAttributesForElementsInRect:queryRect];
+            } @finally {
+                [active removeObject:instanceKey];
+            }
+            cs = origContentSize(selfLayout, csSel);
+            return cs;
+        });
+        method_setImplementation(csMethod, wrappedCS);
+        [PTHookedLayoutMethods() addObject:csMethodKey];
+        hasCustomCS = YES;
+    }
+
+    if (!hasCustomCS) {
+        [PTCheckedLayoutClasses() addObject:clsKey];
+        os_unfair_lock_unlock(&sCustomLayoutHookLock);
+        return;
+    }
+
+    SEL prepSel = @selector(prepareLayout);
+    Method prepMethod = class_getInstanceMethod(cls, prepSel);
+    if (prepMethod && prepMethod != sBaseLayoutPrepareMethod) {
+        NSValue *prepMethodKey = [NSValue valueWithPointer:(const void *)prepMethod];
+        if (![PTHookedLayoutMethods() containsObject:prepMethodKey]) {
+            IMP prepImp = method_getImplementation(prepMethod);
+            if (!PTIsSystemOrPlayToolsIMP(prepImp)) {
+                PTLayoutPrepareIMP origPrepare = (PTLayoutPrepareIMP)prepImp;
+                IMP wrappedPrep = imp_implementationWithBlock(^void(UICollectionViewLayout *selfLayout) {
+                    BOOL onMain = [NSThread isMainThread] && selfLayout != nil;
+                    if (onMain) {
+                        [PTCurrentlyPreparingLayouts() addObject:selfLayout];
+                    }
+                    @try {
+                        origPrepare(selfLayout, prepSel);
+                    } @finally {
+                        if (onMain) {
+                            [PTCurrentlyPreparingLayouts() removeObject:selfLayout];
+                            [PTPreparedLayouts() addObject:selfLayout];
+                        }
+                    }
+                });
+                method_setImplementation(prepMethod, wrappedPrep);
+                [PTHookedLayoutMethods() addObject:prepMethodKey];
+            }
+        }
+    }
+
+    [PTHookedCustomLayoutClasses() addObject:clsKey];
+    [PTCheckedLayoutClasses() addObject:clsKey];
+    os_unfair_lock_unlock(&sCustomLayoutHookLock);
+}
+
+- (void) hook_uicollectionviewlayout_prepareLayout {
+    [self hook_uicollectionviewlayout_prepareLayout];
+    if ([NSThread isMainThread] && [self isKindOfClass:[UICollectionViewLayout class]]) {
+        [PTPreparedLayouts() addObject:self];
+    }
+}
+
+- (void) hook_uicollectionviewlayout_invalidateLayoutWithContext:(UICollectionViewLayoutInvalidationContext *)context {
+    if ([NSThread isMainThread] && [self isKindOfClass:[UICollectionViewLayout class]]) {
+        UICollectionViewLayout *layout = (UICollectionViewLayout *)self;
+        NSValue *instanceKey = [NSValue valueWithPointer:(__bridge const void *)layout];
+        [PTPreparedLayouts() removeObject:layout];
+        if (![PTActiveLazyLayoutCalculations() containsObject:instanceKey] &&
+            ![PTCurrentlyPreparingLayouts() containsObject:layout]) {
+            [PTPrimedLayoutBounds() removeObjectForKey:layout];
+        }
+    }
+    [self hook_uicollectionviewlayout_invalidateLayoutWithContext:context];
+}
+
+- (instancetype) hook_uicollectionview_initWithFrame:(CGRect)frame
+                                collectionViewLayout:(UICollectionViewLayout *)layout {
+    PTEnsureCustomCollectionViewLayoutHooked(layout);
+    return [self hook_uicollectionview_initWithFrame:frame collectionViewLayout:layout];
+}
+
+- (void) hook_uicollectionview_setCollectionViewLayout:(UICollectionViewLayout *)layout {
+    PTEnsureCustomCollectionViewLayoutHooked(layout);
+    [self hook_uicollectionview_setCollectionViewLayout:layout];
+}
+
+- (void) hook_uicollectionview_setCollectionViewLayout:(UICollectionViewLayout *)layout
+                                              animated:(BOOL)animated {
+    PTEnsureCustomCollectionViewLayoutHooked(layout);
+    [self hook_uicollectionview_setCollectionViewLayout:layout animated:animated];
+}
+
+- (void) hook_uicollectionview_setCollectionViewLayout:(UICollectionViewLayout *)layout
+                                              animated:(BOOL)animated
+                                            completion:(void (^)(BOOL finished))completion {
+    PTEnsureCustomCollectionViewLayoutHooked(layout);
+    [self hook_uicollectionview_setCollectionViewLayout:layout animated:animated completion:completion];
+}
+
+- (void) hook_uicollectionview_layoutSubviews {
+    UICollectionView *cv = nil;
+    if ([self isKindOfClass:[UICollectionView class]]) {
+        cv = (UICollectionView *)self;
+        if (cv.collectionViewLayout) {
+            PTEnsureCustomCollectionViewLayoutHooked(cv.collectionViewLayout);
+        }
+    }
+    [self hook_uicollectionview_layoutSubviews];
+    if (cv && [NSThread isMainThread]) {
+        UICollectionViewLayout *layout = cv.collectionViewLayout;
+        CGSize boundsSize = cv.bounds.size;
+        if (layout &&
+            PTIsHookedCustomLayout(layout) &&
+            boundsSize.width > 1.0 && boundsSize.height > 1.0 &&
+            (cv.contentSize.width <= 0.5 || cv.contentSize.height <= 0.5) &&
+            ![PTCurrentlyPreparingLayouts() containsObject:layout] &&
+            PTShouldPrimeLayoutAtSize(layout, boundsSize) &&
+            PTShouldInvalidateInLayoutSubviews(layout, boundsSize) &&
+            PTCollectionViewHasAnyItems(cv)) {
+            [PTLayoutSubviewsInvalidatedBounds() setObject:[NSValue valueWithCGSize:boundsSize]
+                                                    forKey:layout];
+            [layout invalidateLayout];
+        }
+    }
 }
 
 - (BOOL) hook_requiresFullScreen {
@@ -257,11 +672,38 @@ bool menuWasCreated = false;
 + (void)load {
     // This might need refactor soon
     if(@available(iOS 16.3, *)) {
-        if ([[PlaySettings shared] resizableWindow]) {
+        if ([[PlaySettings shared] dynamicWindowMode]) {
             [objc_getClass("_UIApplicationInfoParser") swizzleInstanceMethod:NSSelectorFromString(@"requiresFullScreen") withMethod:@selector(hook_requiresFullScreen)];
             [objc_getClass("UIScreen") swizzleInstanceMethod:@selector(bounds) withMethod:@selector(hook_boundsResizable)];
+            [objc_getClass("UIScreen") swizzleInstanceMethod:NSSelectorFromString(@"applicationFrame") withMethod:@selector(hook_boundsResizable)];
+            [objc_getClass("UIScreen") swizzleInstanceMethod:@selector(nativeBounds) withMethod:@selector(hook_nativeBoundsResizable)];
             [objc_getClass("UIScreen") swizzleInstanceMethod:@selector(nativeScale) withMethod:@selector(hook_nativeScale)];
             [objc_getClass("UIScreen") swizzleInstanceMethod:@selector(scale) withMethod:@selector(hook_scale)];
+            [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(layoutSubviews) withMethod:@selector(hook_uiwindow_layoutSubviews)];
+            [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(setFrame:) withMethod:@selector(hook_uiwindow_setFrame:)];
+            [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(setBounds:) withMethod:@selector(hook_uiwindow_setBounds:)];
+            [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(setRootViewController:) withMethod:@selector(hook_uiwindow_setRootViewController:)];
+            [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(didAddSubview:) withMethod:@selector(hook_uiwindow_didAddSubview:)];
+            [objc_getClass("UIViewController") swizzleInstanceMethod:@selector(viewWillLayoutSubviews) withMethod:@selector(hook_vc_viewWillLayoutSubviews)];
+            [objc_getClass("UIViewController") swizzleInstanceMethod:@selector(viewDidAppear:) withMethod:@selector(hook_vc_viewDidAppear:)];
+            Class baseLayoutCls = objc_getClass("UICollectionViewLayout");
+            sBaseLayoutPrepareMethod = class_getInstanceMethod(baseLayoutCls, @selector(prepareLayout));
+            sBaseLayoutContentSizeMethod = class_getInstanceMethod(baseLayoutCls, @selector(collectionViewContentSize));
+            [baseLayoutCls swizzleInstanceMethod:@selector(prepareLayout)
+                                      withMethod:@selector(hook_uicollectionviewlayout_prepareLayout)];
+            [baseLayoutCls swizzleInstanceMethod:@selector(invalidateLayoutWithContext:)
+                                      withMethod:@selector(hook_uicollectionviewlayout_invalidateLayoutWithContext:)];
+            Class cvCls = objc_getClass("UICollectionView");
+            [cvCls swizzleInstanceMethod:@selector(initWithFrame:collectionViewLayout:)
+                              withMethod:@selector(hook_uicollectionview_initWithFrame:collectionViewLayout:)];
+            [cvCls swizzleInstanceMethod:@selector(setCollectionViewLayout:)
+                              withMethod:@selector(hook_uicollectionview_setCollectionViewLayout:)];
+            [cvCls swizzleInstanceMethod:@selector(setCollectionViewLayout:animated:)
+                              withMethod:@selector(hook_uicollectionview_setCollectionViewLayout:animated:)];
+            [cvCls swizzleInstanceMethod:@selector(setCollectionViewLayout:animated:completion:)
+                              withMethod:@selector(hook_uicollectionview_setCollectionViewLayout:animated:completion:)];
+            [cvCls swizzleInstanceMethod:@selector(layoutSubviews)
+                              withMethod:@selector(hook_uicollectionview_layoutSubviews)];
         }
         else if ([[PlaySettings shared] adaptiveDisplay]) {
             // This is an experimental fix

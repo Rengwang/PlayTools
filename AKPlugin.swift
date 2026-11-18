@@ -9,66 +9,90 @@ import AppKit
 import CoreGraphics
 import Foundation
 
-// Add a lightweight struct so we can decode only the flag we care about
+// Add a lightweight struct so we can decode only the flags we care about
 private struct AKAppSettingsData: Codable {
     var hideTitleBar: Bool?
     var floatingWindow: Bool?
     var resolution: Int?
+    var resizableAspectRatioType: Int?
     var resizableAspectRatioWidth: Int?
     var resizableAspectRatioHeight: Int?
 }
 
+private struct AKAppLayoutInfo {
+    let families: [Int]
+    let supportsIPad: Bool
+    let requiresFullScreen: Bool
+    let hasPortrait: Bool
+    let hasLandscape: Bool
+    let hasScene: Bool
+    let isAdaptive: Bool
+
+    init() {
+        let info = Bundle.main.infoDictionary ?? [:]
+        if let nums = info["UIDeviceFamily"] as? [NSNumber] {
+            families = nums.map { $0.intValue }
+        } else {
+            families = info["UIDeviceFamily"] as? [Int] ?? [1]
+        }
+        supportsIPad = families.contains(2)
+        requiresFullScreen = info["UIRequiresFullScreen"] as? Bool ?? false
+        let ipadOrients = info["UISupportedInterfaceOrientations~ipad"] as? [String] ?? []
+        let iphoneOrients = info["UISupportedInterfaceOrientations"] as? [String] ?? []
+        let orients = (supportsIPad && !ipadOrients.isEmpty) ? ipadOrients : iphoneOrients
+        let fallbackOrient = info["UIInterfaceOrientation"] as? String ?? ""
+        hasPortrait = orients.contains { $0.contains("Portrait") }
+            || (orients.isEmpty && fallbackOrient.contains("Portrait"))
+        hasLandscape = orients.contains { $0.contains("Landscape") }
+            || (orients.isEmpty && fallbackOrient.contains("Landscape"))
+        hasScene = info["UIApplicationSceneManifest"] != nil
+        isAdaptive = supportsIPad && !requiresFullScreen && ((hasPortrait && hasLandscape) || hasScene)
+    }
+
+    var recommendedAspect: (width: CGFloat, height: CGFloat, minW: CGFloat, minH: CGFloat) {
+        if hasLandscape && !hasPortrait {
+            return (16, 9, 480, 270)
+        }
+        if supportsIPad && !families.contains(1) {
+            return (3, 4, 360, 480)
+        }
+        return (9, 16, 270, 480)
+    }
+}
+
 class AKPlugin: NSObject, Plugin {
+    private let layoutInfo = AKAppLayoutInfo()
+    private let configuredWindows = NSHashTable<NSWindow>.weakObjects()
+    private let verifiedTargetWindows = NSHashTable<NSWindow>.weakObjects()
+
     required override init() {
         super.init()
-        if let window = NSApplication.shared.windows.first {
-            window.styleMask.insert([.resizable])
-            window.collectionBehavior = [.fullScreenPrimary, .managed, .participatesInCycle]
-            window.isMovable = true
-            window.isMovableByWindowBackground = true
+        configureAllWindows()
 
-            if self.hideTitleBarSetting == true {
-                window.styleMask.insert([.fullSizeContentView])
-                window.titlebarAppearsTransparent = true
-                window.titleVisibility = .hidden
-                window.toolbar = nil
-                window.title = ""
+        let center = NotificationCenter.default
+        center.addObserver(
+            forName: NSApplication.didFinishLaunchingNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.configureAllWindows()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                self?.configureAllWindows()
             }
-
-            if self.floatingWindowSetting == true {
-                window.level = .floating
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+                self?.configureAllWindows()
             }
-
-            if let aspectRatio = self.aspectRatioSetting {
-                window.contentAspectRatio = aspectRatio
-            }
-
-            NSWindow.allowsAutomaticWindowTabbing = true
         }
 
-        // Apply the same appearance rules to any subsequent windows that may be created
-        NotificationCenter.default.addObserver(
-            forName: NSWindow.didBecomeKeyNotification,
-            object: nil,
-            queue: .main) { notif in
+        for name in [
+            NSWindow.didBecomeKeyNotification,
+            NSWindow.didBecomeMainNotification,
+            NSWindow.didExposeNotification
+        ] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notif in
                 guard let win = notif.object as? NSWindow else { return }
-                win.styleMask.insert([.resizable])
-
-                if self.hideTitleBarSetting == true {
-                    win.styleMask.insert([.fullSizeContentView])
-                    win.titlebarAppearsTransparent = true
-                    win.titleVisibility = .hidden
-                    win.toolbar = nil
-                    win.title = ""
-                }
-
-                if self.floatingWindowSetting == true {
-                    win.level = .floating
-                }
-
-                if let aspectRatio = self.aspectRatioSetting {
-                    win.contentAspectRatio = aspectRatio
-                }
+                self?.configureWindowIfNeeded(win)
+            }
         }
     }
 
@@ -77,23 +101,27 @@ class AKPlugin: NSObject, Plugin {
     }
 
     var mousePoint: CGPoint {
-        NSApplication.shared.windows.first?.mouseLocationOutsideOfEventStream ?? CGPoint()
+        primaryWindow?.mouseLocationOutsideOfEventStream ?? CGPoint()
     }
 
     var windowFrame: CGRect {
-        NSApplication.shared.windows.first?.frame ?? CGRect()
+        primaryWindow?.frame ?? CGRect()
+    }
+
+    var contentLayoutRect: CGRect {
+        primaryWindow?.contentLayoutRect ?? NSApplication.shared.windows.first?.contentLayoutRect ?? CGRect()
     }
 
     var isMainScreenEqualToFirst: Bool {
-        return NSScreen.main == NSScreen.screens.first
+        NSScreen.main == NSScreen.screens.first
     }
 
     var mainScreenFrame: CGRect {
-        return NSScreen.main!.frame as CGRect
+        NSScreen.main?.frame ?? NSScreen.screens.first?.frame ?? CGRect()
     }
 
     var isFullscreen: Bool {
-        NSApplication.shared.windows.first!.styleMask.contains(.fullScreen)
+        primaryWindow?.styleMask.contains(.fullScreen) ?? false
     }
 
     var cmdPressed: Bool = false
@@ -244,7 +272,7 @@ class AKPlugin: NSObject, Plugin {
             }
 
             // For traffic light buttons when fullscreen
-            if event.window != NSApplication.shared.windows.first! {
+            if let primary = self.primaryWindow, event.window != primary {
                 return event
             }
             if consumed(event.buttonNumber, true) {
@@ -290,8 +318,9 @@ class AKPlugin: NSObject, Plugin {
     /// Convenience instance property that exposes the cached static preference.
     private var hideTitleBarSetting: Bool { Self.akAppSettingsData?.hideTitleBar ?? false }
     private var floatingWindowSetting: Bool { Self.akAppSettingsData?.floatingWindow ?? false }
+    private var resolutionSetting: Int { Self.akAppSettingsData?.resolution ?? 7 }
     private var aspectRatioSetting: NSSize? {
-        guard Self.akAppSettingsData?.resolution == 6 else {
+        guard resolutionSetting == 6 else {
             return nil
         }
         let width = Self.akAppSettingsData?.resizableAspectRatioWidth ?? 0
@@ -303,7 +332,8 @@ class AKPlugin: NSObject, Plugin {
     }
 
     fileprivate static var akAppSettingsData: AKAppSettingsData? = {
-        let bundleIdentifier = Bundle.main.bundleIdentifier ?? ""
+        let bundleIdentifier = Bundle.main.bundleIdentifier
+            ?? (Bundle.main.infoDictionary?["CFBundleIdentifier"] as? String) ?? ""
         let settingsURL = URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")
             .appendingPathComponent("App Settings")
             .appendingPathComponent("\(bundleIdentifier).plist")
@@ -313,4 +343,259 @@ class AKPlugin: NSObject, Plugin {
         }
         return decoded
     }()
+}
+
+extension AKPlugin {
+    func applyWindowAspectLock(width: CGFloat, height: CGFloat, minWidth: CGFloat, minHeight: CGFloat) {
+        runOnMain {
+            guard width > 0, height > 0, let win = self.primaryWindow else { return }
+            win.styleMask.insert([.resizable])
+            let safeMinW = max(120, minWidth)
+            let safeMinH = max(120, minHeight)
+            win.contentMinSize = NSSize(width: safeMinW, height: safeMinH)
+            win.contentAspectRatio = NSSize(width: width, height: height)
+
+            let screen = self.resolvedTargetScreen()
+                ?? win.screen ?? NSScreen.main ?? NSScreen.screens.first
+            let visible = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+            let titleOverhead = self.estimatedTitleOverhead(win)
+            let maxW = max(safeMinW, floor(visible.width - 16))
+            let maxH = max(safeMinH, floor(visible.height - titleOverhead - 16))
+
+            let curRect = win.contentLayoutRect
+            let cur = (curRect.width > 1 && curRect.height > 1) ? curRect.size : win.frame.size
+            var newW: CGFloat
+            var newH: CGFloat
+            if height >= width {
+                newH = min(max(cur.height, safeMinH), maxH)
+                newW = round(newH * (width / height))
+                if newW > maxW {
+                    newW = maxW
+                    newH = round(newW * (height / width))
+                }
+            } else {
+                newW = min(max(cur.width, safeMinW), maxW)
+                newH = round(newW * (height / width))
+                if newH > maxH {
+                    newH = maxH
+                    newW = round(newH * (width / height))
+                }
+            }
+            win.setContentSize(NSSize(width: max(safeMinW, newW), height: max(safeMinH, newH)))
+            self.clampWindow(win, to: visible, centerIfOutside: true)
+        }
+    }
+
+    func clearWindowAspectLock(minWidth: CGFloat, minHeight: CGFloat) {
+        runOnMain {
+            guard let win = self.primaryWindow else { return }
+            win.styleMask.insert([.resizable])
+            win.resizeIncrements = NSSize(width: 1, height: 1)
+            win.contentMinSize = NSSize(width: max(120, minWidth), height: max(120, minHeight))
+        }
+    }
+
+    func placeWindowOnTargetScreenIfNeeded() {
+        runOnMain {
+            guard let target = self.resolvedTargetScreen(),
+                  let win = self.primaryWindow else { return }
+            self.configureWindowIfNeeded(win)
+            self.centerAndClampWindow(win, on: target)
+        }
+    }
+}
+
+private extension AKPlugin {
+    var primaryWindow: NSWindow? {
+        NSApplication.shared.windows.first(where: { isMainAppWindow($0) })
+            ?? NSApplication.shared.windows.first
+    }
+
+    func isMainAppWindow(_ win: NSWindow) -> Bool {
+        let className = NSStringFromClass(type(of: win))
+        if className.contains("Menu") || className.contains("StatusBar") || className.contains("Tooltip") {
+            return false
+        }
+        return win.canBecomeMain && !win.isSheet
+    }
+
+    func runOnMain(_ work: @escaping () -> Void) {
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.sync(execute: work)
+        }
+    }
+
+    func resolvedTargetScreen() -> NSScreen? {
+        let env = ProcessInfo.processInfo.environment["PLAYCOVER_TARGET_SCREEN"]?.lowercased() ?? ""
+        guard env == "sidecar" || env == "secondary" else { return nil }
+        return NSScreen.screens.first(where: {
+            $0.localizedName.localizedCaseInsensitiveContains("Sidecar")
+        }) ?? (NSScreen.screens.count > 1 ? NSScreen.screens[1] : NSScreen.main)
+    }
+
+    func configureAllWindows() {
+        for win in NSApplication.shared.windows {
+            configureWindowIfNeeded(win)
+        }
+    }
+
+    func configureWindowIfNeeded(_ win: NSWindow) {
+        guard isMainAppWindow(win) else { return }
+        applyAppearanceRules(win)
+
+        if !configuredWindows.contains(win) {
+            configuredWindows.add(win)
+            applyInitialSizing(win)
+        } else if !verifiedTargetWindows.contains(win),
+                  win.isVisible,
+                  let target = resolvedTargetScreen() {
+            verifiedTargetWindows.add(win)
+            if !target.visibleFrame.intersects(win.frame) {
+                centerAndClampWindow(win, on: target)
+            }
+        }
+    }
+
+    func applyAppearanceRules(_ win: NSWindow) {
+        if resolutionSetting == 6 || resolutionSetting == 7 {
+            win.styleMask.insert([.resizable])
+        } else {
+            win.styleMask.remove(.resizable)
+        }
+        win.collectionBehavior = [.fullScreenPrimary, .managed, .participatesInCycle]
+        win.isMovable = true
+        win.isMovableByWindowBackground = true
+
+        if hideTitleBarSetting {
+            win.styleMask.insert([.fullSizeContentView])
+            win.titlebarAppearsTransparent = true
+            win.titleVisibility = .hidden
+            win.toolbar = nil
+            win.title = ""
+        }
+        if floatingWindowSetting {
+            win.level = .floating
+        }
+        NSWindow.allowsAutomaticWindowTabbing = true
+    }
+
+    func applyInitialSizing(_ win: NSWindow) {
+        let target = resolvedTargetScreen() ?? win.screen ?? NSScreen.main ?? NSScreen.screens.first
+        let visible = target?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+
+        if resolutionSetting == 7 {
+            let titleOverhead = estimatedTitleOverhead(win)
+            let maxW = max(240, floor(visible.width - 24))
+            let maxH = max(240, floor(visible.height - titleOverhead - 20))
+
+            if layoutInfo.isAdaptive {
+                win.resizeIncrements = NSSize(width: 1, height: 1)
+                win.contentMinSize = NSSize(width: 360, height: 540)
+                let initW = max(360, min(920, round(visible.width * 0.68), maxW))
+                let initH = max(540, min(780, round(visible.height * 0.82), maxH))
+                win.setContentSize(NSSize(width: initW, height: initH))
+            } else {
+                let aspect = resolvedNonAdaptiveAspect()
+                win.contentMinSize = NSSize(width: aspect.minW, height: aspect.minH)
+                win.contentAspectRatio = NSSize(width: aspect.width, height: aspect.height)
+                var targetH = floor(visible.height * 0.82)
+                if aspect.height > aspect.width {
+                    targetH = min(targetH, 800)
+                }
+                targetH = min(targetH, maxH)
+                var targetW = round(targetH * (aspect.width / aspect.height))
+                if targetW > maxW {
+                    targetW = maxW
+                    targetH = round(targetW * (aspect.height / aspect.width))
+                }
+                win.setContentSize(NSSize(width: max(aspect.minW, targetW), height: max(aspect.minH, targetH)))
+            }
+            if let target = target {
+                centerAndClampWindow(win, on: target)
+            }
+        } else {
+            if resolutionSetting == 6, let aspectRatio = aspectRatioSetting {
+                win.contentAspectRatio = aspectRatio
+            }
+            if let target = resolvedTargetScreen() {
+                centerAndClampWindow(win, on: target)
+            }
+        }
+
+        if win.isVisible, let target = resolvedTargetScreen(), target.visibleFrame.intersects(win.frame) {
+            verifiedTargetWindows.add(win)
+        }
+    }
+
+    func resolvedNonAdaptiveAspect() -> (width: CGFloat, height: CGFloat, minW: CGFloat, minH: CGFloat) {
+        if let data = Self.akAppSettingsData,
+           (data.resizableAspectRatioType ?? 0) != 0,
+           let w = data.resizableAspectRatioWidth,
+           let h = data.resizableAspectRatioHeight,
+           w > 0, h > 0 {
+            let ratioW = CGFloat(w)
+            let ratioH = CGFloat(h)
+            if w == 9 && h == 16 { return (9, 16, 270, 480) }
+            if w == 16 && h == 9 { return (16, 9, 480, 270) }
+            if w == 3 && h == 4 { return (3, 4, 360, 480) }
+            if w == 4 && h == 3 { return (4, 3, 480, 360) }
+            let minW = ratioW >= ratioH ? round(270 * ratioW / ratioH) : 270
+            let minH = ratioH > ratioW ? round(270 * ratioH / ratioW) : 270
+            return (ratioW, ratioH, minW, minH)
+        }
+        return layoutInfo.recommendedAspect
+    }
+
+    func estimatedTitleOverhead(_ win: NSWindow) -> CGFloat {
+        if hideTitleBarSetting || win.styleMask.contains(.fullSizeContentView) {
+            return 0
+        }
+        let rectH = win.contentLayoutRect.height
+        if rectH > 1 && win.frame.height >= rectH {
+            return min(64, win.frame.height - rectH)
+        }
+        return 28
+    }
+
+    func centerAndClampWindow(_ win: NSWindow, on screen: NSScreen) {
+        let visible = screen.visibleFrame
+        let frame = win.frame
+        if frame.width > visible.width || frame.height > visible.height {
+            let titleOverhead = estimatedTitleOverhead(win)
+            let maxW = max(240, floor(visible.width - 16))
+            let maxH = max(240, floor(visible.height - titleOverhead - 16))
+            let curContent = win.contentLayoutRect.width > 1 ? win.contentLayoutRect.size : frame.size
+            var newW = min(curContent.width, maxW)
+            var newH = min(curContent.height, maxH)
+            if win.contentAspectRatio.width > 0 && win.contentAspectRatio.height > 0 {
+                let ratio = win.contentAspectRatio.width / win.contentAspectRatio.height
+                newH = min(maxH, round(newW / ratio))
+                newW = round(newH * ratio)
+            }
+            win.setContentSize(NSSize(width: newW, height: newH))
+        }
+        let updated = win.frame
+        var x = round(visible.origin.x + (visible.width - updated.width) / 2.0)
+        var y = round(visible.origin.y + (visible.height - updated.height) / 2.0)
+        x = max(visible.minX, min(x, visible.maxX - updated.width))
+        y = max(visible.minY, min(y, visible.maxY - updated.height))
+        win.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    func clampWindow(_ win: NSWindow, to visible: NSRect, centerIfOutside: Bool) {
+        let frame = win.frame
+        if centerIfOutside && !visible.intersects(frame) {
+            var x = round(visible.origin.x + (visible.width - frame.width) / 2.0)
+            var y = round(visible.origin.y + (visible.height - frame.height) / 2.0)
+            x = max(visible.minX, min(x, visible.maxX - frame.width))
+            y = max(visible.minY, min(y, visible.maxY - frame.height))
+            win.setFrameOrigin(NSPoint(x: x, y: y))
+            return
+        }
+        let x = max(visible.minX, min(frame.origin.x, visible.maxX - frame.width))
+        let y = max(visible.minY, min(frame.origin.y, visible.maxY - frame.height))
+        win.setFrameOrigin(NSPoint(x: x, y: y))
+    }
 }
