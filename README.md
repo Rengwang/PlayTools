@@ -1,5 +1,10 @@
 # PlayTools
 
+> [!IMPORTANT]
+> **Personal Patch Fork (`Rengwang/PlayTools`)** — 基于上游 [`PlayCover/PlayTools`](https://github.com/PlayCover/PlayTools)（`master`）维护的个人修补分支，配套 [`Rengwang/PlayCover`](https://github.com/Rengwang/PlayCover)。
+> 新增：**Adaptive / Scaled 双模式窗口自适应引擎**、**通用自定义 `UICollectionViewLayout` 懒计算预热修复**、运行时横向溢出自动兜底、`PLAYCOVER_TARGET_SCREEN=sidecar` 副屏投放与 `PLAYTOOLS_AUTOMATION=1` 进程内无打扰自动化通道。
+> 本仓库修改明细见 [SESSION_MODIFICATIONS.md](./SESSION_MODIFICATIONS.md)，全项目汇总见 [`Rengwang/PlayCover` 的 `SESSION_MODIFICATIONS.md`](https://github.com/Rengwang/PlayCover/blob/develop/SESSION_MODIFICATIONS.md)。
+
 PlayTools is an essential part of [PlayCover](https://github.com/PlayCover/PlayCover). PlayTools implements core functions of PlayCover, including display control, key mapping and bypassing.
 
 ## Display Control
