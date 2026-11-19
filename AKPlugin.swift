@@ -17,11 +17,14 @@ private struct AKAppSettingsData: Codable {
     var resizableAspectRatioType: Int?
     var resizableAspectRatioWidth: Int?
     var resizableAspectRatioHeight: Int?
+    var layoutIdiom: Int?
+    var sdkShift: Bool?
 }
 
 private struct AKAppLayoutInfo {
     let families: [Int]
     let supportsIPad: Bool
+    let supportsDuoAdaptive: Bool
     let requiresFullScreen: Bool
     let hasPortrait: Bool
     let hasLandscape: Bool
@@ -36,9 +39,20 @@ private struct AKAppLayoutInfo {
             families = info["UIDeviceFamily"] as? [Int] ?? [1]
         }
         supportsIPad = families.contains(2)
-        requiresFullScreen = info["UIRequiresFullScreen"] as? Bool ?? false
+        let sdk = Self.parseSDKVersion(info["DTSDKName"] as? String)
+        supportsDuoAdaptive = families.contains(1) && (sdk.major > 27 || (sdk.major == 27 && sdk.minor >= 1))
+        let rawRequiresFullScreen = info["UIRequiresFullScreen"] as? Bool ?? false
+        let ignoredFromStr = (info["UIRequiresFullScreenIgnoredStartingWithVersion"] as? String)
+            ?? (info["UIRequiresFullScreenIgnoredStartingWithVersion"] as? NSNumber)?.stringValue
+        let ignoredFrom = Self.parseSDKVersion(ignoredFromStr)
+        let runtimeVer = ProcessInfo.processInfo.operatingSystemVersion
+        let ignoresRequiresFullScreen = ignoredFrom.major > 0
+            && (runtimeVer.majorVersion > ignoredFrom.major
+                || (runtimeVer.majorVersion == ignoredFrom.major && runtimeVer.minorVersion >= ignoredFrom.minor))
+        requiresFullScreen = rawRequiresFullScreen && !ignoresRequiresFullScreen
         let ipadOrients = info["UISupportedInterfaceOrientations~ipad"] as? [String] ?? []
-        let iphoneOrients = info["UISupportedInterfaceOrientations"] as? [String] ?? []
+        let iphoneOrients = (info["UISupportedInterfaceOrientations~iphone"] as? [String])
+            ?? (info["UISupportedInterfaceOrientations"] as? [String]) ?? []
         let orients = (supportsIPad && !ipadOrients.isEmpty) ? ipadOrients : iphoneOrients
         let fallbackOrient = info["UIInterfaceOrientation"] as? String ?? ""
         hasPortrait = orients.contains { $0.contains("Portrait") }
@@ -46,7 +60,18 @@ private struct AKAppLayoutInfo {
         hasLandscape = orients.contains { $0.contains("Landscape") }
             || (orients.isEmpty && fallbackOrient.contains("Landscape"))
         hasScene = info["UIApplicationSceneManifest"] != nil
-        isAdaptive = supportsIPad && !requiresFullScreen && ((hasPortrait && hasLandscape) || hasScene)
+        isAdaptive = (supportsIPad || supportsDuoAdaptive)
+            && !requiresFullScreen
+            && ((hasPortrait && hasLandscape) || hasScene)
+    }
+
+    private static func parseSDKVersion(_ sdkName: String?) -> (major: Int, minor: Int) {
+        guard let sdk = sdkName else { return (0, 0) }
+        let digits = sdk.drop { !$0.isNumber }
+        let parts = digits.split(separator: ".")
+        let major = parts.first.flatMap { Int($0) } ?? 0
+        let minor = parts.dropFirst().first.flatMap { Int($0) } ?? 0
+        return (major, minor)
     }
 
     var recommendedAspect: (width: CGFloat, height: CGFloat, minW: CGFloat, minH: CGFloat) {
@@ -319,8 +344,14 @@ class AKPlugin: NSObject, Plugin {
     private var hideTitleBarSetting: Bool { Self.akAppSettingsData?.hideTitleBar ?? false }
     private var floatingWindowSetting: Bool { Self.akAppSettingsData?.floatingWindow ?? false }
     private var resolutionSetting: Int { Self.akAppSettingsData?.resolution ?? 7 }
+    private var layoutIdiomSetting: Int { Self.akAppSettingsData?.layoutIdiom ?? 3 }
+    private var sdkShiftSetting: Bool { Self.akAppSettingsData?.sdkShift ?? false }
     private var aspectRatioSetting: NSSize? {
         guard resolutionSetting == 6 else {
+            return nil
+        }
+        let ratioType = Self.akAppSettingsData?.resizableAspectRatioType ?? 0
+        guard ratioType != 0 else {
             return nil
         }
         let width = Self.akAppSettingsData?.resizableAspectRatioWidth ?? 0
@@ -390,6 +421,7 @@ extension AKPlugin {
         runOnMain {
             guard let win = self.primaryWindow else { return }
             win.styleMask.insert([.resizable])
+            win.contentAspectRatio = .zero
             win.resizeIncrements = NSSize(width: 1, height: 1)
             win.contentMinSize = NSSize(width: max(120, minWidth), height: max(120, minHeight))
         }
@@ -490,12 +522,19 @@ private extension AKPlugin {
             let maxW = max(240, floor(visible.width - 24))
             let maxH = max(240, floor(visible.height - titleOverhead - 20))
 
-            if layoutInfo.isAdaptive {
+            if layoutInfo.isAdaptive || sdkShiftSetting {
                 win.resizeIncrements = NSSize(width: 1, height: 1)
-                win.contentMinSize = NSSize(width: 360, height: 540)
-                let initW = max(360, min(920, round(visible.width * 0.68), maxW))
-                let initH = max(540, min(780, round(visible.height * 0.82), maxH))
-                win.setContentSize(NSSize(width: initW, height: initH))
+                if layoutIdiomSetting == 1 || (layoutIdiomSetting == 3 && layoutInfo.families.contains(1)) {
+                    win.contentMinSize = NSSize(width: 320, height: 520)
+                    let initW = max(320, min(420, maxW))
+                    let initH = max(520, min(760, round(visible.height * 0.82), maxH))
+                    win.setContentSize(NSSize(width: initW, height: initH))
+                } else {
+                    win.contentMinSize = NSSize(width: 360, height: 540)
+                    let initW = max(360, min(920, round(visible.width * 0.68), maxW))
+                    let initH = max(540, min(780, round(visible.height * 0.82), maxH))
+                    win.setContentSize(NSSize(width: initW, height: initH))
+                }
             } else {
                 let aspect = resolvedNonAdaptiveAspect()
                 win.contentMinSize = NSSize(width: aspect.minW, height: aspect.minH)

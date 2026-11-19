@@ -84,6 +84,7 @@ extension UIScreen {
 private struct ScreenAppCapabilities {
     let families: [Int]
     let supportsIPad: Bool
+    let supportsDuoAdaptive: Bool
     let requiresFullScreen: Bool
     let hasPortrait: Bool
     let hasLandscape: Bool
@@ -98,9 +99,22 @@ private struct ScreenAppCapabilities {
             families = info["UIDeviceFamily"] as? [Int] ?? [1]
         }
         supportsIPad = families.contains(2)
-        requiresFullScreen = info["UIRequiresFullScreen"] as? Bool ?? false
+        let forceShift = PlaySettings.shared.dynamicWindowMode && PlaySettings.shared.sdkShift
+        let sdk = Self.parseSDKVersion(info["DTSDKName"] as? String)
+        supportsDuoAdaptive = forceShift
+            || (families.contains(1) && (sdk.major > 27 || (sdk.major == 27 && sdk.minor >= 1)))
+        let rawRequiresFullScreen = info["UIRequiresFullScreen"] as? Bool ?? false
+        let ignoredFromStr = (info["UIRequiresFullScreenIgnoredStartingWithVersion"] as? String)
+            ?? (info["UIRequiresFullScreenIgnoredStartingWithVersion"] as? NSNumber)?.stringValue
+        let ignoredFrom = Self.parseSDKVersion(ignoredFromStr)
+        let runtimeVer = ProcessInfo.processInfo.operatingSystemVersion
+        let ignoresRequiresFullScreen = ignoredFrom.major > 0
+            && (runtimeVer.majorVersion > ignoredFrom.major
+                || (runtimeVer.majorVersion == ignoredFrom.major && runtimeVer.minorVersion >= ignoredFrom.minor))
+        requiresFullScreen = !forceShift && rawRequiresFullScreen && !ignoresRequiresFullScreen
         let ipadOrients = info["UISupportedInterfaceOrientations~ipad"] as? [String] ?? []
-        let iphoneOrients = info["UISupportedInterfaceOrientations"] as? [String] ?? []
+        let iphoneOrients = (info["UISupportedInterfaceOrientations~iphone"] as? [String])
+            ?? (info["UISupportedInterfaceOrientations"] as? [String]) ?? []
         let orients = (supportsIPad && !ipadOrients.isEmpty) ? ipadOrients : iphoneOrients
         let fallbackOrient = info["UIInterfaceOrientation"] as? String ?? ""
         hasPortrait = orients.contains { $0.contains("Portrait") }
@@ -108,7 +122,19 @@ private struct ScreenAppCapabilities {
         hasLandscape = orients.contains { $0.contains("Landscape") }
             || (orients.isEmpty && fallbackOrient.contains("Landscape"))
         hasScene = info["UIApplicationSceneManifest"] != nil
-        isAdaptive = supportsIPad && !requiresFullScreen && ((hasPortrait && hasLandscape) || hasScene)
+        isAdaptive = forceShift
+            || ((supportsIPad || supportsDuoAdaptive)
+                && !requiresFullScreen
+                && ((hasPortrait && hasLandscape) || hasScene))
+    }
+
+    fileprivate static func parseSDKVersion(_ sdkName: String?) -> (major: Int, minor: Int) {
+        guard let sdk = sdkName else { return (0, 0) }
+        let digits = sdk.drop { !$0.isNumber }
+        let parts = digits.split(separator: ".")
+        let major = parts.first.flatMap { Int($0) } ?? 0
+        let minor = parts.dropFirst().first.flatMap { Int($0) } ?? 0
+        return (major, minor)
     }
 }
 
@@ -143,6 +169,26 @@ public class PlayScreen: NSObject {
     private var originalWindowBackground: UIColor?
     private var savedRootAutoresizingMask: UIView.AutoresizingMask?
     private var scaledViews = NSHashTable<UIView>.weakObjects()
+    private var scaledWindows = NSHashTable<UIWindow>.weakObjects()
+    private var isHostLiveResizing = false
+    private var lastDuoLandscapeActive = false
+
+    private var isDuoIdentity: Bool {
+        PlaySettings.shared.layoutIdiom == 3
+            || (PlaySettings.shared.deviceModel as String) == "iPhone19,4"
+    }
+
+    private var isForcedPhoneAdaptive: Bool {
+        let idiom = PlaySettings.shared.layoutIdiom
+        return (idiom == 1 || idiom == 3) && displayMode == .adaptive
+    }
+
+    private var shouldAllowRuntimeFallback: Bool {
+        PlaySettings.shared.smartAdaptive
+            && displayMode == .adaptive
+            && !isDuoIdentity
+            && !PlaySettings.shared.sdkShift
+    }
 
     override init() {
         super.init()
@@ -164,18 +210,25 @@ public class PlayScreen: NSObject {
             center.addObserver(forName: name, object: nil, queue: .main, using: handleAppearance)
         }
         center.addObserver(
+            forName: NSNotification.Name("NSWindowWillStartLiveResizeNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleHostWindowLiveResizeStart()
+        }
+        center.addObserver(
             forName: NSNotification.Name("NSWindowDidResizeNotification"),
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleHostWindowResize()
+            self?.handleHostWindowResize(isEndOfLiveResize: false)
         }
         center.addObserver(
             forName: NSNotification.Name("NSWindowDidEndLiveResizeNotification"),
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.handleHostWindowResize()
+            self?.handleHostWindowResize(isEndOfLiveResize: true)
         }
         startAutomationServerIfNeeded()
     }
@@ -224,6 +277,141 @@ public class PlayScreen: NSObject {
 
     @objc public static func onWindow(_ window: UIWindow, didAddSubview subview: UIView) {
         shared.handleWindowDidAddSubview(window, subview: subview)
+    }
+
+    @objc public static func resolvedWindowSafeAreaInsets(
+        _ original: UIEdgeInsets,
+        window: UIWindow
+    ) -> UIEdgeInsets {
+        guard Thread.isMainThread,
+              shared.isUnfoldedDuoLandscape(for: window) else {
+            return original
+        }
+        return UIEdgeInsets(
+            top: original.top,
+            left: original.left,
+            bottom: original.bottom,
+            right: Swift.max(original.right, 16)
+        )
+    }
+
+    @objc public static func resolvedInterfaceOrientation(
+        _ original: UIInterfaceOrientation,
+        scene: UIWindowScene?
+    ) -> UIInterfaceOrientation {
+        guard Thread.isMainThread,
+              PlaySettings.shared.dynamicWindowMode,
+              shared.displayMode == .adaptive,
+              shared.isDuoIdentity else {
+            return original
+        }
+        let targetWindow = scene?.windows.first(where: { shared.isEligiblePrimaryWindow($0) })
+            ?? scene?.windows.first(where: { shared.isAppWindow($0) && !$0.isHidden })
+            ?? shared.activePrimaryWindow
+        let refSize: CGSize
+        if let win = targetWindow, win.bounds.width > 1, win.bounds.height > 1 {
+            refSize = win.bounds.size
+        } else if let sceneBounds = scene?.coordinateSpace.bounds,
+                  sceneBounds.width > 1, sceneBounds.height > 1 {
+            refSize = sceneBounds.size
+        } else {
+            return original
+        }
+        return refSize.width > refSize.height ? .landscapeRight : .portrait
+    }
+
+    @objc public static func resolvedGeometryInterfaceOrientation(
+        _ original: UIInterfaceOrientation,
+        coordinateSpaceBounds bounds: CGRect
+    ) -> UIInterfaceOrientation {
+        guard Thread.isMainThread,
+              PlaySettings.shared.dynamicWindowMode,
+              shared.displayMode == .adaptive,
+              shared.isDuoIdentity else {
+            return original
+        }
+        if bounds.width > 1, bounds.height > 1 {
+            return bounds.width > bounds.height ? .landscapeRight : .portrait
+        }
+        return resolvedInterfaceOrientation(original, scene: nil)
+    }
+
+    @objc public static func resolvedFixedCoordinateSpaceBounds(
+        _ original: CGRect,
+        screen: UIScreen?
+    ) -> CGRect {
+        guard Thread.isMainThread,
+              PlaySettings.shared.dynamicWindowMode,
+              shared.displayMode == .adaptive,
+              shared.isDuoIdentity,
+              let win = shared.activePrimaryWindow,
+              win.bounds.width > 1,
+              win.bounds.height > 1,
+              let scene = win.windowScene else {
+            return original
+        }
+        if let screen = screen, scene.screen !== screen {
+            return original
+        }
+        let activeAppScenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .filter {
+                ($0.activationState == .foregroundActive || $0.activationState == .foregroundInactive)
+                    && $0.windows.contains(where: { shared.isEligiblePrimaryWindow($0) })
+            }
+        guard activeAppScenes.count <= 1 else {
+            return original
+        }
+        let sceneBounds = scene.coordinateSpace.bounds
+        guard sceneBounds.width > 1, sceneBounds.height > 1,
+              abs(win.bounds.width - sceneBounds.width) <= 2,
+              abs(win.bounds.height - sceneBounds.height) <= 2 else {
+            return original
+        }
+        return CGRect(origin: .zero, size: win.bounds.size)
+    }
+
+    @objc public static func resolvedMainBundleInfoValue(
+        _ original: Any?,
+        forKey key: String
+    ) -> Any? {
+        guard PlaySettings.shared.dynamicWindowMode,
+              PlaySettings.shared.sdkShift else {
+            return original
+        }
+        switch key {
+        case "DTSDKName":
+            let sdk = ScreenAppCapabilities.parseSDKVersion(original as? String)
+            if sdk.major < 27 || (sdk.major == 27 && sdk.minor < 1) {
+                return "iphoneos27.2"
+            }
+            return original
+        case "UIRequiresFullScreen":
+            return NSNumber(value: false)
+        case "UIRequiresFullScreenIgnoredStartingWithVersion":
+            return original ?? "27.0"
+        default:
+            return original
+        }
+    }
+
+    @objc public static func resolvedMainBundleInfoDictionary(
+        _ original: [AnyHashable: Any]?
+    ) -> [AnyHashable: Any]? {
+        guard PlaySettings.shared.dynamicWindowMode,
+              PlaySettings.shared.sdkShift,
+              var dict = original else {
+            return original
+        }
+        let sdk = ScreenAppCapabilities.parseSDKVersion(dict["DTSDKName"] as? String)
+        if sdk.major < 27 || (sdk.major == 27 && sdk.minor < 1) {
+            dict["DTSDKName"] = "iphoneos27.2"
+        }
+        dict["UIRequiresFullScreen"] = NSNumber(value: false)
+        if dict["UIRequiresFullScreenIgnoredStartingWithVersion"] == nil {
+            dict["UIRequiresFullScreenIgnoredStartingWithVersion"] = "27.0"
+        }
+        return dict
     }
 
     var fullscreen: Bool { AKInterface.shared?.isFullscreen ?? false }
@@ -382,6 +570,22 @@ private extension PlayScreen {
         !window.isHidden && window.alpha > 0.01 && isAppWindow(window)
     }
 
+    func isUnfoldedDuoLandscape(for window: UIWindow) -> Bool {
+        guard PlaySettings.shared.dynamicWindowMode,
+              displayMode == .adaptive,
+              isDuoIdentity else {
+            return false
+        }
+        let width = window.bounds.width > 1
+            ? window.bounds.width
+            : (window.windowScene?.coordinateSpace.bounds.width ?? 0)
+        let height = window.bounds.height > 1
+            ? window.bounds.height
+            : (window.windowScene?.coordinateSpace.bounds.height ?? 0)
+        guard width > height, width >= 600 else { return false }
+        return isEligiblePrimaryWindow(window)
+    }
+
     func windowScore(_ window: UIWindow) -> Double {
         var score: Double = 0
         if window.rootViewController != nil { score += 10_000 }
@@ -423,16 +627,49 @@ private extension PlayScreen {
                 AKInterface.shared?.placeWindowOnTargetScreenIfNeeded()
             }
             if PlaySettings.shared.smartAdaptive && displayMode == .adaptive {
+                let minW: CGFloat = (PlaySettings.shared.layoutIdiom == 1 || PlaySettings.shared.layoutIdiom == 3) ? 320 : 360
+                let minH: CGFloat = (PlaySettings.shared.layoutIdiom == 1 || PlaySettings.shared.layoutIdiom == 3) ? 520 : 540
+                AKInterface.shared?.clearWindowAspectLock(minWidth: minW, minHeight: minH)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    guard let self = self, self.displayMode == .adaptive else { return }
+                    AKInterface.shared?.clearWindowAspectLock(minWidth: minW, minHeight: minH)
+                }
+            }
+            if shouldAllowRuntimeFallback {
                 scheduleRuntimeFallbackCheck(delay: 0.8)
             }
         }
     }
 
-    func handleHostWindowResize() {
+    func handleHostWindowLiveResizeStart() {
+        isHostLiveResizing = true
+        if isForcedPhoneAdaptive {
+            relayoutWorkItem?.cancel()
+            relayoutWorkItem = nil
+            fallbackWorkItem?.cancel()
+            fallbackWorkItem = nil
+        }
+    }
+
+    func handleHostWindowResize(isEndOfLiveResize: Bool) {
+        if isEndOfLiveResize {
+            isHostLiveResizing = false
+        }
         guard let win = activePrimaryWindow else { return }
         switch displayMode {
         case .adaptive:
             lastAdaptiveBounds = CGRect(origin: .zero, size: win.bounds.size)
+            if isForcedPhoneAdaptive {
+                if isEndOfLiveResize {
+                    scheduleFinalAdaptiveLayoutIfNeeded(for: win, delay: 0.0)
+                } else if !isHostLiveResizing {
+                    scheduleFinalAdaptiveLayoutIfNeeded(for: win, delay: 0.08)
+                } else {
+                    relayoutWorkItem?.cancel()
+                    relayoutWorkItem = nil
+                }
+                return
+            }
             scheduleAdaptiveRelayout(for: win)
             if PlaySettings.shared.smartAdaptive && !didTriggerRuntimeFallback {
                 scheduleRuntimeFallbackCheck(delay: 0.8)
@@ -516,10 +753,28 @@ private extension PlayScreen {
         case .adaptive:
             if window === activePrimaryWindow {
                 resetScaledTransformsIfNeeded(in: window)
+                let nowDuoLandscape = isUnfoldedDuoLandscape(for: window)
+                if nowDuoLandscape != lastDuoLandscapeActive {
+                    lastDuoLandscapeActive = nowDuoLandscape
+                    window.safeAreaInsetsDidChange()
+                    window.rootViewController?.viewSafeAreaInsetsDidChange()
+                    window.setNeedsLayout()
+                    if !isHostLiveResizing {
+                        scheduleAdaptiveRelayout(for: window)
+                    }
+                }
                 if abs(window.bounds.width - lastAdaptiveLayoutSize.width) > 0.5
                     || abs(window.bounds.height - lastAdaptiveLayoutSize.height) > 0.5 {
                     lastAdaptiveLayoutSize = window.bounds.size
                     lastAdaptiveBounds = CGRect(origin: .zero, size: window.bounds.size)
+                    if isForcedPhoneAdaptive {
+                        // Let UIKit drive intermediate layout frames during live drag;
+                        // coalesce one lightweight pass after resizing settles.
+                        if !isHostLiveResizing {
+                            scheduleFinalAdaptiveLayoutIfNeeded(for: window, delay: 0.08)
+                        }
+                        return
+                    }
                     scheduleAdaptiveRelayout(for: window)
                     if PlaySettings.shared.smartAdaptive && !didTriggerRuntimeFallback {
                         scheduleRuntimeFallbackCheck(delay: 0.8)
@@ -543,6 +798,16 @@ private extension PlayScreen {
 
 private extension PlayScreen {
     func resetScaledTransformsIfNeeded(in window: UIWindow) {
+        let didTrackScaledViews = scaledViews.allObjects.contains {
+            $0.window === window || $0.superview === window
+        }
+        guard scaledWindows.contains(window)
+                || didTrackScaledViews
+                || originalWindowBackground != nil else {
+            return
+        }
+        defer { scaledWindows.remove(window) }
+
         let sceneBounds = window.windowScene?.coordinateSpace.bounds
         let needsWindowReset = window.transform != .identity || (sceneBounds.map {
             $0.width > 1 && $0.height > 1 && (
@@ -744,6 +1009,7 @@ private extension PlayScreen {
 
         guard needsBounds || needsCenter || needsScale else { return }
 
+        scaledWindows.add(window)
         isApplyingScaledLayout = true
         defer { isApplyingScaledLayout = false }
 
@@ -756,6 +1022,7 @@ private extension PlayScreen {
     }
 
     func applyScaledCanvas(to window: UIWindow, logicalSize: CGSize) {
+        scaledWindows.add(window)
         let didChangeBounds = abs(window.bounds.width - logicalSize.width) > 0.5
             || abs(window.bounds.height - logicalSize.height) > 0.5
         let sceneBounds = window.windowScene?.coordinateSpace.bounds ?? window.bounds
@@ -776,6 +1043,30 @@ private extension PlayScreen {
                 recursivelyRelayout(subview)
             }
             scheduleAdaptiveRelayout(for: window)
+        }
+    }
+
+    func scheduleFinalAdaptiveLayoutIfNeeded(for window: UIWindow, delay: TimeInterval) {
+        relayoutWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self, weak window] in
+            guard let self = self,
+                  !self.isHostLiveResizing,
+                  let win = window ?? self.activePrimaryWindow,
+                  win === self.activePrimaryWindow,
+                  self.displayMode == .adaptive else { return }
+            self.lastRelayoutTime = CFAbsoluteTimeGetCurrent()
+            if win.bounds.width >= 100 && win.bounds.height >= 100 {
+                self.lastAdaptiveLayoutSize = win.bounds.size
+                self.lastAdaptiveBounds = CGRect(origin: .zero, size: win.bounds.size)
+            }
+            win.setNeedsLayout()
+            win.layoutIfNeeded()
+        }
+        relayoutWorkItem = item
+        if delay <= 0 {
+            DispatchQueue.main.async(execute: item)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
         }
     }
 
@@ -834,9 +1125,8 @@ private extension PlayScreen {
     }
 
     func evaluateRuntimeNonAdaptiveFallback() {
-        guard PlaySettings.shared.smartAdaptive,
+        guard shouldAllowRuntimeFallback,
               !didTriggerRuntimeFallback,
-              displayMode == .adaptive,
               let win = activePrimaryWindow,
               let rootView = win.rootViewController?.view,
               win.bounds.width >= 100 else { return }

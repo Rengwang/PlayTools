@@ -7,6 +7,7 @@
 
 #import "NSObject+Swizzle.h"
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <dlfcn.h>
 #import <os/lock.h>
 #import "CoreGraphics/CoreGraphics.h"
@@ -212,6 +213,69 @@ __attribute__((visibility("hidden")))
     if ([self isKindOfClass:[UIWindow class]] && subview) {
         [PlayScreen onWindow:(UIWindow *)self didAddSubview:subview];
     }
+}
+
+- (UIEdgeInsets) hook_uiwindow_safeAreaInsets {
+    UIEdgeInsets orig = [self hook_uiwindow_safeAreaInsets];
+    if ([self isKindOfClass:[UIWindow class]]) {
+        return [PlayScreen resolvedWindowSafeAreaInsets:orig window:(UIWindow *)self];
+    }
+    return orig;
+}
+
+- (UIInterfaceOrientation) hook_uiscene_interfaceOrientation {
+    UIInterfaceOrientation orig = [self hook_uiscene_interfaceOrientation];
+    if ([self isKindOfClass:[UIWindowScene class]]) {
+        return [PlayScreen resolvedInterfaceOrientation:orig scene:(UIWindowScene *)self];
+    }
+    return orig;
+}
+
+- (UIInterfaceOrientation) hook_uiapp_statusBarOrientation {
+    UIInterfaceOrientation orig = [self hook_uiapp_statusBarOrientation];
+    return [PlayScreen resolvedInterfaceOrientation:orig scene:nil];
+}
+
+- (UIInterfaceOrientation) hook_uiscenegeometry_interfaceOrientation {
+    UIInterfaceOrientation orig = [self hook_uiscenegeometry_interfaceOrientation];
+    CGRect geomBounds = CGRectZero;
+    SEL coordSel = NSSelectorFromString(@"coordinateSpace");
+    if ([self respondsToSelector:coordSel]) {
+        id space = ((id (*)(id, SEL))objc_msgSend)(self, coordSel);
+        if (space && [space conformsToProtocol:@protocol(UICoordinateSpace)]) {
+            geomBounds = [(id<UICoordinateSpace>)space bounds];
+        }
+    }
+    return [PlayScreen resolvedGeometryInterfaceOrientation:orig coordinateSpaceBounds:geomBounds];
+}
+
+- (CGRect) hook_uiscreenfixedspace_bounds {
+    CGRect orig = [self hook_uiscreenfixedspace_bounds];
+    UIScreen *screen = nil;
+    SEL screenSel = NSSelectorFromString(@"_screen");
+    if ([self respondsToSelector:screenSel]) {
+        id candidate = ((id (*)(id, SEL))objc_msgSend)(self, screenSel);
+        if ([candidate isKindOfClass:[UIScreen class]]) {
+            screen = (UIScreen *)candidate;
+        }
+    }
+    return [PlayScreen resolvedFixedCoordinateSpaceBounds:orig screen:screen];
+}
+
+- (id) hook_nsbundle_objectForInfoDictionaryKey:(NSString *)key {
+    id orig = [self hook_nsbundle_objectForInfoDictionaryKey:key];
+    if (key && [self isEqual:[NSBundle mainBundle]]) {
+        return [PlayScreen resolvedMainBundleInfoValue:orig forKey:key];
+    }
+    return orig;
+}
+
+- (NSDictionary<NSString *, id> *) hook_nsbundle_infoDictionary {
+    NSDictionary<NSString *, id> *orig = [self hook_nsbundle_infoDictionary];
+    if ([self isEqual:[NSBundle mainBundle]]) {
+        return [PlayScreen resolvedMainBundleInfoDictionary:orig];
+    }
+    return orig;
 }
 
 - (void) hook_vc_viewWillLayoutSubviews {
@@ -625,11 +689,23 @@ static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
     }
 }
 
-// Hook for UIUserInterfaceIdiom
+// Hook for UIUserInterfaceIdiom & UIDevice model override
 
-// - (long long) hook_userInterfaceIdiom {
-//     return UIUserInterfaceIdiomPad;
-// }
+- (long long) hook_userInterfaceIdiom_phone {
+    return UIUserInterfaceIdiomPhone;
+}
+
+- (long long) hook_userInterfaceIdiom_pad {
+    return UIUserInterfaceIdiomPad;
+}
+
+- (NSString *) hook_deviceModel_phone {
+    return @"iPhone";
+}
+
+- (NSString *) hook_deviceModel_pad {
+    return @"iPad";
+}
 
 bool menuWasCreated = false;
 - (id) initWithRootMenuHook:(id)rootMenu {
@@ -684,6 +760,24 @@ bool menuWasCreated = false;
             [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(setBounds:) withMethod:@selector(hook_uiwindow_setBounds:)];
             [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(setRootViewController:) withMethod:@selector(hook_uiwindow_setRootViewController:)];
             [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(didAddSubview:) withMethod:@selector(hook_uiwindow_didAddSubview:)];
+            [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(safeAreaInsets) withMethod:@selector(hook_uiwindow_safeAreaInsets)];
+            [objc_getClass("UIWindowScene") swizzleInstanceMethod:@selector(interfaceOrientation) withMethod:@selector(hook_uiscene_interfaceOrientation)];
+            [objc_getClass("UIApplication") swizzleInstanceMethod:@selector(statusBarOrientation) withMethod:@selector(hook_uiapp_statusBarOrientation)];
+            Class sceneGeomCls = objc_getClass("UIWindowSceneGeometry");
+            if (sceneGeomCls) {
+                [sceneGeomCls swizzleInstanceMethod:@selector(interfaceOrientation) withMethod:@selector(hook_uiscenegeometry_interfaceOrientation)];
+            }
+            Class fixedSpaceCls = objc_getClass("_UIScreenFixedCoordinateSpace");
+            if (fixedSpaceCls) {
+                [fixedSpaceCls swizzleInstanceMethod:@selector(bounds) withMethod:@selector(hook_uiscreenfixedspace_bounds)];
+            }
+            if ([[PlaySettings shared] sdkShift]) {
+                Class bundleCls = [NSBundle class];
+                [bundleCls swizzleInstanceMethod:@selector(objectForInfoDictionaryKey:)
+                                      withMethod:@selector(hook_nsbundle_objectForInfoDictionaryKey:)];
+                [bundleCls swizzleInstanceMethod:@selector(infoDictionary)
+                                      withMethod:@selector(hook_nsbundle_infoDictionary)];
+            }
             [objc_getClass("UIViewController") swizzleInstanceMethod:@selector(viewWillLayoutSubviews) withMethod:@selector(hook_vc_viewWillLayoutSubviews)];
             [objc_getClass("UIViewController") swizzleInstanceMethod:@selector(viewDidAppear:) withMethod:@selector(hook_vc_viewDidAppear:)];
             Class baseLayoutCls = objc_getClass("UICollectionViewLayout");
@@ -776,9 +870,19 @@ bool menuWasCreated = false;
     
     [objc_getClass("_UIMenuBuilder") swizzleInstanceMethod:sel_getUid("initWithRootMenu:") withMethod:@selector(initWithRootMenuHook:)];
     [objc_getClass("IOSViewController") swizzleInstanceMethod:@selector(prefersPointerLocked) withMethod:@selector(hook_prefersPointerLocked)];
-    // Set idiom to iPad
-    // [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(userInterfaceIdiom) withMethod:@selector(hook_userInterfaceIdiom)];
-    // [objc_getClass("UITraitCollection") swizzleInstanceMethod:@selector(userInterfaceIdiom) withMethod:@selector(hook_userInterfaceIdiom)];
+    // Override device layout idiom (0 = auto, 1 = iPhone, 2 = iPad, 3 = iPhone Duo)
+    NSInteger layoutIdiom = [[PlaySettings shared] layoutIdiom];
+    if (layoutIdiom == 1 || layoutIdiom == 3) {
+        [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(userInterfaceIdiom) withMethod:@selector(hook_userInterfaceIdiom_phone)];
+        [objc_getClass("UITraitCollection") swizzleInstanceMethod:@selector(userInterfaceIdiom) withMethod:@selector(hook_userInterfaceIdiom_phone)];
+        [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(model) withMethod:@selector(hook_deviceModel_phone)];
+        [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(localizedModel) withMethod:@selector(hook_deviceModel_phone)];
+    } else if (layoutIdiom == 2) {
+        [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(userInterfaceIdiom) withMethod:@selector(hook_userInterfaceIdiom_pad)];
+        [objc_getClass("UITraitCollection") swizzleInstanceMethod:@selector(userInterfaceIdiom) withMethod:@selector(hook_userInterfaceIdiom_pad)];
+        [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(model) withMethod:@selector(hook_deviceModel_pad)];
+        [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(localizedModel) withMethod:@selector(hook_deviceModel_pad)];
+    }
 
     [objc_getClass("VSSubscriptionRegistrationCenter") swizzleInstanceMethod:@selector(setCurrentSubscription:) withMethod:@selector(hook_setCurrentSubscription:)];
 

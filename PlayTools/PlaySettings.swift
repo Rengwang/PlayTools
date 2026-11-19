@@ -49,10 +49,44 @@ let settings = PlaySettings.shared
 
     @objc lazy var resizableWindow = (settingsData.resolution == 6 || settingsData.resolution == 7)
 
-    @objc lazy var deviceModel = settingsData.iosDeviceModel as NSString
+    @objc lazy var deviceModel: NSString = effectiveDeviceModel as NSString
+
+    private static let appSupportsPhone: Bool = {
+        let raw = Bundle.main.infoDictionary?["UIDeviceFamily"]
+        let families: [Int]
+        if let nums = raw as? [NSNumber] {
+            families = nums.map { $0.intValue }
+        } else {
+            families = raw as? [Int] ?? [1]
+        }
+        return families.isEmpty || families.contains(1)
+    }()
+
+    private var effectiveLayoutIdiom: Int {
+        if settingsData.layoutIdiom == 3 && !Self.appSupportsPhone {
+            return 0
+        }
+        return settingsData.layoutIdiom
+    }
+
+    private var effectiveDeviceModel: String {
+        if effectiveLayoutIdiom == 3 {
+            return "iPhone19,4"
+        }
+        if effectiveLayoutIdiom == 1 && settingsData.iosDeviceModel.hasPrefix("iPad") {
+            return "iPhone15,3"
+        }
+        if effectiveLayoutIdiom == 2 && settingsData.iosDeviceModel.hasPrefix("iPhone") {
+            return "iPad13,8"
+        }
+        if !Self.appSupportsPhone && settingsData.iosDeviceModel.hasPrefix("iPhone") {
+            return "iPad13,8"
+        }
+        return settingsData.iosDeviceModel
+    }
 
     @objc lazy var oemID: NSString = {
-        switch settingsData.iosDeviceModel {
+        switch effectiveDeviceModel {
         case "iPad6,7":
             return "J98aAP"
         case "iPad8,6":
@@ -105,6 +139,12 @@ let settings = PlaySettings.shared
     @objc lazy var blockSleepSpamming = settingsData.blockSleepSpamming
 
     @objc lazy var ignoreUnityKeyboardInitializationError = settingsData.ignoreUnityKeyboardInitializationError
+
+    @objc lazy var uiScale = settingsData.uiScale
+
+    @objc lazy var layoutIdiom = effectiveLayoutIdiom
+
+    @objc lazy var sdkShift = settingsData.sdkShift
 }
 
 struct AppSettingsData: Codable {
@@ -112,7 +152,7 @@ struct AppSettingsData: Codable {
     var sensitivity: Float = 50
 
     var disableTimeout = false
-    var iosDeviceModel = "iPad13,8"
+    var iosDeviceModel = "iPhone19,4"
     var windowWidth = 1920
     var windowHeight = 1080
     var customScaler = 2.0
@@ -140,16 +180,18 @@ struct AppSettingsData: Codable {
     var resizableAspectRatioHeight = 0
     var blockSleepSpamming = false
     var ignoreUnityKeyboardInitializationError = false
+    var uiScale: Double = 1.0
+    var layoutIdiom: Int = 3
+    var sdkShift = false
 
     init() {}
 
-    // swiftlint:disable:next function_body_length
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         keymapping = try container.decodeIfPresent(Bool.self, forKey: .keymapping) ?? true
         sensitivity = try container.decodeIfPresent(Float.self, forKey: .sensitivity) ?? 50
         disableTimeout = try container.decodeIfPresent(Bool.self, forKey: .disableTimeout) ?? false
-        iosDeviceModel = try container.decodeIfPresent(String.self, forKey: .iosDeviceModel) ?? "iPad13,8"
+        iosDeviceModel = try container.decodeIfPresent(String.self, forKey: .iosDeviceModel) ?? "iPhone19,4"
         windowWidth = try container.decodeIfPresent(Int.self, forKey: .windowWidth) ?? 1920
         windowHeight = try container.decodeIfPresent(Int.self, forKey: .windowHeight) ?? 1080
         customScaler = try container.decodeIfPresent(Double.self, forKey: .customScaler) ?? 2.0
@@ -184,5 +226,9 @@ struct AppSettingsData: Codable {
         blockSleepSpamming = try container.decodeIfPresent(Bool.self, forKey: .blockSleepSpamming) ?? false
         ignoreUnityKeyboardInitializationError = try container.decodeIfPresent(
             Bool.self, forKey: .ignoreUnityKeyboardInitializationError) ?? false
+        let decodedUIScale = try container.decodeIfPresent(Double.self, forKey: .uiScale) ?? 1.0
+        uiScale = decodedUIScale <= 0.0 ? 1.0 : decodedUIScale
+        layoutIdiom = try container.decodeIfPresent(Int.self, forKey: .layoutIdiom) ?? 3
+        sdkShift = try container.decodeIfPresent(Bool.self, forKey: .sdkShift) ?? false
     }
 }
