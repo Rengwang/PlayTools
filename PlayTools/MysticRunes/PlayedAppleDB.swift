@@ -14,6 +14,7 @@ class PlayKeychainDB: NSObject {
 
     private var dbLock: DispatchSemaphore = .init(value: 1)
     private var dbVersion: Int = 1
+    private var isSchemaVerified: Bool = false
 
     func query(_ attributes: NSDictionary) -> [NSMutableDictionary]? {
         guard let tableName = attributes[kSecClass] as? String,
@@ -247,7 +248,9 @@ class PlayKeychainDB: NSObject {
         }
         let keychainDB = playChainDir.appendingPathComponent("\(bundleID).db")
 
-        let alreadyCreated = FileManager.default.fileExists(atPath: keychainDB.path)
+        let fileAttrs = try? FileManager.default.attributesOfItem(atPath: keychainDB.path)
+        let fileSize = (fileAttrs?[.size] as? NSNumber)?.int64Value ?? 0
+        let needsSchemaInit = fileSize == 0 || !isSchemaVerified
 
         guard sqlite3_open(keychainDB.path, &sqlite3DB) == SQLITE_OK,
               let sqlite3DB = sqlite3DB else {
@@ -255,9 +258,14 @@ class PlayKeychainDB: NSObject {
             return nil
         }
 
-        if !alreadyCreated || !structDB(sqlite3DB) {
-            _ = disconnectFromDB(sqlite3DB)
-            return nil
+        // Check PRAGMA user_version once per process (or on 0-byte files) so we do not
+        // fsync CREATE TABLE on every hot query while still initializing empty/0-byte DBs.
+        if needsSchemaInit {
+            guard verifySchemaIfNeeded(sqlite3DB, fileSize: fileSize) else {
+                _ = disconnectFromDB(sqlite3DB)
+                return nil
+            }
+            isSchemaVerified = true
         }
 
         return sqlite3DB
@@ -271,8 +279,10 @@ class PlayKeychainDB: NSObject {
 
         return true
     }
+}
 
-    private func encodeData(stmt: OpaquePointer, index: Int32, value: CFTypeRef) -> Bool {
+private extension PlayKeychainDB {
+    func encodeData(stmt: OpaquePointer, index: Int32, value: CFTypeRef) -> Bool {
         let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         var result = SQLITE_FAIL
         switch CFGetTypeID(value) {
@@ -294,7 +304,7 @@ class PlayKeychainDB: NSObject {
         return result == SQLITE_OK
     }
 
-    private func decodeData(stmt: OpaquePointer, index: Int32) -> CFTypeRef? {
+    func decodeData(stmt: OpaquePointer, index: Int32) -> CFTypeRef? {
         switch sqlite3_column_type(stmt, index) {
         case SQLITE_TEXT:
             guard let ptr = sqlite3_column_text(stmt, index) else { return nil }
@@ -308,6 +318,52 @@ class PlayKeychainDB: NSObject {
         default:
             PlayKeychain.debugLogger("Cannot decode this data \(sqlite3_column_type(stmt, index))")
             return nil
+        }
+    }
+
+    func verifySchemaIfNeeded(_ sqlite3DB: OpaquePointer, fileSize: Int64) -> Bool {
+        var currentVersion: Int32 = 0
+        var verStmt: OpaquePointer?
+        if sqlite3_prepare_v2(sqlite3DB, "PRAGMA user_version", -1, &verStmt, nil) == SQLITE_OK {
+            if sqlite3_step(verStmt) == SQLITE_ROW {
+                currentVersion = sqlite3_column_int(verStmt, 0)
+            }
+            sqlite3_finalize(verStmt)
+        }
+        if currentVersion < Int32(dbVersion) || fileSize == 0 {
+            return structDB(sqlite3DB)
+        }
+        return true
+    }
+}
+
+extension PlayKeychain {
+    static var defaultAccessGroup: String {
+        let bundleID = Bundle.main.infoDictionary?["CFBundleIdentifier"] as? String ?? "com.playcover.app"
+        return "PLAYCOVER.\(bundleID)"
+    }
+
+    static func normalizedAccessGroupDict(_ attributes: NSDictionary) -> NSDictionary {
+        guard let tableName = attributes[kSecClass] as? String,
+              let primaries = PlayedAppleDBConstants.primaries[tableName as CFString],
+              primaries.contains(kSecAttrAccessGroup),
+              attributes[kSecAttrAccessGroup] == nil else {
+            return attributes
+        }
+        let mutable = NSMutableDictionary(dictionary: attributes)
+        mutable[kSecAttrAccessGroup] = defaultAccessGroup
+        return mutable
+    }
+
+    static func ensureAccessGroupIfApplicable(_ dict: NSMutableDictionary) {
+        let tableName = dict[kSecClass] as? String
+        if let tableName,
+           let primaries = PlayedAppleDBConstants.primaries[tableName as CFString],
+           !primaries.contains(kSecAttrAccessGroup) {
+            return
+        }
+        if dict[kSecAttrAccessGroup] == nil {
+            dict[kSecAttrAccessGroup] = defaultAccessGroup
         }
     }
 }
