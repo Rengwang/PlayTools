@@ -6,7 +6,7 @@
 
 ---
 
-## 修改文件清单（7 个文件，+2446 / -175）
+## 修改文件清单
 
 1. **`AKPlugin.swift` & `Plugin.swift`**
    - 新增 `AKAppLayoutInfo`：读取 `UIDeviceFamily`、`UIRequiresFullScreen`、支持方向与 `UIApplicationSceneManifest`，判定应用是否支持自由自适应或推导推荐比例（`16:9` / `3:4` / `9:16`）。
@@ -33,5 +33,12 @@
 5. **`PlayTools/Controls/Frontend/EventAdapter/Mouse/Instances/TouchscreenMouseEventAdapter.swift`**
    - 改用 `contentLayoutRect` 计算指针归一化坐标并兼容 `dynamicWindowMode` 与常规缩放模式，修复标题栏偏移导致的点击偏差。
 
-6. **`PlayTools/MysticRunes/PlayedAppleDB.swift`**
-   - 在打开数据库前自动确保 `PlayChain` 目录存在。
+6. **`PlayTools/MysticRunes/PlayedApple.swift` & `PlayedAppleDB.swift`**
+   - 打开 SQLite 数据库前自动确保 `PlayChain` 目录存在，通过 `PRAGMA user_version` + 空文件检查避免高频重复建表 `fsync`，并补全默认 `kSecAttrAccessGroup`。
+
+7. **`PlayTools/Controls/Backend/Toucher.swift`**
+   - 触控开始命中测试前对 `screen.keyWindow` 做空值保护，避免窗口尚未就绪时点击崩溃。
+
+8. **`iPhone Duo`、UI Scale（`iOSMacScaleFactor`）、`SDK Shift` 与运行时护栏**
+   - `PlaySettings.swift`、`AKPlugin.swift`、`PlayScreen.swift`、`NSObject+Swizzle.m`：支持 `layoutIdiom = 3`（`iPhone19,4`）Duo 展开态侧边安全区、`UIWindowSceneGeometry.interfaceOrientation`、独占模拟内屏下 `_UIScreenFixedCoordinateSpace.bounds` 面积占比、`UIRequiresFullScreenIgnoredStartingWithVersion`、`sdkShift`（内存级 `NSBundle` SDK 元数据切换）及模式 6 `resizableAspectRatioType == 0` 优先级修复。
+   - `PlayLoader.m`：应用 `uiScale`（`iOSMacScaleFactor`）、libc interpose 指针快照、CloudKit 缺失权限降级桩、`UINSUIKitTerminationController` 退出超时收敛与稳定性护栏。
