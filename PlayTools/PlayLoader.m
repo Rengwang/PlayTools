@@ -12,6 +12,12 @@
 #import <sys/utsname.h>
 #import "NSObject+Swizzle.h"
 #import <dlfcn.h>
+#import <libkern/OSCacheControl.h>
+#import <mach-o/dyld.h>
+#import <mach-o/loader.h>
+#import <mach/mach.h>
+#import <objc/runtime.h>
+#import <os/lock.h>
 
 @import MachO;
 
@@ -64,7 +70,10 @@ static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0
     return sysctl(name, types, buf, size, arg0, arg1);
 }
 
+static int (* volatile pt_orig_sysctlbyname)(const char *, void *, size_t *, void *, size_t) = NULL;
+
 static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+    int (*orig_fn)(const char *, void *, size_t *, void *, size_t) = pt_orig_sysctlbyname ? pt_orig_sysctlbyname : &sysctlbyname;
     if ((strcmp(name, "hw.machine") == 0) || (strcmp(name, "hw.product") == 0) || (strcmp(name, "hw.model") == 0)) {
         if (oldp == NULL) {
             *oldlenp = strlen(DEVICE_MODEL) + 1;
@@ -78,7 +87,7 @@ static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
             *oldlenp = strlen(DEVICE_MODEL) + 1;
             return 0;
         } else {
-            int ret = sysctlbyname(name, oldp, oldlenp, newp, newlen);
+            int ret = orig_fn(name, oldp, oldlenp, newp, newlen);
             return ret;
         }
     } else if ((strcmp(name, "hw.target") == 0)) {
@@ -93,11 +102,11 @@ static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
             *oldlenp = strlen(OEM_ID) + 1;
             return 0;
         } else {
-            int ret = sysctlbyname(name, oldp, oldlenp, newp, newlen);
+            int ret = orig_fn(name, oldp, oldlenp, newp, newlen);
             return ret;
         }
     } else {
-        return sysctlbyname(name, oldp, oldlenp, newp, newlen);
+        return orig_fn(name, oldp, oldlenp, newp, newlen);
     }
 }
 
@@ -215,54 +224,88 @@ DYLD_INTERPOSE(pt_SecKeyCreateRandomKey, SecKeyCreateRandomKey)
 DYLD_INTERPOSE(pt_SecKeyGeneratePair, SecKeyGeneratePair)
 
 static uint8_t ue_status = 0;
+static char UE_PATTERN[1024] = "//Users/";
+static BOOL ue_pattern_ready = NO;
+
+static void init_ue_pattern(void) {
+    if (ue_pattern_ready) return;
+    if (getlogin_r(UE_PATTERN + 8, sizeof(UE_PATTERN) - 8) == 0 && UE_PATTERN[8] != '\0') {
+        ue_pattern_ready = YES;
+    }
+}
 
 static char const* ue_fix_filename(char const* filename) {
-    static char UE_PATTERN[1024] = "//Users/";
-    getlogin_r(UE_PATTERN + 8, sizeof(UE_PATTERN) - 8);
-    
-    char const* p = filename;
-    if (ue_status == 2) {
-        char const* last_p = p;
-        while ((p = strstr(p, UE_PATTERN))) {
-            last_p = ++p;
-        }
-        
-        return last_p;
+    // Only rewrite Unreal Engine paths, and never call getlogin_r here: crash reporters
+    // like Heimdallr suspend threads while invoking rename/open, which deadlocks on
+    // libsystem_c's internal getlogin mutex if any suspended thread holds it.
+    if (ue_status != 2 || !ue_pattern_ready || !filename) {
+        return filename;
     }
 
-    return p;
+    char const* p = filename;
+    char const* last_p = p;
+    while ((p = strstr(p, UE_PATTERN))) {
+        last_p = ++p;
+    }
+    return last_p;
+}
+
+// Snapshot libc pointers at constructor time into writable globals (outside __got /
+// __la_symbol_ptr) so clang cannot fold them back into symbol-stub calls and runtime
+// fishhook/rebind_symbols hooks in apps (e.g. ByteDance Heimdallr) cannot create
+// mutual recursion cycles (app_hook -> DYLD_INTERPOSE pt_* -> app_hook).
+static int (* volatile pt_orig_open)(char const* restrict, int, ...) = NULL;
+static int (* volatile pt_orig_stat)(char const* restrict, struct stat* restrict) = NULL;
+static int (* volatile pt_orig_access)(char const*, int) = NULL;
+static int (* volatile pt_orig_rename)(char const* restrict, char const* restrict) = NULL;
+static int (* volatile pt_orig_unlink)(char const*) = NULL;
+static int (* volatile pt_orig_usleep)(useconds_t) = NULL;
+
+__attribute__((constructor(101))) static void pt_snapshot_libc_originals(void) {
+    pt_orig_sysctlbyname = &sysctlbyname;
+    pt_orig_open = &open;
+    pt_orig_stat = &stat;
+    pt_orig_access = &access;
+    pt_orig_rename = &rename;
+    pt_orig_unlink = &unlink;
+    pt_orig_usleep = &usleep;
 }
 
 static int pt_open(char const* restrict filename, int oflag, ... ) {
     filename = ue_fix_filename(filename);
+    int (*orig_fn)(char const* restrict, int, ...) = pt_orig_open ? pt_orig_open : &open;
 
-    if (oflag == O_CREAT) {
+    if (oflag & O_CREAT) {
         int mod;
         va_list ap;
         va_start(ap, oflag);
         mod = va_arg(ap, int);
         va_end(ap);
 
-        return open(filename, O_CREAT, mod);
+        return orig_fn(filename, oflag, mod);
     }
 
-    return open(filename, oflag);
+    return orig_fn(filename, oflag);
 }
 
 static int pt_stat(char const* restrict path, struct stat* restrict buf) {
-    return stat(ue_fix_filename(path), buf);
+    int (*orig_fn)(char const* restrict, struct stat* restrict) = pt_orig_stat ? pt_orig_stat : &stat;
+    return orig_fn(ue_fix_filename(path), buf);
 }
 
 static int pt_access(char const* path, int mode) {
-    return access(ue_fix_filename(path), mode);
+    int (*orig_fn)(char const*, int) = pt_orig_access ? pt_orig_access : &access;
+    return orig_fn(ue_fix_filename(path), mode);
 }
 
 static int pt_rename(char const* restrict old_name, char const* restrict new_name) {
-    return rename(ue_fix_filename(old_name), ue_fix_filename(new_name));
+    int (*orig_fn)(char const* restrict, char const* restrict) = pt_orig_rename ? pt_orig_rename : &rename;
+    return orig_fn(ue_fix_filename(old_name), ue_fix_filename(new_name));
 }
 
 static int pt_unlink(char const* path) {
-    return unlink(ue_fix_filename(path));
+    int (*orig_fn)(char const*) = pt_orig_unlink ? pt_orig_unlink : &unlink;
+    return orig_fn(ue_fix_filename(path));
 }
 
 static NSMutableDictionary *thread_sleep_counters = nil;
@@ -316,7 +359,8 @@ static int pt_usleep(useconds_t time) {
         }
     }
     
-    return usleep(time);
+    int (*orig_fn)(useconds_t) = pt_orig_usleep ? pt_orig_usleep : &usleep;
+    return orig_fn(time);
 }
 
 
@@ -327,9 +371,585 @@ DYLD_INTERPOSE(pt_rename, rename)
 DYLD_INTERPOSE(pt_unlink, unlink)
 DYLD_INTERPOSE(pt_usleep, usleep)
 
+#pragma mark - Universal Catalyst Compatibility & Anti-Tamper Guards
+
+// Neutralize raw inline `svc #0x80` exit stubs inside FirebaseNIMessInstallation
+// when that module is loaded (no-op for apps that do not ship it).
+static int pt_patchFirebaseInlineExits(void) {
+    static const uint32_t exitRetPat[4] = { 0xd2800000, 0x52800030, 0xd4001001, 0xd65f03c0 };
+    static const uint32_t exitClobberPat[4] = { 0xd2800000, 0x52800030, 0xd4001001, 0xd2800001 };
+
+    int totalPatched = 0;
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *imgName = _dyld_get_image_name(i);
+        if (!imgName || strstr(imgName, "FirebaseNIMessInstallation") == NULL) continue;
+
+        const struct mach_header *rawHdr = _dyld_get_image_header(i);
+        if (!rawHdr || rawHdr->magic != MH_MAGIC_64) continue;
+        const struct mach_header_64 *hdr = (const struct mach_header_64 *)rawHdr;
+        intptr_t slide = _dyld_get_image_vmaddr_slide(i);
+
+        const uint8_t *cursor = (const uint8_t *)(hdr + 1);
+        for (uint32_t c = 0; c < hdr->ncmds; c++) {
+            const struct load_command *lc = (const struct load_command *)cursor;
+            if (lc->cmd == LC_SEGMENT_64) {
+                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+                if ((seg->initprot & VM_PROT_EXECUTE) && seg->filesize >= 16) {
+                    uintptr_t textStart = (uintptr_t)seg->vmaddr + (uintptr_t)slide;
+                    uintptr_t textEnd = textStart + (uintptr_t)seg->vmsize;
+                    vm_size_t pageSz = vm_page_size;
+                    vm_address_t pageStart = textStart & ~(pageSz - 1);
+                    vm_address_t pageEnd = (textEnd + pageSz - 1) & ~(pageSz - 1);
+                    vm_size_t pageLen = pageEnd - pageStart;
+
+                    kern_return_t kr = vm_protect(mach_task_self(), pageStart, pageLen, FALSE,
+                                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                    if (kr == KERN_SUCCESS) {
+                        for (uintptr_t addr = textStart; addr + 16 <= textEnd; addr += 4) {
+                            const uint32_t *w = (const uint32_t *)addr;
+                            if (w[0] == exitRetPat[0] && w[1] == exitRetPat[1] &&
+                                w[2] == exitRetPat[2] && w[3] == exitRetPat[3]) {
+                                *(uint32_t *)(addr + 8) = 0xd503201f; // nop svc #0x80 -> falls through to ret
+                                totalPatched++;
+                            } else if (w[0] == exitClobberPat[0] && w[1] == exitClobberPat[1] &&
+                                       w[2] == exitClobberPat[2] && w[3] == exitClobberPat[3]) {
+                                *(uint32_t *)(addr + 8) = 0xd65f03c0; // ret before mov sp, #0
+                                totalPatched++;
+                            }
+                        }
+                        vm_protect(mach_task_self(), pageStart, pageLen, FALSE, VM_PROT_READ | VM_PROT_EXECUTE);
+                        sys_icache_invalidate((void *)textStart, (size_t)(textEnd - textStart));
+                    }
+                }
+            }
+            cursor += lc->cmdsize;
+        }
+    }
+    return totalPatched;
+}
+
+static IMP pt_origRegisterForRemoteNotifications;
+static os_unfair_lock pt_remoteRegLock = OS_UNFAIR_LOCK_INIT;
+static CFAbsoluteTime pt_lastRemoteRegTime = 0;
+
+// Rate-limit -[UIApplication registerForRemoteNotifications] so ad-hoc apps without
+// APNs entitlements do not spin in a 200% CPU failure/retry loop (e.g. JPush/TIMPush).
+static void pt_registerForRemoteNotifications(id self, SEL _cmd) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    BOOL allow = NO;
+    os_unfair_lock_lock(&pt_remoteRegLock);
+    if (pt_lastRemoteRegTime == 0 || (now - pt_lastRemoteRegTime) >= 30.0) {
+        pt_lastRemoteRegTime = now;
+        allow = YES;
+    }
+    os_unfair_lock_unlock(&pt_remoteRegLock);
+    if (!allow) return;
+    if (pt_origRegisterForRemoteNotifications) {
+        ((void (*)(id, SEL))pt_origRegisterForRemoteNotifications)(self, _cmd);
+    }
+}
+
+static IMP pt_origPostNotification;
+static os_unfair_lock pt_notiLock = OS_UNFAIR_LOCK_INIT;
+static CFAbsoluteTime pt_lastCheckNotiTime = 0;
+
+static void pt_postNotificationName(id self, SEL _cmd, NSNotificationName name, id obj, NSDictionary *userInfo) {
+    if ([name isKindOfClass:[NSString class]] &&
+        [(NSString *)name isEqualToString:@"kJPUSHCheckNotiAuthNotification"]) {
+        CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+        BOOL allow = NO;
+        os_unfair_lock_lock(&pt_notiLock);
+        if (pt_lastCheckNotiTime == 0 || (now - pt_lastCheckNotiTime) >= 10.0) {
+            pt_lastCheckNotiTime = now;
+            allow = YES;
+        }
+        os_unfair_lock_unlock(&pt_notiLock);
+        if (!allow) return;
+    }
+    if (pt_origPostNotification) {
+        ((void (*)(id, SEL, id, id, id))pt_origPostNotification)(self, _cmd, name, obj, userInfo);
+    }
+}
+
+static BOOL pt_shouldSuppressRiskBannerText(id text) {
+    if (![text isKindOfClass:[NSString class]]) return NO;
+    NSString *lower = [(NSString *)text lowercaseString];
+    return [lower containsString:@"hooking"] ||
+           [lower containsString:@"proxy detected"] ||
+           [lower containsString:@"integrity"] ||
+           [lower containsString:@"compromise"] ||
+           [lower containsString:@"re-download"] ||
+           [lower containsString:@"official"] ||
+           [lower containsString:@"tamper"] ||
+           [lower containsString:@"数据安全风险"];
+}
+
+static IMP pt_origSetMessageText;
+static void pt_setMessageText(id self, SEL _cmd, id text) {
+    if (pt_shouldSuppressRiskBannerText(text)) {
+        return;
+    }
+    if (pt_origSetMessageText) {
+        ((void (*)(id, SEL, id))pt_origSetMessageText)(self, _cmd, text);
+    }
+}
+
+static IMP pt_origPendJetPrinterOperation;
+static void pt_pendJetPrinterOperation(id self, SEL _cmd, id msg, double duration) {
+    if (pt_shouldSuppressRiskBannerText(msg)) {
+        return;
+    }
+    if (pt_origPendJetPrinterOperation) {
+        ((void (*)(id, SEL, id, double))pt_origPendJetPrinterOperation)(self, _cmd, msg, duration);
+    }
+}
+
+static void pt_installRiskBannerHooks(void) {
+    Class mgr = objc_getClass("PrinterPlatformizationManger");
+    if (mgr && !pt_origPendJetPrinterOperation) {
+        Method m = class_getInstanceMethod(mgr, sel_registerName("pendJetPrinterOperation:duration:"));
+        if (m) {
+            pt_origPendJetPrinterOperation = method_getImplementation(m);
+            if (pt_origPendJetPrinterOperation != (IMP)pt_pendJetPrinterOperation) {
+                class_replaceMethod(mgr, sel_registerName("pendJetPrinterOperation:duration:"),
+                                    (IMP)pt_pendJetPrinterOperation, method_getTypeEncoding(m));
+            }
+        }
+    }
+    Class impl = objc_getClass("PrinterPlatformizationMangerImpl");
+    if (impl && !pt_origSetMessageText) {
+        Method m = class_getInstanceMethod(impl, sel_registerName("setMessageText:"));
+        if (m) {
+            pt_origSetMessageText = method_getImplementation(m);
+            if (pt_origSetMessageText != (IMP)pt_setMessageText) {
+                class_replaceMethod(impl, sel_registerName("setMessageText:"),
+                                    (IMP)pt_setMessageText, method_getTypeEncoding(m));
+            }
+        }
+    }
+}
+
+static void pt_applyUIScaleFactor(void) {
+    double uiScale = [[PlaySettings shared] uiScale];
+    if (uiScale <= 0.0) {
+        uiScale = 1.0;
+    }
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    if (uiScale >= 0.76 && uiScale <= 0.78) {
+        [defaults removeObjectForKey:@"iOSMacScaleFactor"];
+        [defaults removeObjectForKey:@"UINSLastUsedWindowScaleFactor"];
+    } else if (uiScale >= 0.5 && uiScale <= 3.0) {
+        [defaults setDouble:uiScale forKey:@"iOSMacScaleFactor"];
+        [defaults removeObjectForKey:@"UINSLastUsedWindowScaleFactor"];
+    } else {
+        [defaults setDouble:1.0 forKey:@"iOSMacScaleFactor"];
+        [defaults removeObjectForKey:@"UINSLastUsedWindowScaleFactor"];
+    }
+    [defaults synchronize];
+}
+
+static void pt_installTerminationTimeoutHooks(void);
+static void pt_installCloudKitCompatibilityHooks(void);
+
+static void pt_installUniversalCompatibilityGuards(void) {
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    // Prevent AppKit's "unexpectedly quit while reopening windows" modal from blocking Catalyst launch.
+    [defaults setBool:YES forKey:@"ApplePersistenceIgnoreState"];
+    pt_applyUIScaleFactor();
+
+    pt_patchFirebaseInlineExits();
+    pt_installRiskBannerHooks();
+
+    Class nc = objc_getClass("NSNotificationCenter");
+    if (nc) {
+        Method m = class_getInstanceMethod(nc, @selector(postNotificationName:object:userInfo:));
+        if (m) {
+            pt_origPostNotification = method_getImplementation(m);
+            class_replaceMethod(nc, @selector(postNotificationName:object:userInfo:),
+                                (IMP)pt_postNotificationName, method_getTypeEncoding(m));
+        }
+    }
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        Class uiApp = objc_getClass("UIApplication");
+        if (uiApp) {
+            Method m = class_getInstanceMethod(uiApp, sel_registerName("registerForRemoteNotifications"));
+            if (m) {
+                pt_origRegisterForRemoteNotifications = method_getImplementation(m);
+                class_replaceMethod(uiApp, sel_registerName("registerForRemoteNotifications"),
+                                    (IMP)pt_registerForRemoteNotifications, method_getTypeEncoding(m));
+            }
+        }
+        pt_installRiskBannerHooks();
+        pt_installTerminationTimeoutHooks();
+    });
+}
+
+static void (*pt_origLetBackgroundTasksCompleteWithTimeout)(id, SEL, double) = NULL;
+static BOOL pt_terminationHookInstalled = NO;
+
+static void pt_letBackgroundTasksCompleteWithTimeout(id self, SEL _cmd, double timeout) {
+    // Cap UIKitMacHelper's post-Cmd+Q background-task grace window (default 35s) so SDK
+    // tasks opened during applicationDidEnterBackground cannot trap apps in an invisible
+    // background zombie state that resumes the old screen when clicked again.
+    double cappedTimeout = (timeout > 0.35) ? 0.35 : timeout;
+    if (pt_origLetBackgroundTasksCompleteWithTimeout) {
+        pt_origLetBackgroundTasksCompleteWithTimeout(self, _cmd, cappedTimeout);
+    }
+}
+
+static void pt_tryInstallTerminationTimeoutHookNow(void) {
+    if (pt_terminationHookInstalled) {
+        return;
+    }
+    Class termCtrl = objc_getClass("UINSUIKitTerminationController");
+    if (!termCtrl) {
+        return;
+    }
+    SEL sel = sel_registerName("letBackgroundTasksCompleteWithTimeout:");
+    Method m = class_getInstanceMethod(termCtrl, sel);
+    if (m) {
+        pt_origLetBackgroundTasksCompleteWithTimeout = (void (*)(id, SEL, double))method_getImplementation(m);
+        class_replaceMethod(termCtrl, sel, (IMP)pt_letBackgroundTasksCompleteWithTimeout, method_getTypeEncoding(m));
+        pt_terminationHookInstalled = YES;
+    }
+}
+
+static void pt_installTerminationTimeoutHooks(void) {
+    pt_tryInstallTerminationTimeoutHookNow();
+    if (!pt_terminationHookInstalled) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            pt_tryInstallTerminationTimeoutHookNow();
+        }];
+    }
+}
+
+#pragma mark - CloudKit Compatibility Guard
+
+static Class pt_CKContainerClass = Nil;
+static Class pt_CKDatabaseClass = Nil;
+static id (*pt_origCKDefaultContainer)(id, SEL) = NULL;
+static id (*pt_origCKContainerWithIdentifier)(id, SEL, NSString *) = NULL;
+static BOOL pt_cloudKitHooksInstalled = NO;
+
+static NSError *pt_cloudKitMissingEntitlementError(void) {
+    return [NSError errorWithDomain:@"CKErrorDomain"
+                               code:8 /* CKErrorMissingEntitlement */
+                           userInfo:@{NSLocalizedDescriptionKey: @"Missing CloudKit entitlement"}];
+}
+
+@interface PTStubCKDatabase : NSObject
+@property (nonatomic, assign) NSInteger databaseScope;
+@end
+
+@implementation PTStubCKDatabase
+
+- (BOOL)isKindOfClass:(Class)aClass {
+    return [super isKindOfClass:aClass] || (pt_CKDatabaseClass && [pt_CKDatabaseClass isSubclassOfClass:aClass]);
+}
+
+- (void)pt_failCompletion:(void (^)(id _Nullable, NSError * _Nullable))completion {
+    if (!completion) return;
+    NSError *err = pt_cloudKitMissingEntitlementError();
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        completion(nil, err);
+    });
+}
+
+- (void)fetchRecordWithID:(id)recordID completionHandler:(void (^)(id _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:completionHandler];
+}
+
+- (void)saveRecord:(id)record completionHandler:(void (^)(id _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:completionHandler];
+}
+
+- (void)deleteRecordWithID:(id)recordID completionHandler:(void (^)(id _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:completionHandler];
+}
+
+- (void)performQuery:(id)query inZoneWithID:(id)zoneID completionHandler:(void (^)(NSArray * _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:(void (^)(id, NSError *))completionHandler];
+}
+
+- (void)fetchAllRecordZonesWithCompletionHandler:(void (^)(NSArray * _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:(void (^)(id, NSError *))completionHandler];
+}
+
+- (void)fetchRecordZoneWithID:(id)zoneID completionHandler:(void (^)(id _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:completionHandler];
+}
+
+- (void)saveRecordZone:(id)zone completionHandler:(void (^)(id _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:completionHandler];
+}
+
+- (void)deleteRecordZoneWithID:(id)zoneID completionHandler:(void (^)(id _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:completionHandler];
+}
+
+- (void)fetchAllSubscriptionsWithCompletionHandler:(void (^)(NSArray * _Nullable, NSError * _Nullable))completionHandler {
+    [self pt_failCompletion:(void (^)(id, NSError *))completionHandler];
+}
+
+- (void)addOperation:(id)operation {
+}
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+    NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
+    if (!sig && pt_CKDatabaseClass) {
+        sig = [pt_CKDatabaseClass instanceMethodSignatureForSelector:aSelector];
+    }
+    return sig ?: [NSMethodSignature signatureWithObjCTypes:"v@:"];
+}
+
+- (void)forwardInvocation:(NSInvocation *)anInvocation {
+    // Zero-initialize any return buffer so callers receive nil/0/NO cleanly.
+    NSUInteger retLen = anInvocation.methodSignature.methodReturnLength;
+    if (retLen > 0) {
+        uint8_t *zeroBuf = calloc(1, retLen);
+        if (zeroBuf) {
+            [anInvocation setReturnValue:zeroBuf];
+            free(zeroBuf);
+        }
+    }
+}
+
+@end
+
+@interface PTStubCKContainer : NSObject
+@property (nonatomic, copy) NSString *containerIdentifier;
+@property (nonatomic, strong) PTStubCKDatabase *privateCloudDatabase;
+@property (nonatomic, strong) PTStubCKDatabase *publicCloudDatabase;
+@property (nonatomic, strong) PTStubCKDatabase *sharedCloudDatabase;
+@end
+
+@implementation PTStubCKContainer
+
+- (instancetype)initWithIdentifier:(NSString *)identifier {
+    self = [super init];
+    if (self) {
+        _containerIdentifier = [identifier copy];
+        _privateCloudDatabase = [[PTStubCKDatabase alloc] init];
+        _privateCloudDatabase.databaseScope = 2;
+        _publicCloudDatabase = [[PTStubCKDatabase alloc] init];
+        _publicCloudDatabase.databaseScope = 1;
+        _sharedCloudDatabase = [[PTStubCKDatabase alloc] init];
+        _sharedCloudDatabase.databaseScope = 3;
+    }
+    return self;
+}
+
+- (BOOL)isKindOfClass:(Class)aClass {
+    return [super isKindOfClass:aClass] || (pt_CKContainerClass && [pt_CKContainerClass isSubclassOfClass:aClass]);
+}
+
+- (id)databaseWithDatabaseScope:(NSInteger)scope {
+    if (scope == 1) return self.publicCloudDatabase;
+    if (scope == 3) return self.sharedCloudDatabase;
+    return self.privateCloudDatabase;
+}
+
+- (void)accountStatusWithCompletionHandler:(void (^)(NSInteger, NSError * _Nullable))completionHandler {
+    if (!completionHandler) return;
+    NSError *err = pt_cloudKitMissingEntitlementError();
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSLog(@"[PC] CloudKit accountStatus stub completion for %@", self.containerIdentifier);
+        completionHandler(0 /* CKAccountStatusCouldNotDetermine */, err);
+    });
+}
+
+- (void)fetchUserRecordIDWithCompletionHandler:(void (^)(id _Nullable, NSError * _Nullable))completionHandler {
+    if (!completionHandler) return;
+    NSError *err = pt_cloudKitMissingEntitlementError();
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        completionHandler(nil, err);
+    });
+}
+
+- (void)requestApplicationPermission:(NSUInteger)applicationPermission
+                   completionHandler:(void (^)(NSInteger, NSError * _Nullable))completionHandler {
+    if (!completionHandler) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        completionHandler(2 /* CKApplicationPermissionStatusDenied */, nil);
+    });
+}
+
+- (void)statusForApplicationPermission:(NSUInteger)applicationPermission
+                     completionHandler:(void (^)(NSInteger, NSError * _Nullable))completionHandler {
+    if (!completionHandler) return;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        completionHandler(2 /* CKApplicationPermissionStatusDenied */, nil);
+    });
+}
+
+- (void)addOperation:(id)operation {
+}
+
+- (NSMethodSignature *)methodSignatureForSelector:(SEL)aSelector {
+    NSMethodSignature *sig = [super methodSignatureForSelector:aSelector];
+    if (!sig && pt_CKContainerClass) {
+        sig = [pt_CKContainerClass instanceMethodSignatureForSelector:aSelector];
+    }
+    return sig ?: [NSMethodSignature signatureWithObjCTypes:"v@:"];
+}
+
+- (void)forwardInvocation:(NSInvocation *)anInvocation {
+    NSUInteger retLen = anInvocation.methodSignature.methodReturnLength;
+    if (retLen > 0) {
+        uint8_t *zeroBuf = calloc(1, retLen);
+        if (zeroBuf) {
+            [anInvocation setReturnValue:zeroBuf];
+            free(zeroBuf);
+        }
+    }
+}
+
+@end
+
+static BOOL pt_hasCloudKitEntitlementForContainer(NSString * _Nullable containerID) {
+    typedef CFTypeRef (*SecTaskCreateFromSelfFn)(CFAllocatorRef);
+    typedef CFTypeRef (*SecTaskCopyValueForEntitlementFn)(CFTypeRef, CFStringRef, CFErrorRef *);
+    static SecTaskCreateFromSelfFn createSelfFn = NULL;
+    static SecTaskCopyValueForEntitlementFn copyEntitlementFn = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        createSelfFn = (SecTaskCreateFromSelfFn)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        copyEntitlementFn = (SecTaskCopyValueForEntitlementFn)dlsym(RTLD_DEFAULT, "SecTaskCopyValueForEntitlement");
+    });
+    if (!createSelfFn || !copyEntitlementFn) {
+        return NO;
+    }
+    CFTypeRef task = createSelfFn(kCFAllocatorDefault);
+    if (!task) {
+        return NO;
+    }
+
+    BOOL hasService = NO;
+    CFTypeRef services = copyEntitlementFn(task, CFSTR("com.apple.developer.icloud-services"), NULL);
+    if (services) {
+        if (CFGetTypeID(services) == CFArrayGetTypeID()) {
+            for (id entry in (__bridge NSArray *)services) {
+                if ([entry isKindOfClass:[NSString class]] &&
+                    [(NSString *)entry caseInsensitiveCompare:@"CloudKit"] == NSOrderedSame) {
+                    hasService = YES;
+                    break;
+                }
+            }
+        }
+        CFRelease(services);
+    }
+
+    BOOL hasContainer = NO;
+    if (hasService) {
+        CFTypeRef containers = copyEntitlementFn(task, CFSTR("com.apple.developer.icloud-container-identifiers"), NULL);
+        if (containers) {
+            if (CFGetTypeID(containers) == CFArrayGetTypeID()) {
+                NSArray *arr = (__bridge NSArray *)containers;
+                if (containerID.length > 0) {
+                    hasContainer = [arr containsObject:containerID] || [arr containsObject:@"*"];
+                } else {
+                    hasContainer = arr.count > 0;
+                }
+            }
+            CFRelease(containers);
+        }
+    }
+
+    CFRelease(task);
+    return hasService && hasContainer;
+}
+
+static id pt_stubContainerForIdentifier(NSString * _Nullable identifier) {
+    static NSMutableDictionary<NSString *, PTStubCKContainer *> *stubCache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        stubCache = [NSMutableDictionary dictionary];
+    });
+    NSString *key = identifier.length > 0
+        ? identifier
+        : ([[NSBundle mainBundle] bundleIdentifier] ?: @"iCloud.playcover.stub");
+    @synchronized (stubCache) {
+        PTStubCKContainer *stub = stubCache[key];
+        if (!stub) {
+            NSLog(@"[PC] Using CloudKit missing-entitlement stub container for %@", key);
+            stub = [[PTStubCKContainer alloc] initWithIdentifier:key];
+            stubCache[key] = stub;
+        }
+        return stub;
+    }
+}
+
+static id pt_ckDefaultContainer(id self, SEL _cmd) {
+    if (pt_hasCloudKitEntitlementForContainer(nil) && pt_origCKDefaultContainer) {
+        return pt_origCKDefaultContainer(self, _cmd);
+    }
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+    NSString *fallbackID = bid.length > 0 ? [@"iCloud." stringByAppendingString:bid] : @"iCloud.playcover.stub";
+    return pt_stubContainerForIdentifier(fallbackID);
+}
+
+static id pt_ckContainerWithIdentifier(id self, SEL _cmd, NSString *identifier) {
+    if (identifier.length > 0 && pt_hasCloudKitEntitlementForContainer(identifier) && pt_origCKContainerWithIdentifier) {
+        return pt_origCKContainerWithIdentifier(self, _cmd, identifier);
+    }
+    return pt_stubContainerForIdentifier(identifier);
+}
+
+static void pt_tryInstallCloudKitHooksNow(void) {
+    if (pt_cloudKitHooksInstalled) {
+        return;
+    }
+    Class ckContainer = objc_getClass("CKContainer");
+    if (!ckContainer) {
+        return;
+    }
+    pt_CKContainerClass = ckContainer;
+    pt_CKDatabaseClass = objc_getClass("CKDatabase");
+    Class ckMeta = object_getClass(ckContainer);
+    if (!ckMeta) {
+        return;
+    }
+
+    SEL defaultSel = sel_registerName("defaultContainer");
+    Method defaultM = class_getClassMethod(ckContainer, defaultSel);
+    if (defaultM) {
+        pt_origCKDefaultContainer = (id (*)(id, SEL))method_getImplementation(defaultM);
+        class_replaceMethod(ckMeta, defaultSel, (IMP)pt_ckDefaultContainer, method_getTypeEncoding(defaultM));
+    }
+
+    SEL withIdSel = sel_registerName("containerWithIdentifier:");
+    Method withIdM = class_getClassMethod(ckContainer, withIdSel);
+    if (withIdM) {
+        pt_origCKContainerWithIdentifier = (id (*)(id, SEL, NSString *))method_getImplementation(withIdM);
+        class_replaceMethod(ckMeta, withIdSel, (IMP)pt_ckContainerWithIdentifier, method_getTypeEncoding(withIdM));
+    }
+
+    pt_cloudKitHooksInstalled = YES;
+}
+
+static void pt_installCloudKitCompatibilityHooks(void) {
+    pt_tryInstallCloudKitHooksNow();
+    if (!pt_cloudKitHooksInstalled) {
+        [[NSNotificationCenter defaultCenter] addObserverForName:NSBundleDidLoadNotification
+                                                          object:nil
+                                                           queue:nil
+                                                      usingBlock:^(NSNotification * _Nonnull note) {
+            pt_tryInstallCloudKitHooksNow();
+        }];
+    }
+}
+
 @implementation PlayLoader
 
 static void __attribute__((constructor)) initialize(void) {
+    // Install CloudKit entitlement guard synchronously before any background startup queue runs.
+    pt_installCloudKitCompatibilityHooks();
+    pt_installUniversalCompatibilityGuards();
     [PlayCover launch];
     
     if (ue_status == 0) {
@@ -339,6 +959,7 @@ static void __attribute__((constructor)) initialize(void) {
     }
     
     if (ue_status == 2) {
+        init_ue_pattern();
         [PlayKeychain debugLogger: [NSString stringWithFormat:@"UnrealEngine Hooked"]];
     }
 
