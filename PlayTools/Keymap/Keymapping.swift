@@ -5,6 +5,7 @@
 //  Created by 이승윤 on 2022/08/29.
 //
 
+import Darwin
 import Foundation
 
 let keymap = Keymapping.shared
@@ -27,12 +28,33 @@ class Keymapping {
     private let baseKeymapURL: URL
     private let configURL: URL
     private var keymapOrder: [URL: KeymappingData] = [:]
+    private var cachedConfig: (config: KeymapConfig, mtime: timespec)?
+    private var cachedKeymaps: [URL: (data: KeymappingData, mtime: timespec)] = [:]
+
+    private func fileMtime(at url: URL) -> timespec? {
+        var fileStat = stat()
+        guard stat(url.path, &fileStat) == 0 else { return nil }
+        return fileStat.st_mtimespec
+    }
+
+    private func sameMtime(_ lhs: timespec?, _ rhs: timespec?) -> Bool {
+        guard let lhs = lhs, let rhs = rhs else { return false }
+        return lhs.tv_sec == rhs.tv_sec && lhs.tv_nsec == rhs.tv_nsec
+    }
 
     public var keymapConfig: KeymapConfig {
         get {
+            if let cached = cachedConfig,
+               sameMtime(cached.mtime, fileMtime(at: configURL)) {
+                return cached.config
+            }
             do {
                 let data = try Data(contentsOf: configURL)
-                return try PropertyListDecoder().decode(KeymapConfig.self, from: data)
+                let decoded = try PropertyListDecoder().decode(KeymapConfig.self, from: data)
+                if let mtime = fileMtime(at: configURL) {
+                    cachedConfig = (decoded, mtime)
+                }
+                return decoded
             } catch {
                 print("[PlayTools] Failed to decode config url.\n%@")
                 return resetConfig()
@@ -45,6 +67,11 @@ class Keymapping {
             do {
                 let data = try encoder.encode(newValue)
                 try data.write(to: configURL)
+                if let mtime = fileMtime(at: configURL) {
+                    cachedConfig = (newValue, mtime)
+                } else {
+                    cachedConfig = nil
+                }
             } catch {
                 print("[PlayTools] Keymapping encode failed.\n%@")
             }
@@ -102,9 +129,16 @@ class Keymapping {
     }
 
     private func getKeymap(path: URL) -> KeymappingData {
+        if let cached = cachedKeymaps[path],
+           sameMtime(cached.mtime, fileMtime(at: path)) {
+            return cached.data
+        }
         do {
             let data = try Data(contentsOf: path)
             let map = try PropertyListDecoder().decode(KeymappingData.self, from: data)
+            if let mtime = fileMtime(at: path) {
+                cachedKeymaps[path] = (map, mtime)
+            }
             return map
         } catch {
             print("[PlayTools] Keymapping decode failed.\n%@")
@@ -120,10 +154,15 @@ class Keymapping {
         do {
             let data = try encoder.encode(map)
             try data.write(to: path)
+            if let mtime = fileMtime(at: path) {
+                cachedKeymaps[path] = (map, mtime)
+            } else {
+                cachedKeymaps.removeValue(forKey: path)
+            }
 
             if !keymapOrder.keys.contains(path) {
                 keymapConfig.keymapOrder.append(path)
-                keymapOrder[path] = getKeymap(path: path)
+                keymapOrder[path] = map
             }
         } catch {
             print("[PlayTools] Keymapping encode failed.\n%@")

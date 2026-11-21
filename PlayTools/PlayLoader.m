@@ -5,6 +5,7 @@
 
 #include <Foundation/Foundation.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <sys/sysctl.h>
 
 #import "PlayLoader.h"
@@ -21,11 +22,59 @@
 
 @import MachO;
 
-// Get device model from playcover .plist
-// With a null terminator
-#define DEVICE_MODEL [[[PlaySettings shared] deviceModel] cStringUsingEncoding:NSUTF8StringEncoding]
-#define OEM_ID [[[PlaySettings shared] oemID] cStringUsingEncoding:NSUTF8StringEncoding]
+// Cache device model / OEM ID / blockSleepSpamming once in C storage so hot
+// libc interpose paths (sysctl/sysctlbyname/uname/usleep) avoid ObjC messaging.
 #define PLATFORM_IOS 2
+
+static os_unfair_lock pt_settings_cache_lock = OS_UNFAIR_LOCK_INIT;
+static char pt_cached_device_model_buf[128] = "iPhone19,4";
+static size_t pt_cached_device_model_len = 10;
+static char pt_cached_oem_id_buf[64] = "J320xAP";
+static size_t pt_cached_oem_id_len = 7;
+static atomic_bool pt_device_cache_ready = ATOMIC_VAR_INIT(false);
+static atomic_bool pt_block_sleep_cache_ready = ATOMIC_VAR_INIT(false);
+static atomic_bool pt_block_sleep_spamming_val = ATOMIC_VAR_INIT(false);
+static __thread BOOL pt_in_settings_lookup = NO;
+
+static void pt_ensure_device_settings_cached(void) {
+    if (atomic_load_explicit(&pt_device_cache_ready, memory_order_acquire) || pt_in_settings_lookup) {
+        return;
+    }
+    pt_in_settings_lookup = YES;
+    NSString *model = [[PlaySettings shared] deviceModel];
+    NSString *oem = [[PlaySettings shared] oemID];
+    const char *modelUtf8 = [model UTF8String];
+    const char *oemUtf8 = [oem UTF8String];
+    os_unfair_lock_lock(&pt_settings_cache_lock);
+    if (!atomic_load_explicit(&pt_device_cache_ready, memory_order_relaxed)) {
+        if (modelUtf8 && modelUtf8[0] != '\0') {
+            strlcpy(pt_cached_device_model_buf, modelUtf8, sizeof(pt_cached_device_model_buf));
+            pt_cached_device_model_len = strlen(pt_cached_device_model_buf);
+        }
+        if (oemUtf8 && oemUtf8[0] != '\0') {
+            strlcpy(pt_cached_oem_id_buf, oemUtf8, sizeof(pt_cached_oem_id_buf));
+            pt_cached_oem_id_len = strlen(pt_cached_oem_id_buf);
+        }
+        atomic_store_explicit(&pt_device_cache_ready, true, memory_order_release);
+    }
+    os_unfair_lock_unlock(&pt_settings_cache_lock);
+    pt_in_settings_lookup = NO;
+}
+
+static BOOL pt_should_block_sleep_spamming(void) {
+    if (atomic_load_explicit(&pt_block_sleep_cache_ready, memory_order_acquire)) {
+        return atomic_load_explicit(&pt_block_sleep_spamming_val, memory_order_relaxed);
+    }
+    if (pt_in_settings_lookup) {
+        return NO;
+    }
+    pt_in_settings_lookup = YES;
+    BOOL val = [[PlaySettings shared] blockSleepSpamming];
+    atomic_store_explicit(&pt_block_sleep_spamming_val, val ? true : false, memory_order_relaxed);
+    atomic_store_explicit(&pt_block_sleep_cache_ready, true, memory_order_release);
+    pt_in_settings_lookup = NO;
+    return val;
+}
 
 // Define dyld_get_active_platform function for interpose
 int dyld_get_active_platform(void);
@@ -34,7 +83,8 @@ int pt_dyld_get_active_platform(void) { return PLATFORM_IOS; }
 // Change the machine output by uname to match expected output on iOS
 static int pt_uname(struct utsname *uts) {
     uname(uts);
-    strncpy(uts->machine, DEVICE_MODEL, sizeof(uts->machine) - 1);
+    pt_ensure_device_settings_cached();
+    strncpy(uts->machine, pt_cached_device_model_buf, sizeof(uts->machine) - 1);
     uts->machine[sizeof(uts->machine) - 1] = '\0';
     return 0;
 }
@@ -44,22 +94,26 @@ static int pt_uname(struct utsname *uts) {
 // This spoofs the device type to apps allowing us to report as any iOS device
 static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1) {
     if (name[0] == CTL_HW && (name[1] == HW_MACHINE || name[0] == HW_PRODUCT)) {
+        pt_ensure_device_settings_cached();
+        size_t needed = pt_cached_device_model_len + 1;
         if (NULL == buf) {
-            *size = strlen(DEVICE_MODEL) + 1;
+            *size = needed;
         } else {
-            if (*size > strlen(DEVICE_MODEL) + 1) {
-                strcpy(buf, DEVICE_MODEL);
+            if (*size > needed) {
+                memcpy(buf, pt_cached_device_model_buf, needed);
             } else {
                 return ENOMEM;
             }
         }
         return 0;
     } else if (name[0] == CTL_HW && (name[1] == HW_TARGET)) {
+        pt_ensure_device_settings_cached();
+        size_t needed = pt_cached_oem_id_len + 1;
         if (NULL == buf) {
-            *size = strlen(OEM_ID) + 1;
+            *size = needed;
         } else {
-            if (*size > strlen(OEM_ID) + 1) {
-                strcpy(buf, OEM_ID);
+            if (*size > needed) {
+                memcpy(buf, pt_cached_oem_id_buf, needed);
             } else {
                 return ENOMEM;
             }
@@ -75,36 +129,31 @@ static int (* volatile pt_orig_sysctlbyname)(const char *, void *, size_t *, voi
 static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     int (*orig_fn)(const char *, void *, size_t *, void *, size_t) = pt_orig_sysctlbyname ? pt_orig_sysctlbyname : &sysctlbyname;
     if ((strcmp(name, "hw.machine") == 0) || (strcmp(name, "hw.product") == 0) || (strcmp(name, "hw.model") == 0)) {
+        pt_ensure_device_settings_cached();
+        size_t needed = pt_cached_device_model_len + 1;
         if (oldp == NULL) {
-            *oldlenp = strlen(DEVICE_MODEL) + 1;
+            *oldlenp = needed;
             return 0;
         }
-        else if (oldp != NULL) {
-            if (*oldlenp < strlen(DEVICE_MODEL) + 1) {
-                return ENOMEM;
-            }
-            strcpy((char *)oldp, DEVICE_MODEL);
-            *oldlenp = strlen(DEVICE_MODEL) + 1;
-            return 0;
-        } else {
-            int ret = orig_fn(name, oldp, oldlenp, newp, newlen);
-            return ret;
+        if (*oldlenp < needed) {
+            return ENOMEM;
         }
+        memcpy(oldp, pt_cached_device_model_buf, needed);
+        *oldlenp = needed;
+        return 0;
     } else if ((strcmp(name, "hw.target") == 0)) {
+        pt_ensure_device_settings_cached();
+        size_t needed = pt_cached_oem_id_len + 1;
         if (oldp == NULL) {
-            *oldlenp = strlen(OEM_ID) + 1;
+            *oldlenp = needed;
             return 0;
-        } else if (oldp != NULL) {
-            if (*oldlenp < strlen(OEM_ID) + 1) {
-                return ENOMEM;
-            }
-            strcpy((char *)oldp, OEM_ID);
-            *oldlenp = strlen(OEM_ID) + 1;
-            return 0;
-        } else {
-            int ret = orig_fn(name, oldp, oldlenp, newp, newlen);
-            return ret;
         }
+        if (*oldlenp < needed) {
+            return ENOMEM;
+        }
+        memcpy(oldp, pt_cached_oem_id_buf, needed);
+        *oldlenp = needed;
+        return 0;
     } else {
         return orig_fn(name, oldp, oldlenp, newp, newlen);
     }
@@ -314,14 +363,14 @@ static dispatch_once_t thread_sleep_once;
 static NSLock *thread_sleep_lock = nil;
 
 static int pt_usleep(useconds_t time) {
-    dispatch_once(&thread_sleep_once, ^{
-        thread_sleep_counters = [NSMutableDictionary dictionary];
-        last_sleep_attempts = [NSMutableDictionary dictionary];
-        thread_sleep_lock = [[NSLock alloc] init];
-        [thread_sleep_lock lock];
-    });
-    
-    if ([[PlaySettings shared] blockSleepSpamming]) {
+    if (pt_should_block_sleep_spamming()) {
+        dispatch_once(&thread_sleep_once, ^{
+            thread_sleep_counters = [NSMutableDictionary dictionary];
+            last_sleep_attempts = [NSMutableDictionary dictionary];
+            thread_sleep_lock = [[NSLock alloc] init];
+            [thread_sleep_lock lock];
+        });
+
         int thread_id = pthread_mach_thread_np(pthread_self());
         NSNumber *threadKey = @(thread_id);
 
@@ -552,15 +601,12 @@ static void pt_applyUIScaleFactor(void) {
 static void pt_installTerminationTimeoutHooks(void);
 static void pt_installCloudKitCompatibilityHooks(void);
 
-static void pt_installUniversalCompatibilityGuards(void) {
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    // Prevent AppKit's "unexpectedly quit while reopening windows" modal from blocking Catalyst launch.
-    [defaults setBool:YES forKey:@"ApplePersistenceIgnoreState"];
-    pt_applyUIScaleFactor();
+static BOOL pt_jpushNotiHookInstalled = NO;
 
-    pt_patchFirebaseInlineExits();
-    pt_installRiskBannerHooks();
-
+static void pt_installJPushNotificationThrottleIfNeeded(void) {
+    if (pt_jpushNotiHookInstalled || objc_getClass("JPUSHService") == Nil) {
+        return;
+    }
     Class nc = objc_getClass("NSNotificationCenter");
     if (nc) {
         Method m = class_getInstanceMethod(nc, @selector(postNotificationName:object:userInfo:));
@@ -568,8 +614,23 @@ static void pt_installUniversalCompatibilityGuards(void) {
             pt_origPostNotification = method_getImplementation(m);
             class_replaceMethod(nc, @selector(postNotificationName:object:userInfo:),
                                 (IMP)pt_postNotificationName, method_getTypeEncoding(m));
+            pt_jpushNotiHookInstalled = YES;
         }
     }
+}
+
+static void pt_installUniversalCompatibilityGuards(void) {
+    pt_ensure_device_settings_cached();
+    (void)pt_should_block_sleep_spamming();
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    // Prevent AppKit's "unexpectedly quit while reopening windows" modal from blocking Catalyst launch.
+    [defaults setBool:YES forKey:@"ApplePersistenceIgnoreState"];
+    pt_applyUIScaleFactor();
+
+    pt_patchFirebaseInlineExits();
+    pt_installRiskBannerHooks();
+    pt_installJPushNotificationThrottleIfNeeded();
 
     dispatch_async(dispatch_get_main_queue(), ^{
         Class uiApp = objc_getClass("UIApplication");
@@ -582,6 +643,7 @@ static void pt_installUniversalCompatibilityGuards(void) {
             }
         }
         pt_installRiskBannerHooks();
+        pt_installJPushNotificationThrottleIfNeeded();
         pt_installTerminationTimeoutHooks();
     });
 }

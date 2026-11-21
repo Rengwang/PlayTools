@@ -8,6 +8,7 @@
 import Foundation
 import Security
 import SQLite3
+import UIKit
 
 class PlayKeychainDB: NSObject {
     public static let shared = PlayKeychainDB()
@@ -15,6 +16,27 @@ class PlayKeychainDB: NSObject {
     private var dbLock: DispatchSemaphore = .init(value: 1)
     private var dbVersion: Int = 1
     private var isSchemaVerified: Bool = false
+    private var didEnsureDirectory: Bool = false
+    private var persistentDB: OpaquePointer?
+    private var terminationObserver: NSObjectProtocol?
+
+    override init() {
+        super.init()
+        terminationObserver = NotificationCenter.default.addObserver(
+            forName: UIApplication.willTerminateNotification,
+            object: nil,
+            queue: nil
+        ) { [weak self] _ in
+            self?.closePersistentConnection()
+        }
+    }
+
+    deinit {
+        if let observer = terminationObserver {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        closePersistentConnection()
+    }
 
     func query(_ attributes: NSDictionary) -> [NSMutableDictionary]? {
         guard let tableName = attributes[kSecClass] as? String,
@@ -230,21 +252,57 @@ class PlayKeychainDB: NSObject {
         dbLock.wait()
         defer { dbLock.signal() }
 
-        guard let sqlite3DB = connectToDB() else { return false }
+        guard let sqlite3DB = openOrReuseDB() else { return false }
         let result = callback(sqlite3DB)
-        guard disconnectFromDB(sqlite3DB) else { return false }
+        if !result && shouldReconnect(afterErrorOn: sqlite3DB) {
+            resetConnectionLocked()
+            guard let retryDB = openOrReuseDB() else { return false }
+            return callback(retryDB)
+        }
         return result
     }
 
-    private func connectToDB() -> OpaquePointer? {
+    private func shouldReconnect(afterErrorOn sqlite3DB: OpaquePointer) -> Bool {
+        let code = sqlite3_errcode(sqlite3DB)
+        switch code {
+        case SQLITE_IOERR, SQLITE_CORRUPT, SQLITE_NOTADB, SQLITE_CANTOPEN,
+             SQLITE_READONLY, SQLITE_NOMEM, SQLITE_PROTOCOL, SQLITE_BUSY, SQLITE_LOCKED:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func closePersistentConnection() {
+        dbLock.wait()
+        resetConnectionLocked()
+        dbLock.signal()
+    }
+
+    private func resetConnectionLocked() {
+        if let sqliteDB = persistentDB {
+            _ = sqlite3_close_v2(sqliteDB)
+            persistentDB = nil
+        }
+        isSchemaVerified = false
+    }
+
+    private func openOrReuseDB() -> OpaquePointer? {
+        if let existing = persistentDB, isSchemaVerified {
+            return existing
+        }
+
         var sqlite3DB: OpaquePointer?
         let bundleID = Bundle.main.infoDictionary?["CFBundleIdentifier"] as? String ?? "Shared"
         let playChainDir = URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")
             .appendingPathComponent("PlayChain")
-        do {
-            try FileManager.default.createDirectory(at: playChainDir, withIntermediateDirectories: true)
-        } catch {
-            PlayKeychain.debugLogger("Failed to create PlayChain directory: \(error)")
+        if !didEnsureDirectory {
+            do {
+                try FileManager.default.createDirectory(at: playChainDir, withIntermediateDirectories: true)
+                didEnsureDirectory = true
+            } catch {
+                PlayKeychain.debugLogger("Failed to create PlayChain directory: \(error)")
+            }
         }
         let keychainDB = playChainDir.appendingPathComponent("\(bundleID).db")
 
@@ -252,32 +310,31 @@ class PlayKeychainDB: NSObject {
         let fileSize = (fileAttrs?[.size] as? NSNumber)?.int64Value ?? 0
         let needsSchemaInit = fileSize == 0 || !isSchemaVerified
 
-        guard sqlite3_open(keychainDB.path, &sqlite3DB) == SQLITE_OK,
+        let openFlags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX
+        guard sqlite3_open_v2(keychainDB.path, &sqlite3DB, openFlags, nil) == SQLITE_OK,
               let sqlite3DB = sqlite3DB else {
+            if let sqliteDB = sqlite3DB {
+                _ = sqlite3_close_v2(sqliteDB)
+            }
             PlayKeychain.debugLogger("Failed to connect to DB")
             return nil
         }
+
+        sqlite3_busy_timeout(sqlite3DB, 2000)
+        sqlite3_exec(sqlite3DB, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", nil, nil, nil)
 
         // Check PRAGMA user_version once per process (or on 0-byte files) so we do not
         // fsync CREATE TABLE on every hot query while still initializing empty/0-byte DBs.
         if needsSchemaInit {
             guard verifySchemaIfNeeded(sqlite3DB, fileSize: fileSize) else {
-                _ = disconnectFromDB(sqlite3DB)
+                _ = sqlite3_close_v2(sqlite3DB)
                 return nil
             }
             isSchemaVerified = true
         }
 
+        persistentDB = sqlite3DB
         return sqlite3DB
-    }
-
-    private func disconnectFromDB(_ sqlite3DB: OpaquePointer?) -> Bool {
-        guard sqlite3_close(sqlite3DB) == SQLITE_OK else {
-            PlayKeychain.debugLogger("Failed to disconnect from DB")
-            return false
-        }
-
-        return true
     }
 }
 

@@ -151,14 +151,23 @@ __attribute__((visibility("hidden")))
     return 0;
 }
 
+static double pt_cachedCustomScaler(void) {
+    static double cached = 2.0;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cached = [[PlaySettings shared] customScaler];
+    });
+    return cached;
+}
+
 - (double) hook_nativeScale {
-    return [[PlaySettings shared] customScaler];
+    return pt_cachedCustomScaler();
 }
 
 - (double) hook_scale {
     // Return rounded value of [[PlaySettings shared] customScaler]
     // Even though it is a double return, this will only accept .0 value or apps will crash
-    return round([[PlaySettings shared] customScaler]);
+    return round(pt_cachedCustomScaler());
 }
 
 - (double) get_default_height {
@@ -291,29 +300,36 @@ static os_unfair_lock sCustomLayoutHookLock = OS_UNFAIR_LOCK_INIT;
 static Method sBaseLayoutPrepareMethod = NULL;
 static Method sBaseLayoutContentSizeMethod = NULL;
 
-static NSMutableSet<NSValue *> *PTCheckedLayoutClasses(void) {
-    static NSMutableSet<NSValue *> *set = nil;
+// Fast main-thread class cache so UICollectionView.layoutSubviews does 0 locks
+// and 0 NSValue allocations on already-checked layout classes.
+#define PT_MAIN_LAYOUT_CACHE_CAPACITY 16
+static Class sMainLayoutCacheClasses[PT_MAIN_LAYOUT_CACHE_CAPACITY];
+static BOOL sMainLayoutCacheHooked[PT_MAIN_LAYOUT_CACHE_CAPACITY];
+static NSUInteger sMainLayoutCacheCount = 0;
+
+static CFMutableSetRef PTCheckedLayoutClasses(void) {
+    static CFMutableSetRef set = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        set = [NSMutableSet set];
+        set = CFSetCreateMutable(kCFAllocatorDefault, 0, NULL);
     });
     return set;
 }
 
-static NSMutableSet<NSValue *> *PTHookedCustomLayoutClasses(void) {
-    static NSMutableSet<NSValue *> *set = nil;
+static CFMutableSetRef PTHookedCustomLayoutClasses(void) {
+    static CFMutableSetRef set = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        set = [NSMutableSet set];
+        set = CFSetCreateMutable(kCFAllocatorDefault, 0, NULL);
     });
     return set;
 }
 
-static NSMutableSet<NSValue *> *PTHookedLayoutMethods(void) {
-    static NSMutableSet<NSValue *> *set = nil;
+static CFMutableSetRef PTHookedLayoutMethods(void) {
+    static CFMutableSetRef set = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        set = [NSMutableSet set];
+        set = CFSetCreateMutable(kCFAllocatorDefault, 0, NULL);
     });
     return set;
 }
@@ -354,11 +370,11 @@ static NSMapTable<UICollectionViewLayout *, NSValue *> *PTLayoutSubviewsInvalida
     return map;
 }
 
-static NSMutableSet<NSValue *> *PTActiveLazyLayoutCalculations(void) {
-    static NSMutableSet<NSValue *> *active = nil;
+static CFMutableSetRef PTActiveLazyLayoutCalculations(void) {
+    static CFMutableSetRef active = NULL;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        active = [NSMutableSet set];
+        active = CFSetCreateMutable(kCFAllocatorDefault, 0, NULL);
     });
     return active;
 }
@@ -419,7 +435,24 @@ static BOOL PTIsSystemOrPlayToolsIMP(IMP imp) {
     return NO;
 }
 
-static BOOL PTIsHookedCustomLayout(UICollectionViewLayout *layout) {
+static inline void PTCacheMainLayoutClassResult(Class cls, BOOL isHooked) {
+    if (![NSThread isMainThread] || !cls) {
+        return;
+    }
+    for (NSUInteger i = 0; i < sMainLayoutCacheCount; i++) {
+        if (sMainLayoutCacheClasses[i] == cls) {
+            sMainLayoutCacheHooked[i] = isHooked;
+            return;
+        }
+    }
+    if (sMainLayoutCacheCount < PT_MAIN_LAYOUT_CACHE_CAPACITY) {
+        sMainLayoutCacheClasses[sMainLayoutCacheCount] = cls;
+        sMainLayoutCacheHooked[sMainLayoutCacheCount] = isHooked;
+        sMainLayoutCacheCount++;
+    }
+}
+
+static BOOL PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *layout) {
     if (!layout) {
         return NO;
     }
@@ -427,44 +460,54 @@ static BOOL PTIsHookedCustomLayout(UICollectionViewLayout *layout) {
     if (!cls) {
         return NO;
     }
-    NSValue *clsKey = [NSValue valueWithPointer:(__bridge const void *)cls];
-    os_unfair_lock_lock(&sCustomLayoutHookLock);
-    BOOL hooked = [PTHookedCustomLayoutClasses() containsObject:clsKey];
-    os_unfair_lock_unlock(&sCustomLayoutHookLock);
-    return hooked;
-}
+    BOOL onMain = [NSThread isMainThread];
+    if (onMain) {
+        for (NSUInteger i = 0; i < sMainLayoutCacheCount; i++) {
+            if (sMainLayoutCacheClasses[i] == cls) {
+                return sMainLayoutCacheHooked[i];
+            }
+        }
+    }
+    if (![layout isKindOfClass:[UICollectionViewLayout class]]) {
+        return NO;
+    }
 
-static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *layout) {
-    if (!layout || ![layout isKindOfClass:[UICollectionViewLayout class]]) {
-        return;
-    }
-    Class cls = [layout class];
-    if (!cls) {
-        return;
-    }
-    NSValue *clsKey = [NSValue valueWithPointer:(__bridge const void *)cls];
+    const void *clsPtr = (__bridge const void *)cls;
     os_unfair_lock_lock(&sCustomLayoutHookLock);
-    if ([PTCheckedLayoutClasses() containsObject:clsKey]) {
+    CFMutableSetRef checkedSet = PTCheckedLayoutClasses();
+    CFMutableSetRef hookedClasses = PTHookedCustomLayoutClasses();
+    if (CFSetContainsValue(checkedSet, clsPtr)) {
+        BOOL hooked = CFSetContainsValue(hookedClasses, clsPtr) ? YES : NO;
         os_unfair_lock_unlock(&sCustomLayoutHookLock);
-        return;
+        if (onMain) {
+            PTCacheMainLayoutClassResult(cls, hooked);
+        }
+        return hooked;
     }
 
     SEL csSel = @selector(collectionViewContentSize);
     Method csMethod = class_getInstanceMethod(cls, csSel);
     if (!csMethod || csMethod == sBaseLayoutContentSizeMethod) {
-        [PTCheckedLayoutClasses() addObject:clsKey];
+        CFSetAddValue(checkedSet, clsPtr);
         os_unfair_lock_unlock(&sCustomLayoutHookLock);
-        return;
+        if (onMain) {
+            PTCacheMainLayoutClassResult(cls, NO);
+        }
+        return NO;
     }
 
-    NSValue *csMethodKey = [NSValue valueWithPointer:(const void *)csMethod];
-    BOOL hasCustomCS = [PTHookedLayoutMethods() containsObject:csMethodKey];
+    CFMutableSetRef hookedMethods = PTHookedLayoutMethods();
+    const void *csMethodPtr = (const void *)csMethod;
+    BOOL hasCustomCS = CFSetContainsValue(hookedMethods, csMethodPtr) ? YES : NO;
     if (!hasCustomCS) {
         IMP csImp = method_getImplementation(csMethod);
         if (PTIsSystemOrPlayToolsIMP(csImp)) {
-            [PTCheckedLayoutClasses() addObject:clsKey];
+            CFSetAddValue(checkedSet, clsPtr);
             os_unfair_lock_unlock(&sCustomLayoutHookLock);
-            return;
+            if (onMain) {
+                PTCacheMainLayoutClassResult(cls, NO);
+            }
+            return NO;
         }
         PTLayoutContentSizeIMP origContentSize = (PTLayoutContentSizeIMP)csImp;
         IMP wrappedCS = imp_implementationWithBlock(^CGSize(UICollectionViewLayout *selfLayout) {
@@ -479,9 +522,9 @@ static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
                 [PTCurrentlyPreparingLayouts() containsObject:selfLayout]) {
                 return cs;
             }
-            NSValue *instanceKey = [NSValue valueWithPointer:(__bridge const void *)selfLayout];
-            NSMutableSet<NSValue *> *active = PTActiveLazyLayoutCalculations();
-            if ([active containsObject:instanceKey]) {
+            const void *instancePtr = (__bridge const void *)selfLayout;
+            CFMutableSetRef active = PTActiveLazyLayoutCalculations();
+            if (CFSetContainsValue(active, instancePtr)) {
                 return cs;
             }
             UICollectionView *cv = selfLayout.collectionView;
@@ -496,7 +539,7 @@ static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
                 return cs;
             }
             [PTPrimedLayoutBounds() setObject:[NSValue valueWithCGSize:boundsSize] forKey:selfLayout];
-            [active addObject:instanceKey];
+            CFSetAddValue(active, instancePtr);
             @try {
                 CGRect queryRect = CGRectMake(cv.bounds.origin.x,
                                               cv.bounds.origin.y,
@@ -504,53 +547,60 @@ static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
                                               MAX(boundsSize.height, 1.0));
                 [selfLayout layoutAttributesForElementsInRect:queryRect];
             } @finally {
-                [active removeObject:instanceKey];
+                CFSetRemoveValue(active, instancePtr);
             }
             cs = origContentSize(selfLayout, csSel);
             return cs;
         });
         method_setImplementation(csMethod, wrappedCS);
-        [PTHookedLayoutMethods() addObject:csMethodKey];
+        CFSetAddValue(hookedMethods, csMethodPtr);
         hasCustomCS = YES;
     }
 
     if (!hasCustomCS) {
-        [PTCheckedLayoutClasses() addObject:clsKey];
+        CFSetAddValue(checkedSet, clsPtr);
         os_unfair_lock_unlock(&sCustomLayoutHookLock);
-        return;
+        if (onMain) {
+            PTCacheMainLayoutClassResult(cls, NO);
+        }
+        return NO;
     }
 
     SEL prepSel = @selector(prepareLayout);
     Method prepMethod = class_getInstanceMethod(cls, prepSel);
     if (prepMethod && prepMethod != sBaseLayoutPrepareMethod) {
-        NSValue *prepMethodKey = [NSValue valueWithPointer:(const void *)prepMethod];
-        if (![PTHookedLayoutMethods() containsObject:prepMethodKey]) {
+        const void *prepMethodPtr = (const void *)prepMethod;
+        if (!CFSetContainsValue(hookedMethods, prepMethodPtr)) {
             IMP prepImp = method_getImplementation(prepMethod);
             if (!PTIsSystemOrPlayToolsIMP(prepImp)) {
                 PTLayoutPrepareIMP origPrepare = (PTLayoutPrepareIMP)prepImp;
                 IMP wrappedPrep = imp_implementationWithBlock(^void(UICollectionViewLayout *selfLayout) {
-                    BOOL onMain = [NSThread isMainThread] && selfLayout != nil;
-                    if (onMain) {
+                    BOOL prepOnMain = [NSThread isMainThread] && selfLayout != nil;
+                    if (prepOnMain) {
                         [PTCurrentlyPreparingLayouts() addObject:selfLayout];
                     }
                     @try {
                         origPrepare(selfLayout, prepSel);
                     } @finally {
-                        if (onMain) {
+                        if (prepOnMain) {
                             [PTCurrentlyPreparingLayouts() removeObject:selfLayout];
                             [PTPreparedLayouts() addObject:selfLayout];
                         }
                     }
                 });
                 method_setImplementation(prepMethod, wrappedPrep);
-                [PTHookedLayoutMethods() addObject:prepMethodKey];
+                CFSetAddValue(hookedMethods, prepMethodPtr);
             }
         }
     }
 
-    [PTHookedCustomLayoutClasses() addObject:clsKey];
-    [PTCheckedLayoutClasses() addObject:clsKey];
+    CFSetAddValue(hookedClasses, clsPtr);
+    CFSetAddValue(checkedSet, clsPtr);
     os_unfair_lock_unlock(&sCustomLayoutHookLock);
+    if (onMain) {
+        PTCacheMainLayoutClassResult(cls, YES);
+    }
+    return YES;
 }
 
 - (void) hook_uicollectionviewlayout_prepareLayout {
@@ -563,9 +613,9 @@ static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
 - (void) hook_uicollectionviewlayout_invalidateLayoutWithContext:(UICollectionViewLayoutInvalidationContext *)context {
     if ([NSThread isMainThread] && [self isKindOfClass:[UICollectionViewLayout class]]) {
         UICollectionViewLayout *layout = (UICollectionViewLayout *)self;
-        NSValue *instanceKey = [NSValue valueWithPointer:(__bridge const void *)layout];
+        const void *instancePtr = (__bridge const void *)layout;
         [PTPreparedLayouts() removeObject:layout];
-        if (![PTActiveLazyLayoutCalculations() containsObject:instanceKey] &&
+        if (!CFSetContainsValue(PTActiveLazyLayoutCalculations(), instancePtr) &&
             ![PTCurrentlyPreparingLayouts() containsObject:layout]) {
             [PTPrimedLayoutBounds() removeObjectForKey:layout];
         }
@@ -599,27 +649,33 @@ static void PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
 
 - (void) hook_uicollectionview_layoutSubviews {
     UICollectionView *cv = nil;
+    UICollectionViewLayout *initialLayout = nil;
+    BOOL isCustomLayout = NO;
     if ([self isKindOfClass:[UICollectionView class]]) {
         cv = (UICollectionView *)self;
-        if (cv.collectionViewLayout) {
-            PTEnsureCustomCollectionViewLayoutHooked(cv.collectionViewLayout);
+        initialLayout = cv.collectionViewLayout;
+        if (initialLayout) {
+            isCustomLayout = PTEnsureCustomCollectionViewLayoutHooked(initialLayout);
         }
     }
     [self hook_uicollectionview_layoutSubviews];
     if (cv && [NSThread isMainThread]) {
         UICollectionViewLayout *layout = cv.collectionViewLayout;
-        CGSize boundsSize = cv.bounds.size;
-        if (layout &&
-            PTIsHookedCustomLayout(layout) &&
-            boundsSize.width > 1.0 && boundsSize.height > 1.0 &&
-            (cv.contentSize.width <= 0.5 || cv.contentSize.height <= 0.5) &&
-            ![PTCurrentlyPreparingLayouts() containsObject:layout] &&
-            PTShouldPrimeLayoutAtSize(layout, boundsSize) &&
-            PTShouldInvalidateInLayoutSubviews(layout, boundsSize) &&
-            PTCollectionViewHasAnyItems(cv)) {
-            [PTLayoutSubviewsInvalidatedBounds() setObject:[NSValue valueWithCGSize:boundsSize]
-                                                    forKey:layout];
-            [layout invalidateLayout];
+        if (layout != initialLayout) {
+            isCustomLayout = layout ? PTEnsureCustomCollectionViewLayoutHooked(layout) : NO;
+        }
+        if (isCustomLayout && layout) {
+            CGSize boundsSize = cv.bounds.size;
+            if (boundsSize.width > 1.0 && boundsSize.height > 1.0 &&
+                (cv.contentSize.width <= 0.5 || cv.contentSize.height <= 0.5) &&
+                ![PTCurrentlyPreparingLayouts() containsObject:layout] &&
+                PTShouldPrimeLayoutAtSize(layout, boundsSize) &&
+                PTShouldInvalidateInLayoutSubviews(layout, boundsSize) &&
+                PTCollectionViewHasAnyItems(cv)) {
+                [PTLayoutSubviewsInvalidatedBounds() setObject:[NSValue valueWithCGSize:boundsSize]
+                                                        forKey:layout];
+                [layout invalidateLayout];
+            }
         }
     }
 }

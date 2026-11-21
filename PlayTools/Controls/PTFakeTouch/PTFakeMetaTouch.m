@@ -24,15 +24,21 @@ NSLock *lock;
 void eventSendCallback(void* info) {
     UIEvent *event = [[UIApplication sharedApplication] _touchesEvent];
     [event _clearTouches];
-    // Step1: copy touches and record began touches and mark recyclable touches
+    // Step1: copy touches and record began/ended touches
     NSMutableArray *begunTouchAry = [[NSMutableArray alloc] init];
+    NSMutableArray<UITouch *> *endedTouches = [[NSMutableArray alloc] init];
+    NSMutableArray<NSNumber *> *endedIndices = [[NSMutableArray alloc] init];
     [lock lock];
-    [livingTouchAry enumerateObjectsUsingBlock:^(UITouch *aTouch, NSUInteger idx, BOOL *stop) {
+    [livingTouchAry enumerateObjectsUsingBlock:^(id obj, NSUInteger idx, BOOL *stop) {
+        if (![obj isKindOfClass:[UITouch class]]) {
+            return;
+        }
+        UITouch *aTouch = (UITouch *)obj;
         switch (aTouch.phase) {
             case UITouchPhaseEnded:
             case UITouchPhaseCancelled:
-                // set this bit to 1
-                atomic_fetch_or(&reusageMask, 1ull<<idx);
+                [endedTouches addObject:aTouch];
+                [endedIndices addObject:@(idx)];
                 break;
             case UITouchPhaseBegan:
                 [begunTouchAry addObject:aTouch];
@@ -47,7 +53,22 @@ void eventSendCallback(void* info) {
     // Step2: send event
     [[UIApplication sharedApplication] sendEvent:event];
 
-    // Step 3: change "began" touches to "moved"
+    // Step 3: release ended/cancelled touch slots so UIView/UIWindow targets are not retained
+    if (endedIndices.count > 0) {
+        [lock lock];
+        for (NSUInteger i = 0; i < endedIndices.count; i++) {
+            NSUInteger idx = endedIndices[i].unsignedIntegerValue;
+            if (idx < livingTouchAry.count && livingTouchAry[idx] == endedTouches[i]) {
+                livingTouchAry[idx] = [NSNull null];
+                if (idx < 64) {
+                    atomic_fetch_or(&reusageMask, 1ull << idx);
+                }
+            }
+        }
+        [lock unlock];
+    }
+
+    // Step 4: change "began" touches to "moved"
     // Do not let a "began" appear twice on a point
     for (UITouch *touch in begunTouchAry) {
         // Double check "began", because phase may have changed
@@ -106,7 +127,15 @@ void eventSendCallback(void* info) {
         [livingTouchAry setObject:touch atIndexedSubscript:pointId];
         [lock unlock];
     } else {
-        touch = [livingTouchAry objectAtIndex:pointId];
+        [lock lock];
+        id obj = (pointId >= 0 && (NSUInteger)pointId < livingTouchAry.count)
+            ? [livingTouchAry objectAtIndex:(NSUInteger)pointId]
+            : nil;
+        [lock unlock];
+        if (![obj isKindOfClass:[UITouch class]]) {
+            return -1;
+        }
+        touch = (UITouch *)obj;
         if(touch.phase == UITouchPhaseBegan && phase == UITouchPhaseMoved) {
             // previous touch began event not yet captured by runloop. Ignore this move
             return pointId;

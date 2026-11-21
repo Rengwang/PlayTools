@@ -172,6 +172,7 @@ public class PlayScreen: NSObject {
     private var scaledWindows = NSHashTable<UIWindow>.weakObjects()
     private var isHostLiveResizing = false
     private var lastDuoLandscapeActive = false
+    private weak var cachedPrimaryWindow: UIWindow?
 
     private var isDuoIdentity: Bool {
         PlaySettings.shared.layoutIdiom == 3
@@ -196,8 +197,22 @@ public class PlayScreen: NSObject {
     }
 
     func initialize() {
-        guard PlaySettings.shared.dynamicWindowMode else { return }
         let center = NotificationCenter.default
+        let invalidatePrimaryWindow: (Notification) -> Void = { [weak self] _ in
+            self?.cachedPrimaryWindow = nil
+        }
+        for name in [
+            UIWindow.didBecomeKeyNotification,
+            UIWindow.didBecomeVisibleNotification,
+            UIWindow.didBecomeHiddenNotification,
+            UIScene.didActivateNotification,
+            UIScene.willConnectNotification,
+            UIScene.didDisconnectNotification
+        ] {
+            center.addObserver(forName: name, object: nil, queue: .main, using: invalidatePrimaryWindow)
+        }
+
+        guard PlaySettings.shared.dynamicWindowMode else { return }
         let handleAppearance: (Notification) -> Void = { [weak self] notif in
             self?.handleSceneOrWindowEvent(notif.object)
         }
@@ -407,6 +422,15 @@ public class PlayScreen: NSObject {
     var percent: CGFloat { max / 100.0 }
 
     var activePrimaryWindow: UIWindow? {
+        if Thread.isMainThread,
+           let cached = cachedPrimaryWindow,
+           !cached.isHidden,
+           cached.alpha > 0.01,
+           cached.windowScene != nil,
+           cached.bounds.width > 1,
+           cached.bounds.height > 1 {
+            return cached
+        }
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
             .sorted { sceneRank($0.activationState) < sceneRank($1.activationState) }
         var candidates: [UIWindow] = []
@@ -415,7 +439,11 @@ public class PlayScreen: NSObject {
                 candidates.append(win)
             }
         }
-        return candidates.max { windowScore($0) < windowScore($1) }
+        let resolved = candidates.max { windowScore($0) < windowScore($1) }
+        if Thread.isMainThread {
+            cachedPrimaryWindow = resolved
+        }
+        return resolved
     }
 
     var primaryWindowBounds: CGRect? {
@@ -592,6 +620,7 @@ private extension PlayScreen {
     }
 
     func handleSceneOrWindowEvent(_ object: Any?) {
+        cachedPrimaryWindow = nil
         if let scene = object as? UIWindowScene {
             applySceneSizeRestrictions(for: scene)
         } else if let win = object as? UIWindow {
