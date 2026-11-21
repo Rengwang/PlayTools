@@ -40,5 +40,18 @@
    - 触控开始命中测试前对 `screen.keyWindow` 做空值保护，避免窗口尚未就绪时点击崩溃。
 
 8. **`iPhone Duo`、UI Scale（`iOSMacScaleFactor`）、`SDK Shift` 与运行时护栏**
-   - `PlaySettings.swift`、`AKPlugin.swift`、`PlayScreen.swift`、`NSObject+Swizzle.m`：支持 `layoutIdiom = 3`（`iPhone19,4`）Duo 展开态侧边安全区、`UIWindowSceneGeometry.interfaceOrientation`、独占模拟内屏下 `_UIScreenFixedCoordinateSpace.bounds` 面积占比、`UIRequiresFullScreenIgnoredStartingWithVersion`、`sdkShift`（内存级 `NSBundle` SDK 元数据切换）及模式 6 `resizableAspectRatioType == 0` 优先级修复。
+   - `PlaySettings.swift`、`AKPlugin.swift`、`PlayScreen.swift`、`NSObject+Swizzle.m`：支持 `layoutIdiom = 3`（`iPhone19,4`）Duo 展开态几何体、`UIWindowSceneGeometry.interfaceOrientation`、独占模拟内屏下 `_UIScreenFixedCoordinateSpace.bounds` 面积占比、`UIRequiresFullScreenIgnoredStartingWithVersion`、`sdkShift`（内存级 `NSBundle` SDK 元数据切换）及模式 6 `resizableAspectRatioType == 0` 优先级修复（已移除不再需要的 `UIWindow.safeAreaInsets` swizzle）。
    - `PlayLoader.m`：应用 `uiScale`（`iOSMacScaleFactor`）、libc interpose 指针快照、CloudKit 缺失权限降级桩、`UINSUIKitTerminationController` 退出超时收敛与稳定性护栏。
+
+9. **低功耗「应用模式（App Mode）」默认配置与 P0/P1 性能功耗优化**
+   - **共享默认配置（`PlaySettings.swift`、`DiscordActivity.swift`、`AKPlugin.swift`）**：将 `keymapping` 与 `DiscordActivity.enable` 默认值改为 `false`，新增 `spoofPowerState = false`（兼容缺省解码），在 `AKPlugin` 的 4 个事件监听注册入口补充 `keymappingSetting` 防护，同时保持窗口自适应、Sidecar、Duo、UI Scale 与菜单栏不受影响。
+   - **`CADisplayLink` 按需启停与 App Nap 兼容（`PlayInput.swift`、`ControllerFocus.m`）**：将 `CADisplayLink` 移至 `keymapping` 开关之后，且仅在已连接 `GCController` 且应用处于前台活跃状态时创建运行；手柄断开即失效销毁，应用失焦/后台/隐藏/最小化立即暂停，彻底消除静态 60–120 Hz 空转唤醒；`ControllerFocus.m` 的后台手柄监听同步受 `keymapping` 门控。
+   - **Discord RPC 零线程泄漏防护（`DiscordIPC.swift`）**：除检查 `enable` 与非空 `applicationID` 外，在实例化 `SwordRPC` 或请求 iTunes 图标前先用 `access(..., F_OK)` 检查可达的 `discord-ipc-0..9` socket，避免 Discord 未运行时泄漏 10 个 SwiftNIO `MultiThreadedEventLoopGroup` 线程；连接后强引用持有 `activeRPC` 并在退出时 `disconnect()`。
+   - **真实温控/低电量/电池状态透传（`PlayInfo.swift`、`BatteryLevel.m`）**：移除 `BatteryLevelLoader` 中无条件的 `setBatteryMonitoringEnabled:YES`，并移除 `extension ProcessInfo` 对 `thermalState` / `isLowPowerModeEnabled` 的无条件分类覆盖，改由 `spoofPowerState == true` 时再按需 swizzle 电池与温控接口。
+   - **热路径 CPU / 内存 / I/O 优化**：
+     - `PlayScreen.swift`：主线程弱引用缓存 `activePrimaryWindow`，在窗口/场景通知变更时失效，消除高频 `UIScreen.bounds` 与方向查询的重复遍历排序。
+     - `PlayLoader.m`：将 `deviceModel` / `oemID` / `blockSleepSpamming` 原子缓存为 C 状态，避免 `sysctl`/`uname`/`usleep` 热路径重复 ObjC 消息；仅在进程存在 `JPUSHService` 类时才 Hook `NSNotificationCenter`。
+     - `NSObject+Swizzle.m`：使用 `CFMutableSetRef` + 16 槽主线程 `Class` 指针缓存替代 `NSMutableSet<NSValue *>`，使 `UICollectionView.layoutSubviews` 热路径零锁零 `NSValue` 分配；缓存 `customScaler`。
+     - `PTFakeMetaTouch.m`：在 `sendEvent:` 后将已结束/取消的触控槽位清空为 `[NSNull null]` 再归还复用位图，避免持续持有旧 `UIView`/`UIWindow`。
+     - `PlayedAppleDB.swift`：在 `dbLock` 下复用持久化 WAL 模式 `sqlite3*` 连接并在 I/O/锁错误时自动重连，避免每次 Keychain 查询重复 `mkdir`/`stat`/`open`/`close`。
+     - `Keymapping.swift`：基于 `stat()` `st_mtimespec` 缓存 `keymapConfig` 与各 `KeymappingData`，避免 `ActionDispatcher.build()` 重复读取并解析 XML plist。
