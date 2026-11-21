@@ -215,14 +215,6 @@ __attribute__((visibility("hidden")))
     }
 }
 
-- (UIEdgeInsets) hook_uiwindow_safeAreaInsets {
-    UIEdgeInsets orig = [self hook_uiwindow_safeAreaInsets];
-    if ([self isKindOfClass:[UIWindow class]]) {
-        return [PlayScreen resolvedWindowSafeAreaInsets:orig window:(UIWindow *)self];
-    }
-    return orig;
-}
-
 - (UIInterfaceOrientation) hook_uiscene_interfaceOrientation {
     UIInterfaceOrientation orig = [self hook_uiscene_interfaceOrientation];
     if ([self isKindOfClass:[UIWindowScene class]]) {
@@ -760,7 +752,6 @@ bool menuWasCreated = false;
             [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(setBounds:) withMethod:@selector(hook_uiwindow_setBounds:)];
             [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(setRootViewController:) withMethod:@selector(hook_uiwindow_setRootViewController:)];
             [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(didAddSubview:) withMethod:@selector(hook_uiwindow_didAddSubview:)];
-            [objc_getClass("UIWindow") swizzleInstanceMethod:@selector(safeAreaInsets) withMethod:@selector(hook_uiwindow_safeAreaInsets)];
             [objc_getClass("UIWindowScene") swizzleInstanceMethod:@selector(interfaceOrientation) withMethod:@selector(hook_uiscene_interfaceOrientation)];
             [objc_getClass("UIApplication") swizzleInstanceMethod:@selector(statusBarOrientation) withMethod:@selector(hook_uiapp_statusBarOrientation)];
             Class sceneGeomCls = objc_getClass("UIWindowSceneGeometry");

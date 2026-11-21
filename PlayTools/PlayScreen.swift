@@ -279,22 +279,6 @@ public class PlayScreen: NSObject {
         shared.handleWindowDidAddSubview(window, subview: subview)
     }
 
-    @objc public static func resolvedWindowSafeAreaInsets(
-        _ original: UIEdgeInsets,
-        window: UIWindow
-    ) -> UIEdgeInsets {
-        guard Thread.isMainThread,
-              shared.isUnfoldedDuoLandscape(for: window) else {
-            return original
-        }
-        return UIEdgeInsets(
-            top: original.top,
-            left: original.left,
-            bottom: original.bottom,
-            right: Swift.max(original.right, 16)
-        )
-    }
-
     @objc public static func resolvedInterfaceOrientation(
         _ original: UIInterfaceOrientation,
         scene: UIWindowScene?
@@ -756,8 +740,6 @@ private extension PlayScreen {
                 let nowDuoLandscape = isUnfoldedDuoLandscape(for: window)
                 if nowDuoLandscape != lastDuoLandscapeActive {
                     lastDuoLandscapeActive = nowDuoLandscape
-                    window.safeAreaInsetsDidChange()
-                    window.rootViewController?.viewSafeAreaInsetsDidChange()
                     window.setNeedsLayout()
                     if !isHostLiveResizing {
                         scheduleAdaptiveRelayout(for: window)
