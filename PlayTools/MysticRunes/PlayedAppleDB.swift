@@ -44,18 +44,17 @@ class PlayKeychainDB: NSObject {
             return nil
         }
 
-        let selectWhere = primaryColumns.compactMap({
-            guard let attr = attributes[$0] else { return nil } // use only requested ones
-            if CFGetTypeID(attr as CFTypeRef) == CFDataGetTypeID(),
-               let string = (attr as? Data).map({ String(data: $0, encoding: .utf8) }) {
-                return "\($0) LIKE '\(string!)'" // non null-termination in db
-            }
-            return "\($0) = '\(attr)'"
-        }).joined(separator: " AND ")
-        guard selectWhere.count > 0 else { return nil }
+        // Keychain matching is conjunctive over *every* attribute in the query, not
+        // just the primary key. Ignoring the rest made a lookup for e.g. `gena =
+        // IMEIString` return an unrelated item that merely shared the access group,
+        // which hardened apps then dereference as if it were their own record.
+        let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] ?? []
+        let queryColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
+        let (whereClause, whereBindings) = buildWhereClause(columns: queryColumns, attributes: attributes)
+        guard !whereClause.isEmpty else { return nil }
         let selectLimit = attributes[kSecMatchLimit] as? String == kSecMatchLimitOne as String ? 1 : Int.max
 
-        let selectQuery = "SELECT * FROM \(tableName) WHERE \(selectWhere) LIMIT \(selectLimit)"
+        let selectQuery = "SELECT * FROM \(tableName) WHERE \(whereClause) LIMIT \(selectLimit)"
         var stmt: OpaquePointer?
 
         var dictArr: [NSMutableDictionary] = []
@@ -65,6 +64,13 @@ class PlayKeychainDB: NSObject {
                   let stmt = stmt else {
                 PlayKeychain.debugLogger("Failed query \(selectQuery)")
                 PlayKeychain.debugLogger("Failed to query to db table: \(String(cString: sqlite3_errmsg(sqlite3DB)))")
+                return false
+            }
+
+            for (index, value) in whereBindings.enumerated()
+            where !encodeData(stmt: stmt, index: Int32(index + 1), value: value) {
+                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
+                PlayKeychain.debugLogger("Failed to bind query parameter: \(errorMessage)")
                 return false
             }
 
@@ -158,16 +164,10 @@ class PlayKeychainDB: NSObject {
         let updateValues = columnsQuery.map({ attributes[$0] as CFTypeRef })
 
         let updateColumns = columnsQuery.map({ return "\($0) = ?" }).joined(separator: ", ")
-        let updateWhere = primaryColumns.compactMap({
-            guard let attr = attributes[$0] else { return nil }
-            if CFGetTypeID(attr as CFTypeRef) == CFDataGetTypeID(),
-               let string = (attr as? Data).map({ return String(data: $0, encoding: .utf8) }) {
-                return "\($0) LIKE '\(string!)'" // \0 does not exists in db due to casting
-            }
-            return "\($0) = '\(attr)'"
-        }).joined(separator: " AND ")
+        let (whereClause, whereBindings) = buildWhereClause(columns: primaryColumns, attributes: attributes)
+        guard !whereClause.isEmpty else { return false }
 
-        let updateQuery = "UPDATE \(tableName) SET \(updateColumns) WHERE \(updateWhere)"
+        let updateQuery = "UPDATE \(tableName) SET \(updateColumns) WHERE \(whereClause)"
         var stmt: OpaquePointer?
 
         guard usingDB({ sqlite3DB in
@@ -187,6 +187,14 @@ class PlayKeychainDB: NSObject {
                 return false
             }
 
+            let whereOffset = updateValues.count
+            for (index, value) in whereBindings.enumerated()
+            where !encodeData(stmt: stmt, index: Int32(whereOffset + index + 1), value: value) {
+                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
+                PlayKeychain.debugLogger("Failed to bind update parameter: \(errorMessage)")
+                return false
+            }
+
             return sqlite3_step(stmt) == SQLITE_DONE
         }) else { return false }
 
@@ -199,16 +207,10 @@ class PlayKeychainDB: NSObject {
             return false
         }
 
-        let deleteWhere = primaryColumns.compactMap({
-            guard let attr = attributes[$0] else { return nil } // use only requested ones
-            if CFGetTypeID(attr as CFTypeRef) == CFDataGetTypeID(),
-               let string = (attr as? Data).map({ return String(data: $0, encoding: .utf8) }) {
-                return "\($0) LIKE '\(string!)'" // non null-termination in db
-            }
-            return "\($0) = '\(attr)'"
-        }).joined(separator: " AND ")
+        let (whereClause, whereBindings) = buildWhereClause(columns: primaryColumns, attributes: attributes)
+        guard !whereClause.isEmpty else { return false }
 
-        let deleteQuery = "DELETE FROM \(tableName) where \(deleteWhere)"
+        let deleteQuery = "DELETE FROM \(tableName) WHERE \(whereClause)"
         var stmt: OpaquePointer?
 
         guard usingDB({ sqlite3DB in
@@ -221,7 +223,14 @@ class PlayKeychainDB: NSObject {
                 return false
             }
 
-            return sqlite3_step(stmt) == SQLITE_OK
+            for (index, value) in whereBindings.enumerated()
+            where !encodeData(stmt: stmt, index: Int32(index + 1), value: value) {
+                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
+                PlayKeychain.debugLogger("Failed to bind delete parameter: \(errorMessage)")
+                return false
+            }
+
+            return sqlite3_step(stmt) == SQLITE_DONE
         }) else { return false }
 
         return true
@@ -339,6 +348,36 @@ class PlayKeychainDB: NSObject {
 }
 
 private extension PlayKeychainDB {
+    /// Builds a parameterized SQL WHERE clause and ordered binding values from primary key attributes.
+    func buildWhereClause(
+        columns: [CFString],
+        attributes: NSDictionary
+    ) -> (clause: String, bindings: [CFTypeRef]) {
+        var clauses: [String] = []
+        var bindings: [CFTypeRef] = []
+
+        for col in columns {
+            guard let attr = attributes[col] else { continue }
+            let ref = attr as CFTypeRef
+            let typeID = CFGetTypeID(ref)
+            if typeID == CFDataGetTypeID() {
+                let data = ref as! CFData // swiftlint:disable:this force_cast
+                clauses.append("(\(col) = ? OR CAST(\(col) AS BLOB) = ?)")
+                bindings.append(data)
+                bindings.append(data)
+            } else {
+                let boundValue: CFTypeRef = (typeID == CFStringGetTypeID() || typeID == CFNullGetTypeID())
+                    ? ref
+                    : ("\(attr)" as CFString)
+                clauses.append("(\(col) = ? OR CAST(\(col) AS TEXT) = ?)")
+                bindings.append(boundValue)
+                bindings.append(boundValue)
+            }
+        }
+
+        return (clauses.joined(separator: " AND "), bindings)
+    }
+
     func encodeData(stmt: OpaquePointer, index: Int32, value: CFTypeRef) -> Bool {
         let sqliteTransient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
         var result = SQLITE_FAIL
@@ -365,7 +404,23 @@ private extension PlayKeychainDB {
         switch sqlite3_column_type(stmt, index) {
         case SQLITE_TEXT:
             guard let ptr = sqlite3_column_text(stmt, index) else { return nil }
-            return CFStringCreateWithCString(nil, ptr, kCFStringEncodingASCII)
+            let byteCount = sqlite3_column_bytes(stmt, index)
+            if byteCount == 0 {
+                return "" as CFString
+            }
+            return CFStringCreateWithBytes(
+                nil,
+                ptr,
+                CFIndex(byteCount),
+                CFStringBuiltInEncodings.UTF8.rawValue,
+                false
+            ) ?? CFStringCreateWithBytes(
+                nil,
+                ptr,
+                CFIndex(byteCount),
+                CFStringBuiltInEncodings.isoLatin1.rawValue,
+                false
+            )
         case SQLITE_BLOB:
             guard let ptr = sqlite3_column_blob(stmt, index) else { return nil }
             let size = sqlite3_column_bytes(stmt, index)

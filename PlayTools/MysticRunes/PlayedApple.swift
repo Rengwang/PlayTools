@@ -72,9 +72,12 @@ public class PlayKeychain: NSObject {
             return errSecSuccess
         }
 
-        // Place v_Data in the result
+        // Place `v_Data` in the result
         guard let vData = attributes["v_Data"] as? CFTypeRef else {
-            return errSecSuccess
+            // iOS rejects a SecItemAdd that asks for a return value the item cannot
+            // provide instead of returning success with an untouched out-pointer.
+            debugLogger("SecItemAdd requested a return value but carries no v_Data")
+            return errSecParam
         }
 
         if flag(attributes, kSecReturnData) &&
@@ -92,7 +95,7 @@ public class PlayKeychain: NSObject {
                     kSecAttrKeyType: attributes["type"] as? String
                         ?? (attributes[kSecAttrKeyType as String] as? String),
                     kSecAttrKeyClass: attributes["kcls"] as? String
-                        ?? (attributes[kSecAttrKeyType as String] as? String)
+                        ?? (attributes[kSecAttrKeyClass as String] as? String)
                 ]
                 if let key = SecKeyCreateWithData(
                     keyDataValue as CFData,
@@ -273,6 +276,14 @@ extension PlayKeychain {
         let classType = query[kSecClass as String] as? String ?? ""
 
         if wantsAttributes {
+            // Callers that ask for data must not receive a dictionary silently
+            // missing `v_Data`: several hardened apps re-insert the value into
+            // their own dictionary and crash on the nil. Report "not found" so
+            // they take the normal error path instead.
+            if wantsData && keychainDict[kSecValueData] == nil {
+                debugLogger("SecItemCopyMatching asked for attributes and v_Data, but item has none")
+                return errSecItemNotFound
+            }
             // Create a dummy dictionary and return it
             let dummyDict = NSMutableDictionary(dictionary: keychainDict)
             ensureAccessGroupIfApplicable(dummyDict)
@@ -374,13 +385,26 @@ extension PlayKeychain {
             return errSecItemNotFound
         }
 
+        guard let keyData = key as? Data else {
+            return errSecItemNotFound
+        }
+
+        if (keychainDict[kSecClass] as? String) == (kSecClassCertificate as String),
+           let cert = SecCertificateCreateWithData(nil, keyData as CFData) {
+            result?.pointee = Unmanaged.passRetained(cert)
+            return errSecSuccess
+        }
+
         let dummyKeyAttrs = [
             kSecAttrKeyType: keychainDict[kSecAttrKeyType] ?? kSecAttrKeyTypeRSA,
             kSecAttrKeyClass: keychainDict[kSecAttrKeyClass] ?? kSecAttrKeyClassPublic
         ] as CFDictionary
 
-        let secKey = SecKeyCreateWithData(key as! CFData, dummyKeyAttrs, nil) // swiftlint:disable:this force_cast
-        result?.pointee = Unmanaged.passRetained(secKey!)
+        guard let secKey = SecKeyCreateWithData(keyData as CFData, dummyKeyAttrs, nil) else {
+            debugLogger("SecKeyCreateWithData failed for keychain item")
+            return errSecItemNotFound
+        }
+        result?.pointee = Unmanaged.passRetained(secKey)
         return errSecSuccess
     }
 }
