@@ -154,8 +154,22 @@ public class PlayScreen: NSObject {
     @objc public static let shared = PlayScreen()
 
     private let appCapabilities = ScreenAppCapabilities()
-    private var displayMode: PlayDisplayMode = .adaptive
-    private var lastAdaptiveBounds: CGRect?
+    private var displayMode: PlayDisplayMode = .adaptive {
+        didSet {
+            if case .scaled(let logicalSize, _, _) = displayMode {
+                updateBoundsSnapshot(CGRect(origin: .zero, size: logicalSize))
+            }
+        }
+    }
+    private var lastAdaptiveBounds: CGRect? {
+        didSet {
+            if let bounds = lastAdaptiveBounds, displayMode == .adaptive {
+                updateBoundsSnapshot(bounds)
+            }
+        }
+    }
+    private let boundsSnapshotLock = NSLock()
+    private var threadSafeBoundsSnapshot: CGRect?
     private var lastAdaptiveLayoutSize: CGSize = .zero
     private var isResolvingBounds = false
     private var isApplyingScaledLayout = false
@@ -187,13 +201,32 @@ public class PlayScreen: NSObject {
     private var shouldAllowRuntimeFallback: Bool {
         PlaySettings.shared.smartAdaptive
             && displayMode == .adaptive
-            && !isDuoIdentity
+            && !(isDuoIdentity && appCapabilities.supportsDuoAdaptive)
             && !PlaySettings.shared.sdkShift
     }
 
     override init() {
         super.init()
-        displayMode = Self.initialDisplayMode(capabilities: appCapabilities)
+        let mode = Self.initialDisplayMode(capabilities: appCapabilities)
+        displayMode = mode
+        if case .scaled(let logicalSize, _, _) = mode {
+            updateBoundsSnapshot(CGRect(origin: .zero, size: logicalSize))
+        } else {
+            updateBoundsSnapshot(initialAdaptiveFallbackBounds())
+        }
+    }
+
+    private func readBoundsSnapshot() -> CGRect? {
+        boundsSnapshotLock.lock()
+        defer { boundsSnapshotLock.unlock() }
+        return threadSafeBoundsSnapshot
+    }
+
+    private func updateBoundsSnapshot(_ rect: CGRect) {
+        guard rect.width >= 100, rect.height >= 100 else { return }
+        boundsSnapshotLock.lock()
+        threadSafeBoundsSnapshot = rect
+        boundsSnapshotLock.unlock()
     }
 
     func initialize() {
@@ -541,10 +574,20 @@ private extension PlayScreen {
     }
 
     func resolveBoundsResizable(_ rect: CGRect) -> CGRect {
+        if !Thread.isMainThread {
+            if let snapshot = readBoundsSnapshot() {
+                return snapshot
+            }
+            if rect.width >= 100, rect.height >= 100 {
+                return CGRect(origin: .zero, size: rect.size)
+            }
+            return initialAdaptiveFallbackBounds()
+        }
+
         if case .scaled(let logicalSize, _, _) = displayMode {
             return CGRect(origin: .zero, size: logicalSize)
         }
-        let fallback = lastAdaptiveBounds ?? CGRect(x: 0, y: 0, width: 900, height: 760)
+        let fallback = lastAdaptiveBounds ?? initialAdaptiveFallbackBounds()
         guard !isResolvingBounds else { return fallback }
         isResolvingBounds = true
         defer { isResolvingBounds = false }
@@ -554,7 +597,32 @@ private extension PlayScreen {
             lastAdaptiveBounds = resolved
             return resolved
         }
+        if let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.session.role == .windowApplication }) {
+            let sBounds = scene.coordinateSpace.bounds
+            if sBounds.width >= 100, sBounds.height >= 100 {
+                let resolved = CGRect(origin: .zero, size: sBounds.size)
+                lastAdaptiveBounds = resolved
+                return resolved
+            }
+        }
+        if let content = AKInterface.shared?.contentLayoutRect,
+           content.width >= 100, content.height >= 100 {
+            let resolved = CGRect(origin: .zero, size: content.size)
+            lastAdaptiveBounds = resolved
+            return resolved
+        }
         return fallback
+    }
+
+    private func initialAdaptiveFallbackBounds() -> CGRect {
+        let cfg = PlaySettings.shared.settingsData
+        if cfg.windowWidth >= 100 && cfg.windowWidth <= 1400 &&
+           cfg.windowHeight >= 100 && cfg.windowHeight <= 1200 {
+            return CGRect(x: 0, y: 0, width: CGFloat(cfg.windowWidth), height: CGFloat(cfg.windowHeight))
+        }
+        return CGRect(x: 0, y: 0, width: 900, height: 760)
     }
 
     func sceneRank(_ state: UIScene.ActivationState) -> Int {

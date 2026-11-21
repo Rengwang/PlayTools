@@ -146,6 +146,8 @@ let settings = PlaySettings.shared
 
     @objc lazy var sdkShift = settingsData.sdkShift
 
+    @objc lazy var useNativePlatform = settingsData.useNativePlatform
+
     @objc lazy var spoofPowerState = settingsData.spoofPowerState
 }
 
@@ -185,6 +187,7 @@ struct AppSettingsData: Codable {
     var uiScale: Double = 1.0
     var layoutIdiom: Int = 3
     var sdkShift = false
+    var useNativePlatform = false
     var spoofPowerState = false
 
     init() {}
@@ -233,6 +236,7 @@ struct AppSettingsData: Codable {
         uiScale = decodedUIScale <= 0.0 ? 1.0 : decodedUIScale
         layoutIdiom = try container.decodeIfPresent(Int.self, forKey: .layoutIdiom) ?? 3
         sdkShift = try container.decodeIfPresent(Bool.self, forKey: .sdkShift) ?? false
+        useNativePlatform = try container.decodeIfPresent(Bool.self, forKey: .useNativePlatform) ?? false
         spoofPowerState = try container.decodeIfPresent(Bool.self, forKey: .spoofPowerState) ?? false
     }
 }

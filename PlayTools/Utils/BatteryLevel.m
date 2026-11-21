@@ -9,43 +9,13 @@
 #import <objc/runtime.h>
 #import <PlayTools/PlayTools-Swift.h>
 #import "BatteryLevel.h"
+#import "NSObject+Swizzle.h"
 
 __attribute__((visibility("hidden")))
 @interface BatteryLevelLoader : NSObject
 @end
 
 @implementation NSObject (SwizzleBattery)
-
-- (void) swizzleInstanceMethod:(SEL)origSelector withMethod:(SEL)newSelector
-{
-    Class cls = [self class];
-    // If current class doesn't exist selector, then get super
-    Method originalMethod = class_getInstanceMethod(cls, origSelector);
-    Method swizzledMethod = class_getInstanceMethod(cls, newSelector);
-    
-    // Add selector if it doesn't exist, implement append with method
-    if (class_addMethod(cls,
-                        origSelector,
-                        method_getImplementation(swizzledMethod),
-                        method_getTypeEncoding(swizzledMethod)) ) {
-        // Replace class instance method, added if selector not exist
-        // For class cluster, it always adds new selector here
-        class_replaceMethod(cls,
-                            newSelector,
-                            method_getImplementation(originalMethod),
-                            method_getTypeEncoding(originalMethod));
-        
-    } else {
-        // SwizzleMethod maybe belongs to super
-        class_replaceMethod(cls,
-                            newSelector,
-                            class_replaceMethod(cls,
-                                                origSelector,
-                                                method_getImplementation(swizzledMethod),
-                                                method_getTypeEncoding(swizzledMethod)),
-                            method_getTypeEncoding(originalMethod));
-    }
-}
 
 - (bool) pm_return_true {
     return true;
@@ -65,9 +35,10 @@ __attribute__((visibility("hidden")))
     if (![[PlaySettings shared] spoofPowerState]) {
         return;
     }
-    [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(isBatteryMonitoringEnabled) withMethod:@selector(pm_return_true)];
-    [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(batteryState) withMethod:@selector(pm_return_fullCharging)];
-    [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(batteryLevel) withMethod:@selector(pm_return_battery_full)];
+    Class uiDeviceCls = objc_getClass("UIDevice");
+    pt_swizzleInstanceMethod(uiDeviceCls, @selector(isBatteryMonitoringEnabled), @selector(pm_return_true));
+    pt_swizzleInstanceMethod(uiDeviceCls, @selector(batteryState), @selector(pm_return_fullCharging));
+    pt_swizzleInstanceMethod(uiDeviceCls, @selector(batteryLevel), @selector(pm_return_battery_full));
     [PlayInfo installPowerStateHooksIfNeeded];
 }
 @end

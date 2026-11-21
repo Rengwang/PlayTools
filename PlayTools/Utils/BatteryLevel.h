@@ -11,8 +11,6 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface NSObject (SwizzleBattery)
 
-- (void)swizzleInstanceMethod:(SEL)origSelector withMethod:(SEL)newSelector;
-
 @end
 
 NS_ASSUME_NONNULL_END
