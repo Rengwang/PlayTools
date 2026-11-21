@@ -11,25 +11,55 @@ class PlayInput {
                                                qos: .userInteractive,
                                                autoreleaseFrequency: .workItem)
 
+    private var displayLink: CADisplayLink?
+    private var isAppActive = true
+
     @objc func drainMainDispatchQueue() {
         _dispatch_main_queue_callback_4CF(nil)
     }
 
     func initialize() {
-        // drain the dispatch queue every frame for responding to GCController events
-        let displaylink = CADisplayLink(target: self, selector: #selector(drainMainDispatchQueue))
-        displaylink.add(to: .main, forMode: .common)
-
         if PlaySettings.shared.disableBuiltinMouse {
             simulateGCMouseDisconnect()
         }
 
-        if !PlaySettings.shared.keymapping {
+        guard PlaySettings.shared.keymapping else {
             return
         }
 
         let centre = NotificationCenter.default
         let main = OperationQueue.main
+
+        // Only run the CADisplayLink queue-drainer while keymapping is active,
+        // at least one GCController is connected, and the app is foreground-active.
+        for name in [
+            NSNotification.Name.GCControllerDidConnect,
+            NSNotification.Name.GCControllerDidDisconnect
+        ] {
+            centre.addObserver(forName: name, object: nil, queue: main) { [weak self] _ in
+                self?.updateDisplayLinkState()
+            }
+        }
+        centre.addObserver(
+            forName: UIApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: main
+        ) { [weak self] _ in
+            self?.isAppActive = true
+            self?.updateDisplayLinkState()
+        }
+        for name in [
+            UIApplication.willResignActiveNotification,
+            UIApplication.didEnterBackgroundNotification,
+            NSNotification.Name("NSApplicationDidHideNotification"),
+            NSNotification.Name("NSWindowDidMiniaturizeNotification")
+        ] {
+            centre.addObserver(forName: name, object: nil, queue: main) { [weak self] _ in
+                self?.isAppActive = false
+                self?.updateDisplayLinkState()
+            }
+        }
+        updateDisplayLinkState()
 
         centre.addObserver(forName: NSNotification.Name(rawValue: "NSWindowDidBecomeKeyNotification"), object: nil,
             queue: main) { _ in
@@ -45,6 +75,26 @@ class PlayInput {
             Toast.initialize()
         }
         mode.initialize()
+    }
+
+    private func updateDisplayLinkState() {
+        let hasController = !GCController.controllers().isEmpty
+        if !hasController {
+            displayLink?.invalidate()
+            displayLink = nil
+            return
+        }
+        if isAppActive {
+            if displayLink == nil {
+                // Drain the main dispatch queue per frame while a GCController is active.
+                let link = CADisplayLink(target: self, selector: #selector(drainMainDispatchQueue))
+                link.add(to: .main, forMode: .common)
+                displayLink = link
+            }
+            displayLink?.isPaused = false
+        } else {
+            displayLink?.isPaused = true
+        }
     }
 
     private func simulateGCMouseDisconnect() {

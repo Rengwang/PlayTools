@@ -11,6 +11,7 @@ import Foundation
 
 // Add a lightweight struct so we can decode only the flags we care about
 private struct AKAppSettingsData: Codable {
+    var keymapping: Bool?
     var hideTitleBar: Bool?
     var floatingWindow: Bool?
     var resolution: Int?
@@ -186,6 +187,7 @@ class AKPlugin: NSObject, Plugin {
     // swiftlint:disable:next function_body_length
     func setupKeyboard(keyboard: @escaping (UInt16, Bool, Bool, Bool) -> Bool,
                        swapMode: @escaping () -> Bool) {
+        guard keymappingSetting else { return }
         func checkCmd(modifier: NSEvent.ModifierFlags) -> Bool {
             if modifier.contains(.command) {
                 self.cmdPressed = true
@@ -241,6 +243,7 @@ class AKPlugin: NSObject, Plugin {
     }
 
     func setupMouseMoved(_ mouseMoved: @escaping (CGFloat, CGFloat) -> Bool) {
+        guard keymappingSetting else { return }
         let mask: NSEvent.EventTypeMask = [.leftMouseDragged, .otherMouseDragged, .rightMouseDragged]
         NSEvent.addLocalMonitorForEvents(matching: mask, handler: { event in
             let consumed = mouseMoved(event.deltaX, event.deltaY)
@@ -257,6 +260,7 @@ class AKPlugin: NSObject, Plugin {
     }
 
     func setupMouseButton(left: Bool, right: Bool, _ consumed: @escaping (Int, Bool) -> Bool) {
+        guard keymappingSetting else { return }
         let downType: NSEvent.EventTypeMask = left ? .leftMouseDown : right ? .rightMouseDown : .otherMouseDown
         let upType: NSEvent.EventTypeMask = left ? .leftMouseUp : right ? .rightMouseUp : .otherMouseUp
 
@@ -318,6 +322,7 @@ class AKPlugin: NSObject, Plugin {
     }
 
     func setupScrollWheel(_ onMoved: @escaping (CGFloat, CGFloat) -> Bool) {
+        guard keymappingSetting else { return }
         NSEvent.addLocalMonitorForEvents(matching: NSEvent.EventTypeMask.scrollWheel, handler: { event in
             var deltaX = event.scrollingDeltaX, deltaY = event.scrollingDeltaY
             if !event.hasPreciseScrollingDeltas {
@@ -341,6 +346,7 @@ class AKPlugin: NSObject, Plugin {
     }
 
     /// Convenience instance property that exposes the cached static preference.
+    private var keymappingSetting: Bool { Self.akAppSettingsData?.keymapping ?? false }
     private var hideTitleBarSetting: Bool { Self.akAppSettingsData?.hideTitleBar ?? false }
     private var floatingWindowSetting: Bool { Self.akAppSettingsData?.floatingWindow ?? false }
     private var resolutionSetting: Int { Self.akAppSettingsData?.resolution ?? 7 }

@@ -25,7 +25,7 @@ let settings = PlaySettings.shared
 
     lazy var discordActivity = settingsData.discordActivity
 
-    lazy var keymapping = settingsData.keymapping
+    @objc lazy var keymapping = settingsData.keymapping
 
     lazy var notch = settingsData.notch
 
@@ -145,10 +145,12 @@ let settings = PlaySettings.shared
     @objc lazy var layoutIdiom = effectiveLayoutIdiom
 
     @objc lazy var sdkShift = settingsData.sdkShift
+
+    @objc lazy var spoofPowerState = settingsData.spoofPowerState
 }
 
 struct AppSettingsData: Codable {
-    var keymapping = true
+    var keymapping = false
     var sensitivity: Float = 50
 
     var disableTimeout = false
@@ -183,12 +185,13 @@ struct AppSettingsData: Codable {
     var uiScale: Double = 1.0
     var layoutIdiom: Int = 3
     var sdkShift = false
+    var spoofPowerState = false
 
     init() {}
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        keymapping = try container.decodeIfPresent(Bool.self, forKey: .keymapping) ?? true
+        keymapping = try container.decodeIfPresent(Bool.self, forKey: .keymapping) ?? false
         sensitivity = try container.decodeIfPresent(Float.self, forKey: .sensitivity) ?? 50
         disableTimeout = try container.decodeIfPresent(Bool.self, forKey: .disableTimeout) ?? false
         iosDeviceModel = try container.decodeIfPresent(String.self, forKey: .iosDeviceModel) ?? "iPhone19,4"
@@ -230,5 +233,6 @@ struct AppSettingsData: Codable {
         uiScale = decodedUIScale <= 0.0 ? 1.0 : decodedUIScale
         layoutIdiom = try container.decodeIfPresent(Int.self, forKey: .layoutIdiom) ?? 3
         sdkShift = try container.decodeIfPresent(Bool.self, forKey: .sdkShift) ?? false
+        spoofPowerState = try container.decodeIfPresent(Bool.self, forKey: .spoofPowerState) ?? false
     }
 }

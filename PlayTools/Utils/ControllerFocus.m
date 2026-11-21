@@ -16,6 +16,8 @@ __attribute__((visibility("hidden")))
 
 @implementation BackgroundControllerLoader
 + (void)load {
-    [GCController setShouldMonitorBackgroundEvents:YES];
+    if ([[PlaySettings shared] keymapping]) {
+        [GCController setShouldMonitorBackgroundEvents:YES];
+    }
 }
 @end

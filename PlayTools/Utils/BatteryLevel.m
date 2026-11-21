@@ -62,9 +62,12 @@ __attribute__((visibility("hidden")))
 
 @implementation BatteryLevelLoader
 + (void)load {
-    [[UIDevice currentDevice] setBatteryMonitoringEnabled:YES];
+    if (![[PlaySettings shared] spoofPowerState]) {
+        return;
+    }
     [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(isBatteryMonitoringEnabled) withMethod:@selector(pm_return_true)];
     [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(batteryState) withMethod:@selector(pm_return_fullCharging)];
     [objc_getClass("UIDevice") swizzleInstanceMethod:@selector(batteryLevel) withMethod:@selector(pm_return_battery_full)];
+    [PlayInfo installPowerStateHooksIfNeeded];
 }
 @end

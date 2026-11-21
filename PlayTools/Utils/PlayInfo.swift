@@ -4,8 +4,11 @@
 //
 
 import Foundation
+import ObjectiveC.runtime
 
 class PlayInfo: NSObject {
+    private static var powerStateHooksInstalled = false
+
     static var isLauncherInstalled: Bool {
         return AKInterface.shared!
             .urlForApplicationWithBundleIdentifier("io.playcover.PlayCover") != nil
@@ -23,6 +26,22 @@ class PlayInfo: NSObject {
         }
         return false
     }
+
+    @objc static func installPowerStateHooksIfNeeded() {
+        guard !powerStateHooksInstalled, PlaySettings.shared.spoofPowerState else {
+            return
+        }
+        powerStateHooksInstalled = true
+        let cls: AnyClass = ProcessInfo.self
+        if let origThermal = class_getInstanceMethod(cls, #selector(getter: ProcessInfo.thermalState)),
+           let hookThermal = class_getInstanceMethod(cls, #selector(ProcessInfo.pt_spoofedThermalState)) {
+            method_exchangeImplementations(origThermal, hookThermal)
+        }
+        if let origLowPower = class_getInstanceMethod(cls, #selector(getter: ProcessInfo.isLowPowerModeEnabled)),
+           let hookLowPower = class_getInstanceMethod(cls, #selector(ProcessInfo.pt_spoofedIsLowPowerModeEnabled)) {
+            method_exchangeImplementations(origLowPower, hookLowPower)
+        }
+    }
 }
 
 extension ProcessInfo {
@@ -32,10 +51,10 @@ extension ProcessInfo {
     @objc open var isiOSAppOnMac: Bool {
         return true
     }
-    @objc open var thermalState: ProcessInfo.ThermalState {
-        return ProcessInfo.ThermalState.nominal
+    @objc fileprivate func pt_spoofedThermalState() -> ProcessInfo.ThermalState {
+        return .nominal
     }
-    @objc open var isLowPowerModeEnabled: Bool {
+    @objc fileprivate func pt_spoofedIsLowPowerModeEnabled() -> Bool {
         return false
     }
 }
