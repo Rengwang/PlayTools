@@ -55,3 +55,13 @@
      - `PTFakeMetaTouch.m`：在 `sendEvent:` 后将已结束/取消的触控槽位清空为 `[NSNull null]` 再归还复用位图，避免持续持有旧 `UIView`/`UIWindow`。
      - `PlayedAppleDB.swift`：在 `dbLock` 下复用持久化 WAL 模式 `sqlite3*` 连接并在 I/O/锁错误时自动重连，避免每次 Keychain 查询重复 `mkdir`/`stat`/`open`/`close`。
      - `Keymapping.swift`：基于 `stat()` `st_mtimespec` 缓存 `keymapConfig` 与各 `KeymappingData`，避免 `ActionDispatcher.build()` 重复读取并解析 XML plist。
+
+10. **PlayChain 查询语义修复：按全部属性匹配（2026-11-22）**
+   - **根因（实证）**：工商银行启动期查询 `gena = IMEIString`（`kSecAttrGeneric`）时，`PlayKeychainDB.query` 只用主键列（`agrp/acct/svce`）构造 `WHERE`，忽略了 `gena`。于是它返回了同 access group 下 `acct = bundleIDPrefix` 的另一条记录，且该记录没有 `v_Data`；工行把返回值当自己的记录使用，执行 `-[__NSDictionaryM setObject:forKey:]`（key `v_Data`）时触发 `NSInvalidArgumentException` 崩溃。
+   - **修复**：`query` 的 `WHERE` 改为覆盖该表全部列（主键 + 属性列 + 值列），与 Keychain「查询中每个属性都参与匹配」的语义一致；`update` / `delete` 仍只按主键定位。
+   - **验证**：同一 `gena = IMEIString` 查询由「错误命中」变为 `errSecItemNotFound`，工行转入正常新建流程（日志出现 `Wrote keychain item to db`），冷启动后持续运行 ≥15 秒并进入 2 秒一次的正常状态轮询，不再抛异常。
+
+11. **SecItem 返回值语义收敛（`MysticRunes/PlayedApple.swift`）**
+   - `SecItemAdd`：请求了返回值但属性中没有 `v_Data` 时，由「返回 `errSecSuccess` 且不写 out 指针」改为 `errSecParam`，避免调用方拿到未初始化的结果后自行解引用。
+   - `SecItemCopyMatching`：同时请求 `kSecReturnAttributes` 与 `kSecReturnData`、但条目没有 `v_Data` 时返回 `errSecItemNotFound`，而不是返回缺字段的字典。
+   - `addResult` 的密钥构造回退项由 `kSecAttrKeyType` 误用改为 `kSecAttrKeyClass`。
