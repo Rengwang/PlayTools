@@ -65,3 +65,9 @@
    - `SecItemAdd`：请求了返回值但属性中没有 `v_Data` 时，由「返回 `errSecSuccess` 且不写 out 指针」改为 `errSecParam`，避免调用方拿到未初始化的结果后自行解引用。
    - `SecItemCopyMatching`：同时请求 `kSecReturnAttributes` 与 `kSecReturnData`、但条目没有 `v_Data` 时返回 `errSecItemNotFound`，而不是返回缺字段的字典。
    - `addResult` 的密钥构造回退项由 `kSecAttrKeyType` 误用改为 `kSecAttrKeyClass`。
+
+13. **PlayChain 空值 / 批量 / 删除语义补齐（2026-11-22）**
+   - `encodeData`：零长度 `CFData` 改用 `sqlite3_bind_zeroblob(...,0)`，不再因为 `CFDataGetBytePtr == NULL` 被写成 `SQLITE_NULL`；`decodeData` 对 `SQLITE_BLOB` 先取 `column_bytes`，为 0 时返回 `Data()`，只有 `SQLITE_NULL` 才返回 `nil`。
+   - `copyAllMatches` 与单条查询共用 `resultDictionary(_:query:)`：请求 `kSecReturnData` 但条目无 `v_Data` 时不视为匹配，空集合返回 `errSecItemNotFound`。
+   - `SecItemDelete`：仅当 query 只有 `kSecClass` 时执行整表删除；若包含任何无法转成 SQL 的限定键（如 `kSecMatchItemList`），直接返回 `errSecParam` 且不执行 SQL，避免“定向删除变成清表”。`SecItemUpdate/Delete` 用 `sqlite3_changes` 判断是否命中，未命中返回 `errSecItemNotFound`。
+   - 验证：class-only 清表 0 残留；带 `kSecMatchItemList` 返回 `errSecParam` 且 2 行数据零丢失；带 `svce+gena` 只删 1 行；改主键 `acct` 命中 1 行；无匹配返回 0。
