@@ -1,4 +1,11 @@
 import Foundation
+#if PLAYTOOLS_FRAMEWORK_PROBES
+import AuthenticationServices
+import GameKit
+import PassKit
+import StoreKit
+import UserNotifications
+#endif
 import Security
 import UIKit
 
@@ -11,6 +18,7 @@ enum PlayToolsSelfTest {
         case keychain
         case platform
         case geometry
+        case entitlements
     }
 
     private struct Check {
@@ -79,12 +87,33 @@ enum PlayToolsSelfTest {
                 checks += platformChecks(window: window, observations: &observations)
             case .geometry:
                 checks += geometryChecks(window: window, observations: &observations)
+            case .entitlements:
+                continue
             }
         }
         if let requestedGroup = requestedGroup, Group(rawValue: requestedGroup) == nil {
             checks.append(Check("configuration.group", false, "Unknown group: \(requestedGroup)"))
         }
 
+        completeEntitlementChecks(requestedGroup: requestedGroup) { entitlementResults in
+            writeReport(requestedGroup: requestedGroup, checks: checks + entitlementResults, observations: observations)
+        }
+    }
+
+    private static func completeEntitlementChecks(requestedGroup: String?, completion: @escaping ([Check]) -> Void) {
+        guard requestedGroup == nil || requestedGroup == Group.entitlements.rawValue else {
+            completion([])
+            return
+        }
+        #if PLAYTOOLS_FRAMEWORK_PROBES
+        entitlementChecks(completion: completion)
+        #else
+        completion([Check("entitlements.build", status: requestedGroup == nil ? "skipped" : "fail",
+                          "Framework probes were excluded from this build")])
+        #endif
+    }
+
+    private static func writeReport(requestedGroup: String?, checks: [Check], observations: [String: Any]) {
         let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
         let passed = !checks.contains { $0.status == "fail" }
         let payload: [String: Any] = [
@@ -440,3 +469,212 @@ enum PlayToolsSelfTest {
             && rect.width > 0 && rect.height > 0
     }
 }
+
+#if PLAYTOOLS_FRAMEWORK_PROBES
+
+extension PlayToolsSelfTest {
+    // Accept exactly one callback on the main queue. The timeout also covers work
+    // that blocks a dedicated worker, while the host owns process-level crash detection.
+    private static func boundedChecks(_ name: String, seconds: TimeInterval = 5,
+                              cleanup: @escaping () -> Void = {},
+                              start: (@escaping ([Check]) -> Void) -> Void,
+                              completion: @escaping ([Check]) -> Void) {
+        var finished = false
+        DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+            guard !finished else { return }
+            finished = true
+            cleanup()
+            completion([Check(name, false, "Timed out after \(seconds) seconds")])
+        }
+        start { results in
+            DispatchQueue.main.async {
+                guard !finished else { return }
+                finished = true
+                cleanup()
+                completion(results)
+            }
+        }
+    }
+
+    private static func entitlementChecks(completion: @escaping ([Check]) -> Void) {
+        let group = DispatchGroup()
+        var results = [Check("entitlements.appleID.performRequests", status: "skipped",
+                             "Authorization may present sign-in UI")]
+
+        func append(_ name: String, cleanup: @escaping () -> Void = {},
+                    start: (@escaping ([Check]) -> Void) -> Void) {
+            group.enter()
+            boundedChecks(name, cleanup: cleanup, start: start) { checks in
+                results.append(contentsOf: checks)
+                group.leave()
+            }
+        }
+
+        append("entitlements.capabilities") { done in
+            DispatchQueue.global(qos: .utility).async {
+                done([
+                    Check("entitlements.passKit.canMakePayments", true,
+                          "Returned \(PKPaymentAuthorizationController.canMakePayments())"),
+                    Check("entitlements.passKit.isPassLibraryAvailable", true,
+                          "Returned \(PKPassLibrary.isPassLibraryAvailable())"),
+                    Check("entitlements.storeKit.canMakePayments", true,
+                          "Returned \(SKPaymentQueue.canMakePayments())")
+                ])
+            }
+        }
+        append("entitlements.notifications.getSettings") { done in
+            UNUserNotificationCenter.current().getNotificationSettings { settings in
+                done([Check("entitlements.notifications.getSettings", true,
+                            "UNAuthorizationStatus \(settings.authorizationStatus.rawValue)")])
+            }
+        }
+        if isContractFixture {
+            append("entitlements.appleID.getCredentialState") { done in
+                ASAuthorizationAppleIDProvider().getCredentialState(forUserID: UUID().uuidString) { state, error in
+                    let detail = (error as NSError?).map { "\($0.domain) (\($0.code))" } ?? "no error"
+                    done([Check("entitlements.appleID.getCredentialState",
+                                error != nil || state == .notFound || state == .revoked,
+                                "Credential state \(state.rawValue), \(detail)")])
+                }
+            }
+            let products = StoreKitProductProbe()
+            append("entitlements.storeKit.products", cleanup: products.stop, start: products.start)
+
+            let notifications = LocalNotificationProbe()
+            append("entitlements.notifications.mutation", cleanup: notifications.stop, start: notifications.start)
+
+            if getenv("PLAYTOOLS_SELFTEST_GAMEKIT").map({ strcmp($0, "1") == 0 }) == true {
+                let player = GKLocalPlayer.local
+                let previous = player.authenticateHandler
+                append("entitlements.gameKit.authenticateHandler", cleanup: { player.authenticateHandler = previous }) {
+                    done in
+                    player.authenticateHandler = { controller, error in
+                        let detail = (error as NSError?).map { "\($0.domain) (\($0.code))" } ?? "no error"
+                        done([Check("entitlements.gameKit.authenticateHandler", true,
+                                    "Controller provided \(controller != nil), \(detail)")])
+                    }
+                }
+            } else {
+                results.append(Check("entitlements.gameKit.authenticateHandler", status: "skipped",
+                                     "Explicit signed-out fixture launch required"))
+            }
+        } else {
+            for operation in ["appleID.getCredentialState", "storeKit.products", "gameKit.authenticateHandler",
+                              "notifications.requestAuthorization", "notifications.addRequest"] {
+                results.append(Check("entitlements." + operation, status: "skipped", "Contract fixture required"))
+            }
+        }
+
+        group.notify(queue: .main) {
+            completion(results.sorted { $0.name < $1.name })
+        }
+    }
+}
+
+extension PlayToolsSelfTest {
+    private final class StoreKitProductProbe: NSObject, SKProductsRequestDelegate {
+        private var request: SKProductsRequest?
+        private var done: (([Check]) -> Void)?
+        private let identifier = "io.playcover.selftest." + UUID().uuidString.replacingOccurrences(of: "-", with: "")
+
+        func start(_ done: @escaping ([Check]) -> Void) {
+            self.done = done
+            let request = SKProductsRequest(productIdentifiers: [identifier])
+            self.request = request
+            request.delegate = self
+            request.start()
+        }
+
+        func stop() {
+            request?.delegate = nil
+            request?.cancel()
+            request = nil
+            done = nil
+        }
+
+        func productsRequest(_ request: SKProductsRequest, didReceive response: SKProductsResponse) {
+            let invalid = response.invalidProductIdentifiers.contains(identifier)
+            let products = response.products.count
+            report(products == 0 && invalid, "Products \(products), recognized synthetic ID as invalid \(invalid)")
+        }
+
+        func request(_ request: SKRequest, didFailWithError error: Error) {
+            let error = error as NSError
+            report(true, "\(error.domain) (\(error.code))")
+        }
+
+        private func report(_ passed: Bool, _ detail: String) {
+            DispatchQueue.main.async { [weak self] in
+                self?.done?([Check("entitlements.storeKit.products", passed, detail)])
+            }
+        }
+    }
+
+    private final class LocalNotificationProbe {
+        private let center = UNUserNotificationCenter.current()
+        private let identifier = "io.playcover.selftest." + UUID().uuidString
+        private var active = false
+
+        func start(_ done: @escaping ([Check]) -> Void) {
+            active = true
+            center.getNotificationSettings { [weak self] settings in
+                DispatchQueue.main.async { self?.handleSettings(settings.authorizationStatus, done: done) }
+            }
+        }
+
+        func stop() {
+            active = false
+            center.removePendingNotificationRequests(withIdentifiers: [identifier])
+        }
+
+        private func handleSettings(_ status: UNAuthorizationStatus, done: @escaping ([Check]) -> Void) {
+            guard active else { return }
+            let authorization = "entitlements.notifications.requestAuthorization"
+            switch status {
+            case .authorized, .provisional, .ephemeral, .denied:
+                let skipped = Check(authorization, status: "skipped", "Existing authorization state \(status.rawValue)")
+                schedule(expectsAcceptance: status != .denied, earlier: [skipped], done: done)
+            case .notDetermined:
+                guard getenv("PLAYTOOLS_SELFTEST_NOTIFICATION_AUTH").map({ strcmp($0, "1") == 0 }) == true else {
+                    done([
+                        Check(authorization, status: "skipped", "Explicit fixture provisional authorization required"),
+                        Check("entitlements.notifications.addRequest", status: "skipped", "Authorization undetermined")
+                    ])
+                    return
+                }
+                center.requestAuthorization(options: [.provisional]) { [weak self] granted, error in
+                    let detail = (error as NSError?).map { "\($0.domain) (\($0.code))" } ?? "no error"
+                    DispatchQueue.main.async {
+                        guard let self = self, self.active else { return }
+                        let result = Check(authorization, true, "Granted \(granted), \(detail)")
+                        self.schedule(expectsAcceptance: granted, earlier: [result], done: done)
+                    }
+                }
+            @unknown default:
+                done([Check("entitlements.notifications.addRequest", status: "skipped",
+                            "Unknown authorization state \(status.rawValue)")])
+            }
+        }
+
+        private func schedule(expectsAcceptance: Bool, earlier: [Check], done: @escaping ([Check]) -> Void) {
+            let content = UNMutableNotificationContent()
+            content.title = "PlayTools contract fixture"
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 86_400, repeats: false)
+            let request = UNNotificationRequest(identifier: identifier, content: content, trigger: trigger)
+            center.add(request) { [center, identifier, weak self] error in
+                // Also clean up a late completion if the fixture has already timed out.
+                center.removePendingNotificationRequests(withIdentifiers: [identifier])
+                DispatchQueue.main.async {
+                    guard let self = self, self.active else { return }
+                    let detail = (error as NSError?).map { "\($0.domain) (\($0.code))" } ?? "accepted"
+                    let result = Check("entitlements.notifications.addRequest", (error == nil) == expectsAcceptance, detail)
+                    center.getPendingNotificationRequests { requests in
+                        let removed = !requests.contains { $0.identifier == identifier }
+                        done(earlier + [result, Check("entitlements.notifications.cleanup", removed)])
+                    }
+                }
+            }
+        }
+    }
+}
+#endif
