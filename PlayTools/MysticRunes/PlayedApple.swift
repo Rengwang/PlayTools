@@ -273,17 +273,9 @@ extension PlayKeychain {
             // missing `v_Data`: several hardened apps re-insert the value into
             // their own dictionary and crash on the nil. Report "not found" so
             // they take the normal error path instead.
-            if wantsData && keychainDict[kSecValueData] == nil {
+            guard let dummyDict = resultDictionary(keychainDict, query: query) else {
                 debugLogger("SecItemCopyMatching asked for attributes and v_Data, but item has none")
                 return errSecItemNotFound
-            }
-            // Create a dummy dictionary and return it
-            let dummyDict = NSMutableDictionary(dictionary: keychainDict)
-            ensureAccessGroupIfApplicable(dummyDict)
-            if !wantsData {
-                dummyDict.removeObject(forKey: kSecValueData)
-                dummyDict.removeObject(forKey: kSecValueRef)
-                dummyDict.removeObject(forKey: kSecValuePersistentRef)
             }
             result?.pointee = Unmanaged.passRetained(dummyDict)
             return errSecSuccess
@@ -346,16 +338,31 @@ extension PlayKeychain {
             return errSecSuccess
         }
 
-        result?.pointee = Unmanaged.passRetained(keychainDicts.map({
-            ensureAccessGroupIfApplicable($0)
-            if !wantsData {
-                $0.removeObject(forKey: kSecValueData)
-            }
-            $0.removeObject(forKey: kSecValueRef)
-            $0.removeObject(forKey: kSecValuePersistentRef)
-            return $0
-        }) as CFTypeRef)
+        // Same contract as the single-item path: entries that cannot satisfy the requested
+        // return flags are not valid matches, and an empty result is "not found".
+        let dictionaries = keychainDicts.compactMap { resultDictionary($0, query: query) }
+        guard !dictionaries.isEmpty else {
+            debugLogger("SecItemCopyMatching matched only items without v_Data")
+            return errSecItemNotFound
+        }
+        result?.pointee = Unmanaged.passRetained(dictionaries as CFTypeRef)
         return errSecSuccess
+    }
+
+    /// Builds the attribute dictionary for a match. `kSecReturnData` must yield real data;
+    /// otherwise the item is rejected so callers never see a silent nil.
+    private static func resultDictionary(_ keychainDict: NSMutableDictionary,
+                                         query: NSDictionary) -> NSMutableDictionary? {
+        let wantsData = flag(query, kSecReturnData)
+        if wantsData && keychainDict[kSecValueData] == nil { return nil }
+        let dict = NSMutableDictionary(dictionary: keychainDict)
+        ensureAccessGroupIfApplicable(dict)
+        if !wantsData {
+            dict.removeObject(forKey: kSecValueData)
+            dict.removeObject(forKey: kSecValueRef)
+            dict.removeObject(forKey: kSecValuePersistentRef)
+        }
+        return dict
     }
 
     private static func copyReference(_ keychainDict: NSMutableDictionary,

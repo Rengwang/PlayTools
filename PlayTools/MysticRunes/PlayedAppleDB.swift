@@ -214,9 +214,11 @@ class PlayKeychainDB: NSObject {
 
         let allColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
         let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: attributes)
-        guard !whereClause.isEmpty else { return (false, 0) }
-
-        let deleteQuery = "DELETE FROM \(tableName) WHERE \(whereClause)"
+        // `SecItemDelete` with only kSecClass is the documented "clear this class" call.
+        // `tableName` comes from the constants whitelist above, so it is safe to interpolate.
+        let deleteQuery = whereClause.isEmpty
+            ? "DELETE FROM \(tableName)"
+            : "DELETE FROM \(tableName) WHERE \(whereClause)"
         var stmt: OpaquePointer?
         var changes = 0
 
@@ -395,9 +397,15 @@ private extension PlayKeychainDB {
             result = sqlite3_bind_text(stmt, index, string, -1, sqliteTransient)
         case CFDataGetTypeID():
             let data = value as! CFData // swiftlint:disable:this force_cast
-            let ptr = CFDataGetBytePtr(data)
             let size = CFDataGetLength(data)
-            result = sqlite3_bind_blob(stmt, index, ptr, Int32(size), sqliteTransient)
+            if size == 0 {
+                // `CFDataGetBytePtr` is NULL for empty data; binding that as a blob stores
+                // SQLITE_NULL, which is indistinguishable from "no value" on read.
+                result = sqlite3_bind_zeroblob(stmt, index, 0)
+            } else {
+                let ptr = CFDataGetBytePtr(data)
+                result = sqlite3_bind_blob(stmt, index, ptr, Int32(size), sqliteTransient)
+            }
         case CFNullGetTypeID():
             result = sqlite3_bind_null(stmt, index)
         default:
@@ -430,8 +438,10 @@ private extension PlayKeychainDB {
                 false
             )
         case SQLITE_BLOB:
-            guard let ptr = sqlite3_column_blob(stmt, index) else { return nil }
+            // A legal zero-length BLOB reports a NULL pointer, so the size decides emptiness.
             let size = sqlite3_column_bytes(stmt, index)
+            if size == 0 { return Data() as CFData }
+            guard let ptr = sqlite3_column_blob(stmt, index) else { return nil }
             return CFDataCreate(nil, ptr, CFIndex(size))
         case SQLITE_NULL:
             return nil
