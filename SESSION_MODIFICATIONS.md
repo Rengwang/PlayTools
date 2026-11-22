@@ -84,3 +84,6 @@
 - Phase 4 将窗口相关 swizzle 的别名安装到对应 UIKit 类，拆分 `UIScreen.bounds` 与 `applicationFrame`，按 `nativeScale` 计算竖屏基准的 `nativeBounds`。`scaled` 同步同场景的可见应用窗口，并通过 UIKit 坐标转换选择命中目标。固定屏幕空间继续由 UIKit 转换，动态画布可仅占固定空间的一部分。
 - 随航上的 B 站、高德地图、酷安、小红书与独立场景测试应用均通过宽屏、窄屏、等比缩放和恢复自适应的几何断言。独立应用的合成浮窗在四种状态下均命中测试按钮，缩放态的窗口变换和画布尺寸一致。B 站、酷安、小红书的越界统计为 0。高德地图在窄屏、缩放和恢复态各报告 11 个底部面板越界候选，与 Phase 3 对照一致。截图中的地图、搜索、主要操作和标签栏均可见，模拟滑动能移动该面板。保留原始越界统计。
 - Phase 5 增加可选编译的权限探针。用 `SWIFT_ACTIVE_COMPILATION_CONDITIONS = $(inherited) PLAYTOOLS_FRAMEWORK_PROBES` 的 xcconfig 通过 `XCODE_XCCONFIG_FILE` 传给标准构建入口，再以 `PLAYTOOLS_SELFTEST_GROUP=entitlements` 运行。UpTimer 上的只读检查通过。独立随航测试应用收到 Apple ID 凭据状态错误和合法的 PassKit/StoreKit 返回，StoreKit 识别了随机不存在的产品。通知探针只为独立应用申请静默临时权限，登记后删除了唯一的远期本地通知。已运行的入口没有异常或超时，因此生产运行时无需新增降级桩。跳过可能显示登录 UI 的 Apple ID 交互请求和 GameKit 认证。
+- Phase 6 的 `media` 探针验证具名剪贴板读写并清理，记录动作传感器能力。独立应用先测试常用音频类别及扬声器、蓝牙选项，再激活和停用可混音播放并恢复音频会话。上述调用均成功，生产路径无需新增音频重试。
+- 全量探针构建在 Mac 主屏通过 54 项，Apple ID 交互登录与 GameKit 认证仍未执行。该次测试应用已有临时通知权限，授权请求在 Phase 5 已单独验证。随后用标准 Release 构建在主屏复测 B 站、高德地图、小红书、酷安的冷启动、宽窄窗口、等比缩放、回到自适应和退出。几何断言全部通过，退出均未强制终止。高德底部面板原始越界计数见 Phase 4。
+- UpTimer 在相同主屏窗口尺寸下完成 3 轮短时空闲采样，按采样时长加权的进程能耗约为 Phase 3 的 1.53 mW 与最终版本的 1.60 mW。该结果只覆盖短时空闲。四款应用的系统日志对照没有新增 Fault 类别。

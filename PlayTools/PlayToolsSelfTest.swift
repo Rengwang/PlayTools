@@ -1,6 +1,8 @@
 import Foundation
 #if PLAYTOOLS_FRAMEWORK_PROBES
 import AuthenticationServices
+import AVFAudio
+import CoreMotion
 import GameKit
 import PassKit
 import StoreKit
@@ -19,6 +21,7 @@ enum PlayToolsSelfTest {
         case platform
         case geometry
         case entitlements
+        case media
     }
 
     private struct Check {
@@ -87,7 +90,7 @@ enum PlayToolsSelfTest {
                 checks += platformChecks(window: window, observations: &observations)
             case .geometry:
                 checks += geometryChecks(window: window, observations: &observations)
-            case .entitlements:
+            case .entitlements, .media:
                 continue
             }
         }
@@ -96,7 +99,10 @@ enum PlayToolsSelfTest {
         }
 
         completeEntitlementChecks(requestedGroup: requestedGroup) { entitlementResults in
-            writeReport(requestedGroup: requestedGroup, checks: checks + entitlementResults, observations: observations)
+            completeMediaChecks(requestedGroup: requestedGroup) { mediaResults in
+                writeReport(requestedGroup: requestedGroup, checks: checks + entitlementResults + mediaResults,
+                            observations: observations)
+            }
         }
     }
 
@@ -109,6 +115,19 @@ enum PlayToolsSelfTest {
         entitlementChecks(completion: completion)
         #else
         completion([Check("entitlements.build", status: requestedGroup == nil ? "skipped" : "fail",
+                          "Framework probes were excluded from this build")])
+        #endif
+    }
+
+    private static func completeMediaChecks(requestedGroup: String?, completion: @escaping ([Check]) -> Void) {
+        guard requestedGroup == nil || requestedGroup == Group.media.rawValue else {
+            completion([])
+            return
+        }
+        #if PLAYTOOLS_FRAMEWORK_PROBES
+        mediaChecks(completion: completion)
+        #else
+        completion([Check("media.build", status: requestedGroup == nil ? "skipped" : "fail",
                           "Framework probes were excluded from this build")])
         #endif
     }
@@ -675,6 +694,94 @@ extension PlayToolsSelfTest {
                 }
             }
         }
+    }
+}
+#endif
+
+#if PLAYTOOLS_FRAMEWORK_PROBES
+
+extension PlayToolsSelfTest {
+    private static func mediaChecks(completion: @escaping ([Check]) -> Void) {
+        let motion = CMMotionManager()
+        let motionCheck = Check("media.motion.capabilities", true,
+                                "Accelerometer \(motion.isAccelerometerAvailable), gyro \(motion.isGyroAvailable), "
+                                + "magnetometer \(motion.isMagnetometerAvailable), device motion "
+                                + "\(motion.isDeviceMotionAvailable)")
+        guard isContractFixture else {
+            completion([
+                motionCheck,
+                Check("media.pasteboard", status: "skipped", "Fixture required for disposable pasteboard write"),
+                Check("media.audio", status: "skipped", "Fixture required for audio category and activation changes")
+            ])
+            return
+        }
+
+        let clipboard = pasteboardCheck()
+        boundedChecks("media.audio", seconds: 12) { done in
+            DispatchQueue.global(qos: .utility).async {
+                done(audioSessionChecks())
+            }
+        } completion: { audio in
+            completion([motionCheck, clipboard] + audio)
+        }
+    }
+
+    private static func pasteboardCheck() -> Check {
+        let name = UIPasteboard.Name(rawValue: "io.playcover.selftest." + UUID().uuidString)
+        guard let pasteboard = UIPasteboard(name: name, create: true) else {
+            return Check("media.pasteboard", false, "Could not create the disposable named pasteboard")
+        }
+        defer { UIPasteboard.remove(withName: name) }
+        let sample = UUID().uuidString
+        pasteboard.string = sample
+        return Check("media.pasteboard", pasteboard.string == sample, "Named pasteboard round trip")
+    }
+
+    private static func audioSessionChecks() -> [Check] {
+        let session = AVAudioSession.sharedInstance()
+        let originalCategory = session.category
+        let originalMode = session.mode
+        let originalPolicy = session.routeSharingPolicy
+        let originalOptions = session.categoryOptions
+
+        func probe(_ name: String, operation: () throws -> Void) -> Check {
+            let start = ProcessInfo.processInfo.systemUptime
+            do {
+                try operation()
+                let elapsed = ProcessInfo.processInfo.systemUptime - start
+                return Check("media.audio." + name, true,
+                             "Returned normally (\(String(format: "%.3f", elapsed)) s)")
+            } catch let error as NSError {
+                let elapsed = ProcessInfo.processInfo.systemUptime - start
+                return Check("media.audio." + name, false, "\(error.domain) (\(error.code)), "
+                             + "\(String(format: "%.3f", elapsed)) s, \(error.localizedDescription)")
+            }
+        }
+
+        let combinations: [(String, AVAudioSession.Category, AVAudioSession.CategoryOptions)] = [
+            ("playAndRecord.defaultToSpeaker", .playAndRecord, .defaultToSpeaker),
+            ("playAndRecord.allowBluetoothHFP", .playAndRecord, .allowBluetoothHFP),
+            ("playAndRecord.allowBluetoothA2DP", .playAndRecord, .allowBluetoothA2DP),
+            ("ambient", .ambient, []),
+            ("playback.mixWithOthers", .playback, .mixWithOthers)
+        ]
+        var checks = combinations.map { name, category, options in
+            probe(name) { try session.setCategory(category, mode: .default, options: options) }
+        }
+
+        if checks.last?.status == "pass" {
+            checks.append(probe("activate") { try session.setActive(true) })
+            // A failed activation can partially configure the session. Try to deactivate
+            // whenever activation was attempted on this disposable, initially inactive host.
+            checks.append(probe("deactivate") { try session.setActive(false, options: .notifyOthersOnDeactivation) })
+        } else {
+            checks.append(Check("media.audio.activate", status: "skipped", "Mixable playback category setup failed"))
+        }
+        checks.append(probe("restore") {
+            try session.setCategory(originalCategory, mode: originalMode, policy: originalPolicy,
+                                    options: originalOptions)
+        })
+        return checks
     }
 }
 #endif
