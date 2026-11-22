@@ -6,6 +6,7 @@
 //
 
 #import "NSObject+Swizzle.h"
+#import "PlayLoader.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <dlfcn.h>
@@ -793,24 +794,6 @@ static BOOL PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
     }
 }
 
-// Hook for UIUserInterfaceIdiom & UIDevice model override
-
-- (long long) hook_userInterfaceIdiom_phone {
-    return UIUserInterfaceIdiomPhone;
-}
-
-- (long long) hook_userInterfaceIdiom_pad {
-    return UIUserInterfaceIdiomPad;
-}
-
-- (NSString *) hook_deviceModel_phone {
-    return @"iPhone";
-}
-
-- (NSString *) hook_deviceModel_pad {
-    return @"iPad";
-}
-
 bool menuWasCreated = false;
 - (id) initWithRootMenuHook:(id)rootMenu {
     self = [self initWithRootMenuHook:rootMenu];
@@ -848,8 +831,55 @@ bool menuWasCreated = false;
  of code and complexity. I'm not sure this trade-off is "worth it", at least at the time of writing.
  */
 
+static UIUserInterfaceIdiom pt_phoneIdiom(id self, SEL selector) {
+    return UIUserInterfaceIdiomPhone;
+}
+
+static UIUserInterfaceIdiom pt_padIdiom(id self, SEL selector) {
+    return UIUserInterfaceIdiomPad;
+}
+
+static NSString *pt_phoneModel(id self, SEL selector) {
+    return @"iPhone";
+}
+
+static NSString *pt_padModel(id self, SEL selector) {
+    return @"iPad";
+}
+
+static NSString *pt_phoneSystemName(id self, SEL selector) {
+    return @"iOS";
+}
+
+static void pt_overrideIdentityGetter(Class target, SEL selector, IMP implementation) {
+    Method getter = class_getInstanceMethod(target, selector);
+    if (getter) {
+        class_replaceMethod(target, selector, implementation, method_getTypeEncoding(getter));
+    }
+}
+
+static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
+    if (layoutIdiom == 0) {
+        return;
+    }
+
+    BOOL phone = layoutIdiom == 1 || layoutIdiom == 3;
+    IMP idiom = phone ? (IMP)pt_phoneIdiom : (IMP)pt_padIdiom;
+    IMP model = phone ? (IMP)pt_phoneModel : (IMP)pt_padModel;
+    Class device = objc_getClass("UIDevice");
+    pt_overrideIdentityGetter(device, @selector(userInterfaceIdiom), idiom);
+    pt_overrideIdentityGetter(objc_getClass("UITraitCollection"), @selector(userInterfaceIdiom), idiom);
+    pt_overrideIdentityGetter(device, @selector(model), model);
+    pt_overrideIdentityGetter(device, @selector(localizedModel), model);
+    if (phone) {
+        pt_overrideIdentityGetter(device, @selector(systemName), (IMP)pt_phoneSystemName);
+    }
+}
+
 @implementation PTSwizzleLoader
 + (void)load {
+    pt_initializePlatformIdentity();
+    pt_installDeviceLayoutIdentity(PlaySettings.shared.layoutIdiom);
     // This might need refactor soon
     if(@available(iOS 16.3, *)) {
         if ([[PlaySettings shared] dynamicWindowMode]) {
@@ -964,20 +994,6 @@ bool menuWasCreated = false;
     
     pt_swizzleInstanceMethod(objc_getClass("_UIMenuBuilder"), sel_getUid("initWithRootMenu:"), @selector(initWithRootMenuHook:));
     pt_swizzleInstanceMethod(objc_getClass("IOSViewController"), @selector(prefersPointerLocked), @selector(hook_prefersPointerLocked));
-    // Override device layout idiom (0 = auto, 1 = iPhone, 2 = iPad, 3 = iPhone Duo)
-    NSInteger layoutIdiom = [[PlaySettings shared] layoutIdiom];
-    if (layoutIdiom == 1 || layoutIdiom == 3) {
-        pt_swizzleInstanceMethod(objc_getClass("UIDevice"), @selector(userInterfaceIdiom), @selector(hook_userInterfaceIdiom_phone));
-        pt_swizzleInstanceMethod(objc_getClass("UITraitCollection"), @selector(userInterfaceIdiom), @selector(hook_userInterfaceIdiom_phone));
-        pt_swizzleInstanceMethod(objc_getClass("UIDevice"), @selector(model), @selector(hook_deviceModel_phone));
-        pt_swizzleInstanceMethod(objc_getClass("UIDevice"), @selector(localizedModel), @selector(hook_deviceModel_phone));
-    } else if (layoutIdiom == 2) {
-        pt_swizzleInstanceMethod(objc_getClass("UIDevice"), @selector(userInterfaceIdiom), @selector(hook_userInterfaceIdiom_pad));
-        pt_swizzleInstanceMethod(objc_getClass("UITraitCollection"), @selector(userInterfaceIdiom), @selector(hook_userInterfaceIdiom_pad));
-        pt_swizzleInstanceMethod(objc_getClass("UIDevice"), @selector(model), @selector(hook_deviceModel_pad));
-        pt_swizzleInstanceMethod(objc_getClass("UIDevice"), @selector(localizedModel), @selector(hook_deviceModel_pad));
-    }
-
     pt_swizzleInstanceMethod(objc_getClass("VSSubscriptionRegistrationCenter"), @selector(setCurrentSubscription:), @selector(hook_setCurrentSubscription:));
 
     if (PlayInfo.isUnrealEngine) {

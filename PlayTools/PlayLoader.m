@@ -1954,14 +1954,113 @@ static void pt_installCloudKitCompatibilityHooks(void) {
     }
 }
 
+typedef BOOL (*pt_processInfo_bool_fn)(id, SEL);
+static pt_processInfo_bool_fn pt_origRuntimeIsMacCatalystApp = NULL;
+static pt_processInfo_bool_fn pt_origRuntimeIsIOSAppOnMac = NULL;
+static pt_processInfo_bool_fn pt_origBaseIsMacCatalystApp = NULL;
+static pt_processInfo_bool_fn pt_origBaseIsIOSAppOnMac = NULL;
+
+static BOOL pt_isSystemFrameworkAddress(const void *addr) {
+    if (!addr) {
+        return NO;
+    }
+    Dl_info info;
+    if (dladdr(addr, &info) == 0 || !info.dli_fname) {
+        return NO;
+    }
+    const char *path = info.dli_fname;
+    return strncmp(path, "/System/", 8) == 0 ||
+           strncmp(path, "/usr/lib/", 9) == 0 ||
+           strncmp(path, "/Library/Apple/", 15) == 0;
+}
+
+static BOOL pt_runtimeProcessInfoIsMacCatalystApp(id self, SEL _cmd) {
+    if (pt_isSystemFrameworkAddress(__builtin_return_address(0))) {
+        return pt_origRuntimeIsMacCatalystApp ? pt_origRuntimeIsMacCatalystApp(self, _cmd) : YES;
+    }
+    return NO;
+}
+
+static BOOL pt_runtimeProcessInfoIsIOSAppOnMac(id self, SEL _cmd) {
+    if (pt_isSystemFrameworkAddress(__builtin_return_address(0))) {
+        return pt_origRuntimeIsIOSAppOnMac ? pt_origRuntimeIsIOSAppOnMac(self, _cmd) : NO;
+    }
+    return NO;
+}
+
+static BOOL pt_baseProcessInfoIsMacCatalystApp(id self, SEL _cmd) {
+    if (pt_isSystemFrameworkAddress(__builtin_return_address(0))) {
+        return pt_origBaseIsMacCatalystApp ? pt_origBaseIsMacCatalystApp(self, _cmd) : YES;
+    }
+    return NO;
+}
+
+static BOOL pt_baseProcessInfoIsIOSAppOnMac(id self, SEL _cmd) {
+    if (pt_isSystemFrameworkAddress(__builtin_return_address(0))) {
+        return pt_origBaseIsIOSAppOnMac ? pt_origBaseIsIOSAppOnMac(self, _cmd) : NO;
+    }
+    return NO;
+}
+
+static void pt_installIOSProcessIdentity(void) {
+
+    SEL catSel = @selector(isMacCatalystApp);
+    SEL iosOnMacSel = @selector(isiOSAppOnMac);
+    Class baseCls = [NSProcessInfo class];
+    Class runtimeCls = object_getClass([NSProcessInfo processInfo]);
+
+    // Hook runtime concrete subclass (e.g. _NSSwiftProcessInfo) FIRST before base class
+    // so we always capture the real Foundation IMPs.
+    if (runtimeCls && runtimeCls != baseCls) {
+        Method mCat = class_getInstanceMethod(runtimeCls, catSel);
+        if (mCat && method_getImplementation(mCat) != (IMP)pt_runtimeProcessInfoIsMacCatalystApp) {
+            pt_origRuntimeIsMacCatalystApp = (pt_processInfo_bool_fn)method_getImplementation(mCat);
+            class_replaceMethod(runtimeCls, catSel, (IMP)pt_runtimeProcessInfoIsMacCatalystApp, method_getTypeEncoding(mCat));
+        }
+        Method mIos = class_getInstanceMethod(runtimeCls, iosOnMacSel);
+        if (mIos && method_getImplementation(mIos) != (IMP)pt_runtimeProcessInfoIsIOSAppOnMac) {
+            pt_origRuntimeIsIOSAppOnMac = (pt_processInfo_bool_fn)method_getImplementation(mIos);
+            class_replaceMethod(runtimeCls, iosOnMacSel, (IMP)pt_runtimeProcessInfoIsIOSAppOnMac, method_getTypeEncoding(mIos));
+        }
+    }
+
+    if (baseCls) {
+        Method mCat = class_getInstanceMethod(baseCls, catSel);
+        if (mCat && method_getImplementation(mCat) != (IMP)pt_baseProcessInfoIsMacCatalystApp) {
+            pt_origBaseIsMacCatalystApp = (pt_processInfo_bool_fn)method_getImplementation(mCat);
+            class_replaceMethod(baseCls, catSel, (IMP)pt_baseProcessInfoIsMacCatalystApp, method_getTypeEncoding(mCat));
+        }
+        Method mIos = class_getInstanceMethod(baseCls, iosOnMacSel);
+        if (mIos && method_getImplementation(mIos) != (IMP)pt_baseProcessInfoIsIOSAppOnMac) {
+            pt_origBaseIsIOSAppOnMac = (pt_processInfo_bool_fn)method_getImplementation(mIos);
+            class_replaceMethod(baseCls, iosOnMacSel, (IMP)pt_baseProcessInfoIsIOSAppOnMac, method_getTypeEncoding(mIos));
+        }
+    }
+}
+
+void pt_initializePlatformIdentity(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        @autoreleasepool {
+            BOOL useNativePlatform = PlaySettings.shared.useNativePlatform;
+            atomic_store_explicit(&pt_use_native_platform, useNativePlatform, memory_order_relaxed);
+            pt_ensure_device_settings_cached();
+            if (!useNativePlatform) {
+                pt_installIOSProcessIdentity();
+            }
+        }
+    });
+}
+
 @implementation PlayLoader
 
++ (void)load {
+    pt_initializePlatformIdentity();
+}
+
 static void __attribute__((constructor)) initialize(void) {
-    BOOL useNativePlatform = PlaySettings.shared.useNativePlatform;
     NSInteger layoutIdiom = PlaySettings.shared.layoutIdiom;
     BOOL isPhoneIdiom = layoutIdiom == 1 || layoutIdiom == 3;
-    atomic_store_explicit(&pt_use_native_platform, useNativePlatform, memory_order_relaxed);
-    [PlayInfo installPlatformIdentityWithUseNativePlatform:useNativePlatform isPhoneIdiom:isPhoneIdiom];
     if (isPhoneIdiom) {
         pt_installTencentVideoPhoneNavigation();
     }

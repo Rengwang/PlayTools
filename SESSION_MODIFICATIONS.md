@@ -79,3 +79,5 @@
 - `./sync_upstream.sh build` 构建成功。B 站在 iPad 随航副屏冷启动并生成报告，3 条临时 Keychain 记录均已删除。基线重现重复项返回 `-36`、数值查找上限被忽略、持久引用无效和设备名称不一致。随后用同一构建启动 UpTimer，未开启自检时未生成报告。两个窗口均确认在随航屏并正常退出。
 - Phase 1 统一 PlayChain 的查询上限和返回类型，重复写入返回 `errSecDuplicateItem`。永久密钥保留调用方传入的标签和可持久化属性。数据库版本 2 为既有记录补充不透明标识，持久引用可回查、更新和删除，更新属性后仍保持稳定。省略查询的访问组时只扫描该应用的 PlayChain 数据库。
 - B 站和独立 Catalyst 测试应用的 Keychain 自检各通过 20 项。独立应用直接调用公开 `SecItem*` API 验证重复项返回 `-25299`、持久引用回查和删除。B 站数据库迁移后通过 SQLite 完整性检查，临时测试服务无残留。
+- Phase 2 将设备配置缓存与进程平台身份初始化移到注入库的 `+load`，并采用工作区已有的调用方感知方案，系统框架继续看到 Foundation 原始进程标志。显式 iPhone 和 Duo 的设备、界面 idiom 和系统名统一为 iPhone / iOS，显式 iPad 保留 UIKit 的 iOS / iPadOS 命名。Auto 跟随 UIKit 的布局，设备型号仍按用户配置独立处理。
+- 平台开关关闭时，应用侧 `dyld_get_active_platform` 为 iOS (2)，两个 ProcessInfo Mac 标志均为 false。开启时，在本机测试的 Catalyst 进程为 Mac Catalyst (6)，两个标志依次为 true、false。带场景的独立测试应用在 4 种布局 × 2 种开关组合下均通过，`+load` 中记录的身份与运行后相符。此时序结果适用于测试主程序，依赖库可能先于 PlayTools 初始化。B 站、高德地图、小红书均在随航屏冷启动、自检并退出。

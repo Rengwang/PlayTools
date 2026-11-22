@@ -44,7 +44,7 @@ enum PlayToolsSelfTest {
     }
 
     private static func runWhenReady(requestedGroup: String?, deadline: TimeInterval) {
-        let needsWindow = requestedGroup == nil || requestedGroup == Group.geometry.rawValue
+        let needsWindow = requestedGroup != Group.keychain.rawValue
         let window = needsWindow ? PlayScreen.shared.activePrimaryWindow : nil
         if needsWindow && window == nil && ProcessInfo.processInfo.systemUptime < deadline {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
@@ -291,6 +291,7 @@ enum PlayToolsSelfTest {
             "isiOSAppOnMac": process.isiOSAppOnMac,
             "deviceIdiom": device.userInterfaceIdiom.rawValue,
             "traitIdiom": traits.userInterfaceIdiom.rawValue,
+            "traitSource": window == nil ? "current" : "window",
             "model": device.model,
             "localizedModel": device.localizedModel,
             "systemName": device.systemName,
@@ -298,9 +299,17 @@ enum PlayToolsSelfTest {
             "uname.machine": unameName,
             "hw.machine": sysctlName
         ]
+        let matchesProcessIdentity: Bool
+        #if targetEnvironment(macCatalyst)
+        matchesProcessIdentity = process.isMacCatalystApp == native && !process.isiOSAppOnMac
+        #else
+        matchesProcessIdentity = native
+            ? process.isMacCatalystApp == process.isiOSAppOnMac
+            : !process.isMacCatalystApp && !process.isiOSAppOnMac
+        #endif
         var checks = [
             Check("platform.dyld", platform == expectedPlatform, "Expected \(expectedPlatform), received \(platform)"),
-            Check("platform.processInfo.exclusive", !(process.isMacCatalystApp && process.isiOSAppOnMac)),
+            Check("platform.processInfo", matchesProcessIdentity),
             Check("platform.machine", sysctlName == settings.deviceModel as String && unameName == sysctlName)
         ]
         if phone || layout == 2 {
@@ -309,7 +318,8 @@ enum PlayToolsSelfTest {
             checks += [
                 Check("platform.deviceIdiom", device.userInterfaceIdiom == expected),
                 Check("platform.traitIdiom", traits.userInterfaceIdiom == expected),
-                Check("platform.model", device.model == model && device.localizedModel == model)
+                Check("platform.model", device.model == model && device.localizedModel == model),
+                Check("platform.systemName", device.systemName == "iOS" || (!phone && device.systemName == "iPadOS"))
             ]
         }
         return checks

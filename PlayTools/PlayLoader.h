@@ -13,6 +13,8 @@
 #define DYLD_INTERPOSE_ORIG(_type,_replacee) \
    (*(_type const volatile *)&_interpose_##_replacee.replacee)
 
+__attribute__((visibility("hidden"))) void pt_initializePlatformIdentity(void);
+
 @interface PlayLoader : NSObject
 
 @end
