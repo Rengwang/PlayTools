@@ -1385,6 +1385,16 @@ private extension PlayScreen {
             )
         case "setMode":
             performAutomationSetMode(params: params, in: window, stateURL: stateURL)
+        #if PLAYTOOLS_FRAMEWORK_PROBES
+        case "selftestPresentations":
+            guard PlayToolsSelfTest.isRequested, PlayToolsSelfTest.isContractFixture else {
+                writeJSON(["error": "Marked contract fixture required"], to: stateURL)
+                return
+            }
+            PlayToolsSelfTest.presentationReport(window: window) { [weak self] report in
+                self?.writeJSON(report, to: stateURL)
+            }
+        #endif
         case "selftestGeometry":
             guard PlayToolsSelfTest.isRequested else {
                 writeJSON(["error": "PLAYTOOLS_SELFTEST=1 required"], to: stateURL)

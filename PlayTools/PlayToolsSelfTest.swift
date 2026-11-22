@@ -5,7 +5,9 @@ import AVFAudio
 import CoreMotion
 import GameKit
 import PassKit
+import PhotosUI
 import StoreKit
+import UniformTypeIdentifiers
 import UserNotifications
 import WebKit
 #endif
@@ -25,6 +27,7 @@ enum PlayToolsSelfTest {
         case media
         case webkit
         case urls
+        case presentations
     }
 
     private struct Check {
@@ -93,7 +96,7 @@ enum PlayToolsSelfTest {
                 checks += platformChecks(window: window, observations: &observations)
             case .geometry:
                 checks += geometryChecks(window: window, observations: &observations)
-            case .entitlements, .media, .webkit, .urls:
+            case .entitlements, .media, .webkit, .urls, .presentations:
                 continue
             }
         }
@@ -101,7 +104,7 @@ enum PlayToolsSelfTest {
             checks.append(Check("configuration.group", false, "Unknown group: \(requestedGroup)"))
         }
 
-        let frameworkGroups: [Group] = [.entitlements, .media, .webkit, .urls]
+        let frameworkGroups: [Group] = [.entitlements, .media, .webkit, .urls, .presentations]
         let selectedGroups = frameworkGroups.filter { requestedGroup == nil || requestedGroup == $0.rawValue }
         completeFrameworkChecks(selectedGroups[...], explicit: requestedGroup != nil, window: window) { results in
             writeReport(requestedGroup: requestedGroup, checks: checks + results, observations: observations)
@@ -129,6 +132,8 @@ enum PlayToolsSelfTest {
             webKitChecks(window: window, completion: next)
         case .urls:
             urlChecks(completion: next)
+        case .presentations:
+            presentationChecks(window: window, completion: next)
         default:
             next([])
         }
@@ -964,6 +969,97 @@ extension PlayToolsSelfTest {
         } completion: { results in
             completion(results)
         }
+    }
+}
+#endif
+
+#if PLAYTOOLS_FRAMEWORK_PROBES
+extension PlayToolsSelfTest {
+    static func presentationReport(window: UIWindow, completion: @escaping ([String: Any]) -> Void) {
+        presentationChecks(window: window) { checks in
+            completion([
+                "action": "selftestPresentations",
+                "pid": ProcessInfo.processInfo.processIdentifier,
+                "mode": PlayScreen.shared.currentDisplayMode.name,
+                "windowBounds": rectJSON(window.bounds),
+                "passed": !checks.contains { $0.status == "fail" },
+                "checks": checks.map(\.json)
+            ])
+        }
+    }
+
+    private static func presentationChecks(window: UIWindow?, completion: @escaping ([Check]) -> Void) {
+        guard isContractFixture else {
+            completion([Check("presentations.fixture", status: "skipped", "A marked contract fixture is required")])
+            return
+        }
+        guard let presenter = window?.rootViewController, presenter.viewIfLoaded?.window != nil,
+              presenter.presentedViewController == nil else {
+            completion([Check("presentations.window", false, "Fixture presenter is unavailable")])
+            return
+        }
+        let camera = UIImagePickerController.isSourceTypeAvailable(.camera)
+        let photos = UIImagePickerController.isSourceTypeAvailable(.photoLibrary)
+        let availability = Check("presentations.images.capabilities", true,
+                                 "camera \(camera), photoLibrary \(photos)")
+        let scenarios: [(name: String, make: () -> UIViewController)] = [
+            ("actionSheet", {
+                let sheet = UIAlertController(title: "Contract fixture", message: nil, preferredStyle: .actionSheet)
+                sheet.addAction(UIAlertAction(title: "Close", style: .cancel))
+                return sheet
+            }),
+            ("activity", { UIActivityViewController(activityItems: ["Contract fixture"], applicationActivities: nil) }),
+            ("photos", { PHPickerViewController(configuration: PHPickerConfiguration()) }),
+            ("documents", { UIDocumentPickerViewController(forOpeningContentTypes: [.plainText]) })
+        ]
+        runPresentations(scenarios[...], presenter: presenter) { results in
+            completion([availability] + results)
+        }
+    }
+
+    private static func runPresentations(_ scenarios: ArraySlice<(name: String, make: () -> UIViewController)>,
+                                         presenter: UIViewController, completion: @escaping ([Check]) -> Void) {
+        guard let scenario = scenarios.first else {
+            completion([])
+            return
+        }
+
+        let controller = scenario.make()
+        let name = "presentations." + scenario.name
+        boundedChecks(name, seconds: 7, cleanup: {
+            if presenter.presentedViewController === controller {
+                controller.dismiss(animated: false)
+            }
+        }, start: { done in
+            presenter.present(controller, animated: false) {
+                // The system can attach its picker content on a subsequent run-loop pass.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                    let view = controller.viewIfLoaded
+                    let window = view?.window
+                    let presented = controller.presentingViewController === presenter
+                    let frame = view.map { $0.convert($0.bounds, to: window) }
+                    let fitsWindow = window.map { window in
+                        frame.map { validRect($0) && window.bounds.insetBy(dx: -1, dy: -1).contains($0) } ?? false
+                    } ?? false
+                    let attached = presenter.presentedViewController === controller
+                    controller.dismiss(animated: false) {
+                        let dismissed = presenter.presentedViewController !== controller
+                        let detail = "presented \(presented), attached \(attached), fits window \(fitsWindow), "
+                            + "frame \(String(describing: frame)), window \(String(describing: window?.bounds)), "
+                            + "dismissed \(dismissed)"
+                        done([Check(name, (presented || attached) && fitsWindow && dismissed, detail)])
+                    }
+                }
+            }
+        }, completion: { checks in
+            guard checks.allSatisfy({ $0.status == "pass" }) else {
+                completion(checks)
+                return
+            }
+            runPresentations(scenarios.dropFirst(), presenter: presenter) { remaining in
+                completion(checks + remaining)
+            }
+        })
     }
 }
 #endif
