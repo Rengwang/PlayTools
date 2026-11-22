@@ -113,38 +113,31 @@ public class PlayKeychain: NSObject {
     }
 
     // SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate)
-    @objc static public func update(_ query: NSDictionary, attributesToUpdate: NSDictionary) -> OSStatus {
-        guard let keychainDict = playChainDB.query(query)?.first else {
-            debugLogger("Keychain item not found in db")
-            return errSecItemNotFound
-        }
-        debugLogger("Select keychain item from db")
-        // Reconstruct the dictionary (subscripting won't work as assignment is not allowed)
-        let newKeychainDict = NSMutableDictionary()
-        for (key, value) in keychainDict {
-            newKeychainDict.setValue(value, forKey: key as! String) // swiftlint:disable:this force_cast
-        }
-        // Update the dictionary
-        for (key, value) in attributesToUpdate {
-            newKeychainDict.setValue(value, forKey: key as! String) // swiftlint:disable:this force_cast
-        }
-        guard playChainDB.update(newKeychainDict) else {
+    @objc static public func update(_ query: NSDictionary,
+                                    attributesToUpdate: NSDictionary) -> OSStatus {
+        let result = playChainDB.update(query: query, attributesToUpdate: attributesToUpdate)
+        guard result.ok else {
             debugLogger("Failed to update keychain item to db")
             return errSecIO
         }
-
+        guard result.changes > 0 else {
+            debugLogger("Keychain item not found in db")
+            return errSecItemNotFound
+        }
+        debugLogger("Updated keychain item in db")
         return errSecSuccess
     }
 
     // SecItemDelete(CFDictionaryRef query)
     @objc static public func delete(_ query: NSDictionary) -> OSStatus {
-        guard playChainDB.query(query)?.first != nil else {
-            debugLogger("Failed to find keychain item")
-            return errSecItemNotFound
-        }
-        guard playChainDB.delete(query) else {
+        let result = playChainDB.delete(query)
+        guard result.ok else {
             debugLogger("Failed to delete keychain item")
             return errSecIO
+        }
+        guard result.changes > 0 else {
+            debugLogger("Failed to find keychain item")
+            return errSecItemNotFound
         }
         debugLogger("Deleted keychain item in db")
         return errSecSuccess

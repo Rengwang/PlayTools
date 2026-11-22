@@ -146,94 +146,102 @@ class PlayKeychainDB: NSObject {
         return newDict
     }
 
-    func update(_ attributes: NSDictionary) -> Bool {
-        guard let tableName = attributes[kSecClass] as? String,
+    /// Applies a partial update: `query` only builds the WHERE clause, and
+    /// `attributesToUpdate` only builds the SET clause. Returns the affected row count so the
+    /// caller can report `errSecItemNotFound` instead of a false success.
+    func update(query: NSDictionary, attributesToUpdate: NSDictionary) -> (ok: Bool, changes: Int) {
+        guard let tableName = query[kSecClass] as? String,
               let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString],
               let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] else {
-            return false
+            return (false, 0)
         }
 
-        var columnsQuery = primaryColumns.map({ "\($0)" })
-        columnsQuery.append(contentsOf: secondaryColumns.compactMap({
-            attributes[$0] != nil ? "\($0)" : nil
-        }))
-        columnsQuery.append(contentsOf: PlayedAppleDBConstants.values.compactMap({
-            attributes[$0] != nil ? "\($0)" : nil
-        }))
+        let allColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
+        var setClauses: [String] = []
+        var setValues: [CFTypeRef] = []
+        for column in allColumns where column as String != kSecClass as String {
+            guard let value = attributesToUpdate[column] else { continue }
+            setClauses.append("\(column) = ?")
+            setValues.append(value as CFTypeRef)
+        }
+        guard !setClauses.isEmpty else { return (false, 0) }
 
-        let updateValues = columnsQuery.map({ attributes[$0] as CFTypeRef })
+        let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: query)
+        guard !whereClause.isEmpty else { return (false, 0) }
 
-        let updateColumns = columnsQuery.map({ return "\($0) = ?" }).joined(separator: ", ")
-        let (whereClause, whereBindings) = buildWhereClause(columns: primaryColumns, attributes: attributes)
-        guard !whereClause.isEmpty else { return false }
-
-        let updateQuery = "UPDATE \(tableName) SET \(updateColumns) WHERE \(whereClause)"
+        let updateQuery = "UPDATE \(tableName) SET \(setClauses.joined(separator: ", ")) WHERE \(whereClause)"
         var stmt: OpaquePointer?
+        var changes = 0
 
-        guard usingDB({ sqlite3DB in
+        let ok = usingDB { sqlite3DB in
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare(sqlite3DB, updateQuery, -1, &stmt, nil) == SQLITE_OK,
                   let stmt = stmt else {
-                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
                 PlayKeychain.debugLogger("Failed query \(updateQuery)")
-                PlayKeychain.debugLogger("Failed to make query: \(errorMessage)")
+                PlayKeychain.debugLogger("Failed to make query: \(String(cString: sqlite3_errmsg(sqlite3DB)))")
                 return false
             }
 
-            for (index, value) in updateValues.enumerated()
+            for (index, value) in setValues.enumerated()
             where !encodeData(stmt: stmt, index: Int32(index + 1), value: value) {
-                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
-                PlayKeychain.debugLogger("Failed to update into db: \(errorMessage)")
+                PlayKeychain.debugLogger("Failed to bind update value")
                 return false
             }
 
-            let whereOffset = updateValues.count
+            let whereOffset = setValues.count
             for (index, value) in whereBindings.enumerated()
             where !encodeData(stmt: stmt, index: Int32(whereOffset + index + 1), value: value) {
-                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
-                PlayKeychain.debugLogger("Failed to bind update parameter: \(errorMessage)")
+                PlayKeychain.debugLogger("Failed to bind update parameter")
                 return false
             }
 
-            return sqlite3_step(stmt) == SQLITE_DONE
-        }) else { return false }
-
-        return true
-    }
-
-    func delete(_ attributes: NSDictionary) -> Bool {
-        guard let tableName = attributes[kSecClass] as? String,
-              let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString] else {
-            return false
+            guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+            changes = Int(sqlite3_changes(sqlite3DB))
+            return true
         }
 
-        let (whereClause, whereBindings) = buildWhereClause(columns: primaryColumns, attributes: attributes)
-        guard !whereClause.isEmpty else { return false }
+        return (ok, ok ? changes : 0)
+    }
+
+    /// Deletes every row matched by the query (all provided attributes are part of the WHERE
+    /// clause) and reports how many rows were removed.
+    func delete(_ attributes: NSDictionary) -> (ok: Bool, changes: Int) {
+        guard let tableName = attributes[kSecClass] as? String,
+              let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString],
+              let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] else {
+            return (false, 0)
+        }
+
+        let allColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
+        let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: attributes)
+        guard !whereClause.isEmpty else { return (false, 0) }
 
         let deleteQuery = "DELETE FROM \(tableName) WHERE \(whereClause)"
         var stmt: OpaquePointer?
+        var changes = 0
 
-        guard usingDB({ sqlite3DB in
+        let ok = usingDB { sqlite3DB in
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare(sqlite3DB, deleteQuery, -1, &stmt, nil) == SQLITE_OK,
                   let stmt = stmt else {
-                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
                 PlayKeychain.debugLogger("Failed query \(deleteQuery)")
-                PlayKeychain.debugLogger("Failed to delte items from db table: \(errorMessage)")
+                PlayKeychain.debugLogger("Failed to delete items from db table: "
+                                         + "\(String(cString: sqlite3_errmsg(sqlite3DB)))")
                 return false
             }
 
             for (index, value) in whereBindings.enumerated()
             where !encodeData(stmt: stmt, index: Int32(index + 1), value: value) {
-                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
-                PlayKeychain.debugLogger("Failed to bind delete parameter: \(errorMessage)")
+                PlayKeychain.debugLogger("Failed to bind delete parameter")
                 return false
             }
 
-            return sqlite3_step(stmt) == SQLITE_DONE
-        }) else { return false }
+            guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
+            changes = Int(sqlite3_changes(sqlite3DB))
+            return true
+        }
 
-        return true
+        return (ok, ok ? changes : 0)
     }
 
     private func structDB(_ sqlite3DB: OpaquePointer) -> Bool {
