@@ -2513,18 +2513,40 @@ static pt_processInfo_bool_fn pt_origRuntimeIsIOSAppOnMac = NULL;
 static pt_processInfo_bool_fn pt_origBaseIsMacCatalystApp = NULL;
 static pt_processInfo_bool_fn pt_origBaseIsIOSAppOnMac = NULL;
 
+extern const struct mach_header __dso_handle;
+enum { pt_callerCacheSlots = 32 };
+static _Atomic(uintptr_t) pt_systemCallerCache[pt_callerCacheSlots];
+
 static BOOL pt_isSystemFrameworkAddress(const void *addr) {
     if (!addr) {
         return NO;
     }
+    // Store the address and result together. An odd address cannot share a slot with a result bit.
+    const uintptr_t address = (uintptr_t)addr;
+    const BOOL aligned = (address & 1) == 0;
+    const size_t slot = ((address >> 2) ^ (address >> 11)) & (pt_callerCacheSlots - 1);
+    if (aligned) {
+        const uintptr_t cached = atomic_load_explicit(&pt_systemCallerCache[slot], memory_order_relaxed);
+        if ((cached & ~(uintptr_t)1) == address) {
+            return (cached & 1) != 0;
+        }
+    }
+
     Dl_info info;
     if (dladdr(addr, &info) == 0 || !info.dli_fname) {
         return NO;
     }
     const char *path = info.dli_fname;
-    return strncmp(path, "/System/", 8) == 0 ||
-           strncmp(path, "/usr/lib/", 9) == 0 ||
-           strncmp(path, "/Library/Apple/", 15) == 0;
+    const BOOL isSystem = strncmp(path, "/System/", 8) == 0 ||
+                          strncmp(path, "/usr/lib/", 9) == 0 ||
+                          strncmp(path, "/Library/Apple/", 15) == 0;
+    const struct mach_header *image = info.dli_fbase;
+    // Unloadable dylibs can be remapped at the same address with a different path.
+    if (aligned && image && (image == &__dso_handle || image->filetype == MH_EXECUTE ||
+                             (image->flags & MH_DYLIB_IN_CACHE) != 0)) {
+        atomic_store_explicit(&pt_systemCallerCache[slot], address | (uintptr_t)isSystem, memory_order_relaxed);
+    }
+    return isSystem;
 }
 
 static BOOL pt_runtimeProcessInfoIsMacCatalystApp(id self, SEL _cmd) {

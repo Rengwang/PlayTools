@@ -1386,6 +1386,16 @@ private extension PlayScreen {
         case "setMode":
             performAutomationSetMode(params: params, in: window, stateURL: stateURL)
         #if PLAYTOOLS_FRAMEWORK_PROBES
+        case "selftestAuthorization":
+            guard PlayToolsSelfTest.isRequested, PlayToolsSelfTest.isContractFixture,
+                  getenv("PLAYTOOLS_SELFTEST_AUTHORIZATION").map({ strcmp($0, "1") == 0 }) == true,
+                  let operation = params["operation"] as? String else {
+                writeJSON(["error": "Explicit authorization probe launch and operation required"], to: stateURL)
+                return
+            }
+            PlayToolsSelfTest.authorizationReport(operation: operation, window: window) { [weak self] report in
+                self?.writeJSON(report, to: stateURL)
+            }
         case "selftestPresentations":
             guard PlayToolsSelfTest.isRequested, PlayToolsSelfTest.isContractFixture else {
                 writeJSON(["error": "Marked contract fixture required"], to: stateURL)

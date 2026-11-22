@@ -390,8 +390,36 @@ enum PlayToolsSelfTest {
                 Check("platform.systemName", device.systemName == "iOS" || (!phone && device.systemName == "iPadOS"))
             ]
         }
+        #if PLAYTOOLS_FRAMEWORK_PROBES
+        if isContractFixture {
+            let iterations = 100_000
+            // Warm the Foundation getter before timing, and report its result from every sample.
+            _ = catalystGetterSample(process, iterations: 1_000)
+            let samples = (0..<5).map { _ in catalystGetterSample(process, iterations: iterations) }
+            let expectedCount = process.isMacCatalystApp ? iterations : 0
+            observations["platformBenchmark"] = [
+                "iterationsPerSample": iterations,
+                "nanosecondsPerCall": samples.map(\.nanosecondsPerCall),
+                "trueCounts": samples.map(\.trueCount)
+            ]
+            checks.append(Check("platform.benchmark", samples.allSatisfy { $0.trueCount == expectedCount }))
+        }
+        #endif
         return checks
     }
+
+    #if PLAYTOOLS_FRAMEWORK_PROBES
+    private static func catalystGetterSample(_ process: ProcessInfo, iterations: Int)
+        -> (nanosecondsPerCall: Double, trueCount: Int) {
+        var trueCount = 0
+        let start = DispatchTime.now().uptimeNanoseconds
+        for _ in 0..<iterations {
+            if process.isMacCatalystApp { trueCount += 1 }
+        }
+        let elapsed = DispatchTime.now().uptimeNanoseconds - start
+        return (Double(elapsed) / Double(iterations), trueCount)
+    }
+    #endif
 
     static func geometryReport(window: UIWindow, secondary: [(name: String, passed: Bool, detail: String)])
         -> [String: Any] {
@@ -529,7 +557,7 @@ extension PlayToolsSelfTest {
     private static func entitlementChecks(completion: @escaping ([Check]) -> Void) {
         let group = DispatchGroup()
         var results = [Check("entitlements.appleID.performRequests", status: "skipped",
-                             "Authorization may present sign-in UI")]
+                             "Run selftestAuthorization from an isolated fixture on Sidecar")]
 
         func append(_ name: String, cleanup: @escaping () -> Void = {},
                     start: (@escaping ([Check]) -> Void) -> Void) {
@@ -574,19 +602,14 @@ extension PlayToolsSelfTest {
             append("entitlements.notifications.mutation", cleanup: notifications.stop, start: notifications.start)
 
             if getenv("PLAYTOOLS_SELFTEST_GAMEKIT").map({ strcmp($0, "1") == 0 }) == true {
-                let player = GKLocalPlayer.local
-                let previous = player.authenticateHandler
-                append("entitlements.gameKit.authenticateHandler", cleanup: { player.authenticateHandler = previous }) {
-                    done in
-                    player.authenticateHandler = { controller, error in
-                        let detail = (error as NSError?).map { "\($0.domain) (\($0.code))" } ?? "no error"
-                        done([Check("entitlements.gameKit.authenticateHandler", true,
-                                    "Controller provided \(controller != nil), \(detail)")])
-                    }
+                group.enter()
+                gameKitAuthenticationCheck { checks in
+                    results.append(contentsOf: checks)
+                    group.leave()
                 }
             } else {
                 results.append(Check("entitlements.gameKit.authenticateHandler", status: "skipped",
-                                     "Explicit signed-out fixture launch required"))
+                                     "Run selftestAuthorization from an isolated fixture on Sidecar"))
             }
         } else {
             for operation in ["appleID.getCredentialState", "storeKit.products", "gameKit.authenticateHandler",
@@ -597,6 +620,81 @@ extension PlayToolsSelfTest {
 
         group.notify(queue: .main) {
             completion(results.sorted { $0.name < $1.name })
+        }
+    }
+
+    static func authorizationReport(operation: String, window: UIWindow,
+                                    completion: @escaping ([String: Any]) -> Void) {
+        let report: ([Check]) -> Void = { checks in
+            completion([
+                "action": "selftestAuthorization",
+                "pid": ProcessInfo.processInfo.processIdentifier,
+                "passed": !checks.contains { $0.status == "fail" },
+                "checks": checks.map(\.json)
+            ])
+        }
+        switch operation {
+        case "appleID":
+            let probe = AppleIDAuthorizationProbe(window: window)
+            boundedChecks("entitlements.appleID.performRequests", seconds: 8, cleanup: probe.stop,
+                          start: probe.start, completion: report)
+        case "gameKit":
+            gameKitAuthenticationCheck(completion: report)
+        default:
+            report([Check("entitlements.authorization.operation", false, "Expected appleID or gameKit")])
+        }
+    }
+
+    private static func gameKitAuthenticationCheck(completion: @escaping ([Check]) -> Void) {
+        let name = "entitlements.gameKit.authenticateHandler"
+        let player = GKLocalPlayer.local
+        let previous = player.authenticateHandler
+        boundedChecks(name, seconds: 8, cleanup: { player.authenticateHandler = previous }, start: { done in
+            player.authenticateHandler = { controller, error in
+                let detail = (error as NSError?).map { "\($0.domain) (\($0.code))" } ?? "no error"
+                let authenticated = player.isAuthenticated
+                done([Check(name, controller != nil || error != nil || authenticated,
+                            "Controller provided \(controller != nil), authenticated \(authenticated), \(detail)")])
+            }
+        }, completion: completion)
+    }
+
+    private final class AppleIDAuthorizationProbe: NSObject, ASAuthorizationControllerDelegate,
+                                                   ASAuthorizationControllerPresentationContextProviding {
+        private let window: UIWindow
+        private var controller: ASAuthorizationController?
+        private var completion: (([Check]) -> Void)?
+
+        init(window: UIWindow) {
+            self.window = window
+        }
+
+        func start(_ completion: @escaping ([Check]) -> Void) {
+            let request = ASAuthorizationAppleIDProvider().createRequest()
+            let controller = ASAuthorizationController(authorizationRequests: [request])
+            self.controller = controller
+            self.completion = completion
+            controller.delegate = self
+            controller.presentationContextProvider = self
+            controller.performRequests()
+        }
+
+        func stop() {
+            completion = nil
+            if #available(iOS 16.0, *) { controller?.cancel() }
+            controller = nil
+        }
+
+        func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor { window }
+
+        func authorizationController(controller: ASAuthorizationController,
+                                     didCompleteWithAuthorization authorization: ASAuthorization) {
+            completion?([Check("entitlements.appleID.performRequests", true, "Authorization callback")])
+        }
+
+        func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
+            let error = error as NSError
+            completion?([Check("entitlements.appleID.performRequests", true, "\(error.domain) (\(error.code))")])
         }
     }
 }
