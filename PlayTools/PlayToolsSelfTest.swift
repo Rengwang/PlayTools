@@ -33,8 +33,17 @@ enum PlayToolsSelfTest {
         }
     }
 
+    static var isRequested: Bool {
+        getenv("PLAYTOOLS_SELFTEST").map { strcmp($0, "1") == 0 } == true
+    }
+
+    static var isContractFixture: Bool {
+        getenv("PLAYTOOLS_SELFTEST_FIXTURE").map { strcmp($0, "1") == 0 } == true &&
+            Bundle.main.object(forInfoDictionaryKey: "PlayToolsContractFixture") as? Bool == true
+    }
+
     static func startIfRequested() {
-        guard getenv("PLAYTOOLS_SELFTEST").map({ strcmp($0, "1") == 0 }) == true else { return }
+        guard isRequested else { return }
         let environment = ProcessInfo.processInfo.environment
         let requestedGroup = environment["PLAYTOOLS_SELFTEST_GROUP"]
         DispatchQueue.main.async {
@@ -325,6 +334,20 @@ enum PlayToolsSelfTest {
         return checks
     }
 
+    static func geometryReport(window: UIWindow, secondary: [(name: String, passed: Bool, detail: String)])
+        -> [String: Any] {
+        var observations: [String: Any] = [:]
+        let checks = geometryChecks(window: window, observations: &observations) +
+            secondary.map { Check($0.name, $0.passed, $0.detail) }
+        return [
+            "action": "selftestGeometry",
+            "pid": ProcessInfo.processInfo.processIdentifier,
+            "passed": !checks.contains { $0.status == "fail" },
+            "checks": checks.map(\.json),
+            "observations": observations
+        ]
+    }
+
     private static func geometryChecks(window: UIWindow?, observations: inout [String: Any]) -> [Check] {
         let screen = window?.windowScene?.screen ?? UIScreen.main
         let bounds = screen.bounds
@@ -340,13 +363,18 @@ enum PlayToolsSelfTest {
             "fixedCoordinateSpace": rectJSON(fixed.bounds)
         ]
         defer { observations["geometry"] = values }
-        let sample = CGPoint(x: bounds.midX + bounds.width / 5, y: bounds.midY)
+        let sample = CGPoint(x: rotated.bounds.midX + rotated.bounds.width / 5, y: rotated.bounds.midY)
         let roundTrip = rotated.convert(rotated.convert(sample, to: fixed), from: fixed)
+        let convertedBounds = rotated.convert(rotated.bounds, to: fixed)
+        values["coordinateSpaceInFixedSpace"] = rectJSON(convertedBounds)
+        let restoredBounds = rotated.convert(convertedBounds, from: fixed)
         var checks = [
             Check("geometry.screenMetrics",
                   validRect(bounds) && validRect(screen.nativeBounds) &&
                   screen.scale.isFinite && screen.scale > 0 && screen.nativeScale.isFinite && screen.nativeScale > 0),
             Check("geometry.coordinateSpace.bounds", validRect(rotated.bounds) && validRect(fixed.bounds)),
+            // The virtual app canvas can occupy a subrectangle of the fixed host display.
+            Check("geometry.coordinateSpace.rectRoundTrip", equalRect(restoredBounds, rotated.bounds)),
             Check("geometry.coordinateSpace.roundTrip",
                   abs(roundTrip.x - sample.x) <= 0.5 && abs(roundTrip.y - sample.y) <= 0.5)
         ]
@@ -354,13 +382,51 @@ enum PlayToolsSelfTest {
             checks.append(Check("geometry.scene", status: "skipped", "No window scene appeared before the timeout"))
             return checks
         }
+        if PlaySettings.shared.dynamicWindowMode {
+            let nativeSize = CGSize(width: min(bounds.width, bounds.height) * screen.nativeScale,
+                                    height: max(bounds.width, bounds.height) * screen.nativeScale)
+            checks.append(Check("geometry.nativeBounds",
+                                equalRect(screen.nativeBounds, CGRect(origin: .zero, size: nativeSize))))
+            checks.append(Check("geometry.screenCanvas",
+                                equalRect(bounds, window.bounds) && equalRect(bounds, rotated.bounds)))
+        }
         values["windowBounds"] = rectJSON(window.bounds)
         values["sceneBounds"] = rectJSON(scene.coordinateSpace.bounds)
         if let statusBar = scene.statusBarManager {
-            values["statusBarFrame"] = rectJSON(statusBar.statusBarFrame)
+            let frame = statusBar.statusBarFrame
+            values["statusBarFrame"] = rectJSON(frame)
+            checks.append(Check("geometry.statusBarFrame",
+                                [frame.origin.x, frame.origin.y, frame.size.width, frame.size.height]
+                                    .allSatisfy { $0.isFinite } &&
+                                frame.size.width >= 0 && frame.size.height >= 0 &&
+                                (frame.isEmpty || (frame.minX >= -1 && frame.minY >= -1 &&
+                                                  frame.maxX <= scene.coordinateSpace.bounds.maxX + 1 &&
+                                                  frame.maxY <= scene.coordinateSpace.bounds.maxY + 1))))
+        }
+        switch PlayScreen.shared.currentDisplayMode {
+        case .scaled(let logicalSize, _, _):
+            let sceneBounds = scene.coordinateSpace.bounds
+            let scale = min(sceneBounds.width / logicalSize.width, sceneBounds.height / logicalSize.height)
+            let fittedSize = CGSize(width: logicalSize.width * scale, height: logicalSize.height * scale)
+            let fittedFrame = CGRect(x: sceneBounds.midX - fittedSize.width / 2,
+                                     y: sceneBounds.midY - fittedSize.height / 2,
+                                     width: fittedSize.width, height: fittedSize.height)
+            values["windowFrameInScene"] = rectJSON(window.frame)
+            checks.append(Check("geometry.scaled.logicalBounds",
+                                equalRect(window.bounds, CGRect(origin: .zero, size: logicalSize))))
+            checks.append(Check("geometry.scaled.sceneFit", equalRect(window.frame, fittedFrame)))
+        case .adaptive:
+            if PlaySettings.shared.dynamicWindowMode {
+                checks.append(Check("geometry.adaptive.sceneExtent", equalRect(window.bounds, scene.coordinateSpace.bounds)))
+            }
         }
         checks.append(Check("geometry.scene", validRect(scene.coordinateSpace.bounds) && validRect(window.bounds)))
         return checks
+    }
+
+    private static func equalRect(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        abs(lhs.minX - rhs.minX) <= 1 && abs(lhs.minY - rhs.minY) <= 1 &&
+            abs(lhs.maxX - rhs.maxX) <= 1 && abs(lhs.maxY - rhs.maxY) <= 1
     }
 
     private static func rectJSON(_ rect: CGRect) -> [String: Any] {

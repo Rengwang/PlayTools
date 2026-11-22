@@ -81,3 +81,5 @@
 - B 站和独立 Catalyst 测试应用的 Keychain 自检各通过 20 项。独立应用直接调用公开 `SecItem*` API 验证重复项返回 `-25299`、持久引用回查和删除。B 站数据库迁移后通过 SQLite 完整性检查，临时测试服务无残留。
 - Phase 2 将设备配置缓存与进程平台身份初始化移到注入库的 `+load`，并采用工作区已有的调用方感知方案，系统框架继续看到 Foundation 原始进程标志。显式 iPhone 和 Duo 的设备、界面 idiom 和系统名统一为 iPhone / iOS，显式 iPad 保留 UIKit 的 iOS / iPadOS 命名。Auto 跟随 UIKit 的布局，设备型号仍按用户配置独立处理。
 - 平台开关关闭时，应用侧 `dyld_get_active_platform` 为 iOS (2)，两个 ProcessInfo Mac 标志均为 false。开启时，在本机测试的 Catalyst 进程为 Mac Catalyst (6)，两个标志依次为 true、false。带场景的独立测试应用在 4 种布局 × 2 种开关组合下均通过，`+load` 中记录的身份与运行后相符。此时序结果适用于测试主程序，依赖库可能先于 PlayTools 初始化。B 站、高德地图、小红书均在随航屏冷启动、自检并退出。
+- Phase 4 将窗口相关 swizzle 的别名安装到对应 UIKit 类，拆分 `UIScreen.bounds` 与 `applicationFrame`，按 `nativeScale` 计算竖屏基准的 `nativeBounds`。`scaled` 同步同场景的可见应用窗口，并通过 UIKit 坐标转换选择命中目标。固定屏幕空间继续由 UIKit 转换，动态画布可仅占固定空间的一部分。
+- 随航上的 B 站、高德地图、酷安、小红书与独立场景测试应用均通过宽屏、窄屏、等比缩放和恢复自适应的几何断言。独立应用的合成浮窗在四种状态下均命中测试按钮，缩放态的窗口变换和画布尺寸一致。B 站、酷安、小红书的越界统计为 0。高德地图在窄屏、缩放和恢复态各报告 11 个底部面板越界候选，与 Phase 3 对照一致。截图中的地图、搜索、主要操作和标签栏均可见，模拟滑动能移动该面板。保留原始越界统计。

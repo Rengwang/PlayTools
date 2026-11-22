@@ -14,7 +14,6 @@ let mainScreenWidth = !isInvertFixEnabled
 let mainScreenHeight = !isInvertFixEnabled
     ? PlaySettings.shared.windowSizeHeight
     : PlaySettings.shared.windowSizeWidth
-let customScaler = PlaySettings.shared.customScaler
 
 extension CGSize {
     func aspectRatio() -> CGFloat {
@@ -283,7 +282,9 @@ public class PlayScreen: NSObject {
 
     @objc public static func frame(_ rect: CGRect) -> CGRect { rect.toAspectRatioReversed() }
     @objc public static func bounds(_ rect: CGRect) -> CGRect { rect.toAspectRatio() }
-    @objc public static func nativeBounds(_ rect: CGRect) -> CGRect { rect.toAspectRatio(CGFloat(customScaler)) }
+    @objc public static func nativeBounds(_ rect: CGRect) -> CGRect {
+        portraitBounds(rect.toAspectRatio(), scale: reportedNativeScale)
+    }
     @objc public static func width(_ size: Int) -> Int { size }
     @objc public static func height(_ size: Int) -> Int { Int(size / Int(UIScreen.aspectRatio)) }
     @objc public static func sizeAspectRatio(_ size: CGSize) -> CGSize { size.toAspectRatio() }
@@ -291,16 +292,24 @@ public class PlayScreen: NSObject {
     @objc public static func frameDefault(_ rect: CGRect) -> CGRect { rect.toAspectRatioDefault() }
     @objc public static func boundsDefault(_ rect: CGRect) -> CGRect { rect.toAspectRatioDefault() }
     @objc public static func nativeBoundsDefault(_ rect: CGRect) -> CGRect {
-        rect.toAspectRatioDefault(CGFloat(customScaler))
+        portraitBounds(rect.toAspectRatioDefault(), scale: reportedNativeScale)
     }
     @objc public static func sizeAspectRatioDefault(_ size: CGSize) -> CGSize { size.toAspectRatioDefault() }
     @objc public static func frameInternalDefault(_ rect: CGRect) -> CGRect { rect.toAspectRatioDefault() }
     @objc public static func boundsResizable(_ rect: CGRect) -> CGRect { shared.resolveBoundsResizable(rect) }
 
+    @objc public static let reportedNativeScale: CGFloat = {
+        let raw = PlaySettings.shared.customScaler
+        return raw.isFinite && raw > 0 ? CGFloat(raw) : 2
+    }()
+
     @objc public static func nativeBoundsResizable(_ rect: CGRect) -> CGRect {
-        let logical = boundsResizable(rect)
-        let scale = shared.effectiveScale
-        return CGRect(origin: .zero, size: CGSize(width: logical.width * scale, height: logical.height * scale))
+        portraitBounds(boundsResizable(rect), scale: reportedNativeScale)
+    }
+
+    private static func portraitBounds(_ rect: CGRect, scale: CGFloat = 1) -> CGRect {
+        CGRect(x: 0, y: 0, width: min(rect.width, rect.height) * scale,
+               height: Swift.max(rect.width, rect.height) * scale)
     }
 
     @objc public static func onWindowLayoutSubviews(_ window: UIWindow) {
@@ -489,19 +498,13 @@ public class PlayScreen: NSObject {
         guard let win = activePrimaryWindow else {
             return CGPoint(x: nx * screenRect.width, y: ny * screenRect.height)
         }
-        if case .scaled = displayMode,
-           let sceneBounds = win.windowScene?.coordinateSpace.bounds,
-           sceneBounds.width > 1, sceneBounds.height > 1,
-           win.frame.width > 1, win.frame.height > 1 {
-            let sx = nx * sceneBounds.width
-            let sy = ny * sceneBounds.height
-            let wf = win.frame
-            let pt = CGPoint(
-                x: (sx - wf.minX) * (win.bounds.width / wf.width),
-                y: (sy - wf.minY) * (win.bounds.height / wf.height)
-            )
-            let inside = pt.x >= 0 && pt.x <= win.bounds.width && pt.y >= 0 && pt.y <= win.bounds.height
-            return inside ? pt : nil
+        if case .scaled = displayMode, let space = win.windowScene?.coordinateSpace {
+            let sceneBounds = space.bounds
+            guard sceneBounds.width > 1, sceneBounds.height > 1 else { return nil }
+            let scenePoint = CGPoint(x: sceneBounds.minX + nx * sceneBounds.width,
+                                     y: sceneBounds.minY + ny * sceneBounds.height)
+            let windowPoint = win.convert(scenePoint, from: space)
+            return win.bounds.contains(windowPoint) ? windowPoint : nil
         }
         return CGPoint(x: nx * win.bounds.width, y: ny * win.bounds.height)
     }
@@ -517,11 +520,6 @@ public class PlayScreen: NSObject {
 }
 
 private extension PlayScreen {
-    var effectiveScale: CGFloat {
-        let raw = PlaySettings.shared.customScaler
-        return CGFloat(round(raw > 0 ? raw : 2.0))
-    }
-
     static func initialDisplayMode(capabilities: ScreenAppCapabilities) -> PlayDisplayMode {
         guard PlaySettings.shared.smartAdaptive else {
             return .adaptive
@@ -758,11 +756,11 @@ private extension PlayScreen {
                 scheduleRuntimeFallbackCheck(delay: 0.8)
             }
         case .scaled(let logicalSize, _, _):
-            applyScaledCanvas(to: win, logicalSize: logicalSize)
+            applyScaledCanvasToScene(containing: win, logicalSize: logicalSize)
             DispatchQueue.main.async { [weak self, weak win] in
                 guard let self = self, let win = win,
                       case .scaled(let currentLogical, _, _) = self.displayMode else { return }
-                self.applyScaledCanvas(to: win, logicalSize: currentLogical)
+                self.applyScaledCanvasToScene(containing: win, logicalSize: currentLogical)
             }
         }
     }
@@ -834,8 +832,8 @@ private extension PlayScreen {
         case .scaled(let logicalSize, _, _):
             applyScaledCanvas(to: window, logicalSize: logicalSize)
         case .adaptive:
+            resetScaledTransformsIfNeeded(in: window)
             if window === activePrimaryWindow {
-                resetScaledTransformsIfNeeded(in: window)
                 let nowDuoLandscape = isUnfoldedDuoLandscape(for: window)
                 if nowDuoLandscape != lastDuoLandscapeActive {
                     lastDuoLandscapeActive = nowDuoLandscape
@@ -1077,16 +1075,17 @@ private extension PlayScreen {
         )
         let targetCenter = CGPoint(x: containerBounds.midX, y: containerBounds.midY)
 
-        let curScale = hypot(window.transform.a, window.transform.b)
+        let targetTransform = CGAffineTransform(scaleX: scale, y: scale)
         let needsBounds = abs(window.bounds.width - targetBounds.width) > 0.25
             || abs(window.bounds.height - targetBounds.height) > 0.25
             || abs(window.bounds.origin.x) > 0.25
             || abs(window.bounds.origin.y) > 0.25
         let needsCenter = abs(window.center.x - targetCenter.x) > 0.25
             || abs(window.center.y - targetCenter.y) > 0.25
-        let needsScale = abs(curScale - scale) > 0.001
-            || abs(window.transform.b) > 0.001
-            || abs(window.transform.c) > 0.001
+        let currentTransform = window.transform
+        let needsScale = abs(currentTransform.a - scale) > 0.001 || abs(currentTransform.d - scale) > 0.001
+            || abs(currentTransform.b) > 0.001 || abs(currentTransform.c) > 0.001
+            || abs(currentTransform.tx) > 0.001 || abs(currentTransform.ty) > 0.001
 
         guard needsBounds || needsCenter || needsScale else { return }
 
@@ -1094,12 +1093,17 @@ private extension PlayScreen {
         isApplyingScaledLayout = true
         defer { isApplyingScaledLayout = false }
 
-        if needsBounds && window.transform != .identity {
-            window.transform = .identity
-        }
         if needsBounds { window.bounds = targetBounds }
         if needsCenter { window.center = targetCenter }
-        if needsScale { window.transform = CGAffineTransform(scaleX: scale, y: scale) }
+        if needsScale { window.transform = targetTransform }
+    }
+
+    func applyScaledCanvasToScene(containing window: UIWindow, logicalSize: CGSize) {
+        let sceneWindows = window.windowScene?.windows ?? []
+        for appWindow in sceneWindows where appWindow !== window && isEligiblePrimaryWindow(appWindow) {
+            applyScaledCanvas(to: appWindow, logicalSize: logicalSize)
+        }
+        applyScaledCanvas(to: window, logicalSize: logicalSize)
     }
 
     func applyScaledCanvas(to window: UIWindow, logicalSize: CGSize) {
@@ -1230,7 +1234,7 @@ private extension PlayScreen {
             minWidth: minSize.width,
             minHeight: minSize.height
         )
-        applyScaledCanvas(to: win, logicalSize: logical)
+        applyScaledCanvasToScene(containing: win, logicalSize: logical)
     }
 
     func hasNonScrollableWidthOverflow(in view: UIView, window: UIWindow, threshold: CGFloat) -> Bool {
@@ -1381,9 +1385,68 @@ private extension PlayScreen {
             )
         case "setMode":
             performAutomationSetMode(params: params, in: window, stateURL: stateURL)
+        case "selftestGeometry":
+            guard PlayToolsSelfTest.isRequested else {
+                writeJSON(["error": "PLAYTOOLS_SELFTEST=1 required"], to: stateURL)
+                return
+            }
+            if params["secondWindow"] as? Bool == true {
+                guard PlayToolsSelfTest.isContractFixture, let scene = window.windowScene else {
+                    writeJSON(["error": "Marked contract fixture with a window scene required"], to: stateURL)
+                    return
+                }
+                let secondary = testSecondGeometryWindow(primary: window, scene: scene)
+                writeJSON(PlayToolsSelfTest.geometryReport(window: window, secondary: secondary), to: stateURL)
+            } else {
+                writeJSON(PlayToolsSelfTest.geometryReport(window: window, secondary: []), to: stateURL)
+            }
         default:
             writeJSON(["error": "unknown action: \(action)"], to: stateURL)
         }
+    }
+
+    func testSecondGeometryWindow(primary: UIWindow, scene: UIWindowScene)
+        -> [(name: String, passed: Bool, detail: String)] {
+        let overlay = UIWindow(windowScene: scene)
+        overlay.windowLevel = UIWindow.Level(rawValue: primary.windowLevel.rawValue + 1)
+        overlay.frame = scene.coordinateSpace.bounds
+        let controller = UIViewController()
+        controller.view.backgroundColor = .clear
+        let button = UIButton(type: .system)
+        button.setTitle("Contract test", for: .normal)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        controller.view.addSubview(button)
+        NSLayoutConstraint.activate([
+            button.centerXAnchor.constraint(equalTo: controller.view.centerXAnchor, constant: 40),
+            button.centerYAnchor.constraint(equalTo: controller.view.centerYAnchor, constant: -50),
+            button.widthAnchor.constraint(equalToConstant: 120),
+            button.heightAnchor.constraint(equalToConstant: 44)
+        ])
+        overlay.rootViewController = controller
+        overlay.isHidden = false
+        defer {
+            overlay.isHidden = true
+            overlay.rootViewController = nil
+            overlay.windowScene = nil
+        }
+        overlay.layoutIfNeeded()
+        controller.view.layoutIfNeeded()
+        let buttonPoint = button.convert(CGPoint(x: button.bounds.midX, y: button.bounds.midY), to: overlay)
+        let primaryPoint = overlay.convert(buttonPoint, to: primary)
+        let target = resolveHitTarget(for: primaryPoint, primary: primary)
+        let hitButton = target.window === overlay && (target.hitView === button || target.hitView.isDescendant(of: button))
+        var checks = [("geometry.secondWindow.hitTest", hitButton,
+                       "Expected fixture button, hit \(type(of: target.hitView)) at \(target.point)")]
+        if case .scaled = displayMode {
+            checks.append(("geometry.secondWindow.scaledAlignment",
+                           abs(overlay.bounds.width - primary.bounds.width) <= 1 &&
+                               abs(overlay.bounds.height - primary.bounds.height) <= 1 &&
+                               abs(overlay.transform.a - primary.transform.a) <= 0.01 &&
+                               abs(overlay.transform.d - primary.transform.d) <= 0.01,
+                           "Primary \(primary.bounds) / \(primary.transform), "
+                               + "overlay \(overlay.bounds) / \(overlay.transform)"))
+        }
+        return checks
     }
 
     func performAutomationTap(at point: CGPoint, in window: UIWindow, stateURL: URL) {
@@ -1468,6 +1531,10 @@ private extension PlayScreen {
             applySceneSizeRestrictions(for: window.windowScene)
             AKInterface.shared?.clearWindowAspectLock(minWidth: 360, minHeight: 540)
             resetScaledTransformsIfNeeded(in: window)
+            for scaledWindow in scaledWindows.allObjects {
+                resetScaledTransformsIfNeeded(in: scaledWindow)
+            }
+            lastAdaptiveBounds = CGRect(origin: .zero, size: window.bounds.size)
             scheduleAdaptiveRelayout(for: window)
         } else {
             let preset = params["preset"] as? String
@@ -1481,7 +1548,7 @@ private extension PlayScreen {
                 minWidth: minSize.width,
                 minHeight: minSize.height
             )
-            applyScaledCanvas(to: window, logicalSize: logical)
+            applyScaledCanvasToScene(containing: window, logicalSize: logical)
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self, weak window] in
             guard let self = self, let win = window ?? self.activePrimaryWindow else { return }
@@ -1531,24 +1598,11 @@ private extension PlayScreen {
     }
 
     func convertPoint(_ point: CGPoint, from source: UIWindow, to target: UIWindow) -> CGPoint {
-        if source === target { return point }
-        guard source.bounds.width > 0.5, source.bounds.height > 0.5,
-              target.frame.width > 0.5, target.frame.height > 0.5 else {
-            return point
-        }
-        let sx = source.frame.minX + (point.x - source.bounds.minX) * (source.frame.width / source.bounds.width)
-        let sy = source.frame.minY + (point.y - source.bounds.minY) * (source.frame.height / source.bounds.height)
-        return CGPoint(
-            x: target.bounds.minX + (sx - target.frame.minX) * (target.bounds.width / target.frame.width),
-            y: target.bounds.minY + (sy - target.frame.minY) * (target.bounds.height / target.frame.height)
-        )
+        source === target ? point : source.convert(point, to: target)
     }
 
     func convertRect(_ rect: CGRect, from source: UIWindow, to target: UIWindow) -> CGRect {
-        if source === target { return rect }
-        let p0 = convertPoint(rect.origin, from: source, to: target)
-        let p1 = convertPoint(CGPoint(x: rect.maxX, y: rect.maxY), from: source, to: target)
-        return CGRect(x: p0.x, y: p0.y, width: p1.x - p0.x, height: p1.y - p0.y)
+        source === target ? rect : source.convert(rect, to: target)
     }
 
     func resolveHitTarget(
