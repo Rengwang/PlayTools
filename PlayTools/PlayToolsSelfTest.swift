@@ -7,6 +7,7 @@ import GameKit
 import PassKit
 import StoreKit
 import UserNotifications
+import WebKit
 #endif
 import Security
 import UIKit
@@ -22,6 +23,7 @@ enum PlayToolsSelfTest {
         case geometry
         case entitlements
         case media
+        case webkit
     }
 
     private struct Check {
@@ -90,7 +92,7 @@ enum PlayToolsSelfTest {
                 checks += platformChecks(window: window, observations: &observations)
             case .geometry:
                 checks += geometryChecks(window: window, observations: &observations)
-            case .entitlements, .media:
+            case .entitlements, .media, .webkit:
                 continue
             }
         }
@@ -98,37 +100,38 @@ enum PlayToolsSelfTest {
             checks.append(Check("configuration.group", false, "Unknown group: \(requestedGroup)"))
         }
 
-        completeEntitlementChecks(requestedGroup: requestedGroup) { entitlementResults in
-            completeMediaChecks(requestedGroup: requestedGroup) { mediaResults in
-                writeReport(requestedGroup: requestedGroup, checks: checks + entitlementResults + mediaResults,
-                            observations: observations)
+        let frameworkGroups: [Group] = [.entitlements, .media, .webkit]
+        let selectedGroups = frameworkGroups.filter { requestedGroup == nil || requestedGroup == $0.rawValue }
+        completeFrameworkChecks(selectedGroups[...], explicit: requestedGroup != nil, window: window) { results in
+            writeReport(requestedGroup: requestedGroup, checks: checks + results, observations: observations)
+        }
+    }
+
+    private static func completeFrameworkChecks(_ groups: ArraySlice<Group>, explicit: Bool,
+                                                window: UIWindow?, completion: @escaping ([Check]) -> Void) {
+        guard let group = groups.first else {
+            completion([])
+            return
+        }
+        let next: ([Check]) -> Void = { results in
+            completeFrameworkChecks(groups.dropFirst(), explicit: explicit, window: window) {
+                completion(results + $0)
             }
         }
-    }
-
-    private static func completeEntitlementChecks(requestedGroup: String?, completion: @escaping ([Check]) -> Void) {
-        guard requestedGroup == nil || requestedGroup == Group.entitlements.rawValue else {
-            completion([])
-            return
-        }
         #if PLAYTOOLS_FRAMEWORK_PROBES
-        entitlementChecks(completion: completion)
-        #else
-        completion([Check("entitlements.build", status: requestedGroup == nil ? "skipped" : "fail",
-                          "Framework probes were excluded from this build")])
-        #endif
-    }
-
-    private static func completeMediaChecks(requestedGroup: String?, completion: @escaping ([Check]) -> Void) {
-        guard requestedGroup == nil || requestedGroup == Group.media.rawValue else {
-            completion([])
-            return
+        switch group {
+        case .entitlements:
+            entitlementChecks(completion: next)
+        case .media:
+            mediaChecks(completion: next)
+        case .webkit:
+            webKitChecks(window: window, completion: next)
+        default:
+            next([])
         }
-        #if PLAYTOOLS_FRAMEWORK_PROBES
-        mediaChecks(completion: completion)
         #else
-        completion([Check("media.build", status: requestedGroup == nil ? "skipped" : "fail",
-                          "Framework probes were excluded from this build")])
+        next([Check(group.rawValue + ".build", status: explicit ? "fail" : "skipped",
+                    "Framework probes were excluded from this build")])
         #endif
     }
 
@@ -782,6 +785,136 @@ extension PlayToolsSelfTest {
                                     options: originalOptions)
         })
         return checks
+    }
+}
+#endif
+
+#if PLAYTOOLS_FRAMEWORK_PROBES
+extension PlayToolsSelfTest {
+    private static func webKitChecks(window: UIWindow?, completion: @escaping ([Check]) -> Void) {
+        guard isContractFixture else {
+            completion([Check("webkit.fixture", status: "skipped", "A marked contract fixture is required")])
+            return
+        }
+        guard let window else {
+            completion([Check("webkit.window", false, "No fixture window")])
+            return
+        }
+        let probe = WebKitProbe(window: window)
+        boundedChecks("webkit.navigation", seconds: 20, cleanup: probe.stop,
+                      start: probe.start, completion: completion)
+    }
+
+    private final class WebKitProbe: NSObject, WKNavigationDelegate {
+        private enum Variant: String, CaseIterable {
+            case recommended
+            case explicitDesktop
+            case mobileWithSuffix
+            case customUserAgent
+        }
+
+        private let suffix = "PlayCoverFixture/1.0"
+        private let customAgent = "PlayCoverFixture Explicit User Agent"
+        private let window: UIWindow
+        private var views: [WKWebView] = []
+        private var pending: [ObjectIdentifier: Variant] = [:]
+        private var results: [Check] = []
+        private var completion: (([Check]) -> Void)?
+
+        init(window: UIWindow) {
+            self.window = window
+        }
+
+        func start(_ completion: @escaping ([Check]) -> Void) {
+            self.completion = completion
+            for variant in Variant.allCases {
+                let config = WKWebViewConfiguration()
+                config.websiteDataStore = .nonPersistent()
+                if variant == .explicitDesktop {
+                    config.defaultWebpagePreferences.preferredContentMode = .desktop
+                } else if variant == .mobileWithSuffix {
+                    config.defaultWebpagePreferences.preferredContentMode = .mobile
+                    config.applicationNameForUserAgent = suffix
+                }
+                let view = WKWebView(frame: CGRect(x: 0, y: 0, width: 320, height: 240), configuration: config)
+                if variant == .customUserAgent { view.customUserAgent = customAgent }
+                view.navigationDelegate = self
+                views.append(view)
+                pending[ObjectIdentifier(view)] = variant
+                window.addSubview(view)
+                view.loadHTMLString("""
+                    <!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+                    <title>PlayCover WebKit contract</title>
+                    """, baseURL: nil)
+            }
+        }
+
+        func stop() {
+            completion = nil
+            for view in views {
+                view.navigationDelegate = nil
+                view.stopLoading()
+                view.removeFromSuperview()
+            }
+            views.removeAll()
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            guard let variant = pending[ObjectIdentifier(webView)] else { return }
+            webView.evaluateJavaScript("""
+                ({userAgent:navigator.userAgent, platform:navigator.platform, touchPoints:navigator.maxTouchPoints,
+                  width:window.innerWidth, pixelRatio:window.devicePixelRatio})
+                """) { [weak self, weak webView] value, error in
+                    guard let self, let webView, let result = value as? [String: Any],
+                          let agent = result["userAgent"] as? String,
+                          let platform = result["platform"] as? String,
+                          let touchPoints = result["touchPoints"] as? Int,
+                          let width = result["width"] as? Double,
+                          let pixelRatio = result["pixelRatio"] as? Double else {
+                        self?.finish(variant, passed: false, detail: error?.localizedDescription ?? "Missing DOM values")
+                        return
+                    }
+                    let mode = webView.configuration.defaultWebpagePreferences.preferredContentMode
+                    let settings = PlaySettings.shared
+                    let wantsPhone = (settings.layoutIdiom == 1 || settings.layoutIdiom == 3) &&
+                        !settings.useNativePlatform
+                    var passed = !agent.isEmpty && !platform.isEmpty && touchPoints >= 0 &&
+                        width.isFinite && width > 0 && pixelRatio.isFinite && pixelRatio > 0
+                    switch variant {
+                    case .recommended:
+                        if wantsPhone {
+                            passed = passed && agent.contains("Mobile") && abs(width - 320) <= 1
+                        }
+                    case .explicitDesktop:
+                        passed = passed && mode == .desktop
+                    case .mobileWithSuffix:
+                        passed = passed && mode == .mobile && agent.contains(self.suffix) && abs(width - 320) <= 1
+                    case .customUserAgent:
+                        passed = passed && agent == self.customAgent
+                    }
+                    let detail = "UA: \(agent) | platform: \(platform) | touch: \(touchPoints) | "
+                        + "viewport: \(width) | DPR: \(pixelRatio) | configured mode: \(mode.rawValue)"
+                    self.finish(variant, passed: passed, detail: detail)
+                }
+        }
+
+        func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
+                     withError error: Error) {
+            if let variant = pending[ObjectIdentifier(webView)] {
+                finish(variant, passed: false, detail: error.localizedDescription)
+            }
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            self.webView(webView, didFailProvisionalNavigation: navigation, withError: error)
+        }
+
+        private func finish(_ variant: Variant, passed: Bool, detail: String) {
+            guard let entry = pending.first(where: { $0.value == variant }) else { return }
+            pending.removeValue(forKey: entry.key)
+            results.append(Check("webkit." + variant.rawValue, passed, detail))
+            if pending.isEmpty { completion?(results.sorted { $0.name < $1.name }) }
+        }
     }
 }
 #endif
