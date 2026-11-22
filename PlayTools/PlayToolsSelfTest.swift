@@ -24,6 +24,7 @@ enum PlayToolsSelfTest {
         case entitlements
         case media
         case webkit
+        case urls
     }
 
     private struct Check {
@@ -92,7 +93,7 @@ enum PlayToolsSelfTest {
                 checks += platformChecks(window: window, observations: &observations)
             case .geometry:
                 checks += geometryChecks(window: window, observations: &observations)
-            case .entitlements, .media, .webkit:
+            case .entitlements, .media, .webkit, .urls:
                 continue
             }
         }
@@ -100,7 +101,7 @@ enum PlayToolsSelfTest {
             checks.append(Check("configuration.group", false, "Unknown group: \(requestedGroup)"))
         }
 
-        let frameworkGroups: [Group] = [.entitlements, .media, .webkit]
+        let frameworkGroups: [Group] = [.entitlements, .media, .webkit, .urls]
         let selectedGroups = frameworkGroups.filter { requestedGroup == nil || requestedGroup == $0.rawValue }
         completeFrameworkChecks(selectedGroups[...], explicit: requestedGroup != nil, window: window) { results in
             writeReport(requestedGroup: requestedGroup, checks: checks + results, observations: observations)
@@ -126,6 +127,8 @@ enum PlayToolsSelfTest {
             mediaChecks(completion: next)
         case .webkit:
             webKitChecks(window: window, completion: next)
+        case .urls:
+            urlChecks(completion: next)
         default:
             next([])
         }
@@ -914,6 +917,52 @@ extension PlayToolsSelfTest {
             pending.removeValue(forKey: entry.key)
             results.append(Check("webkit." + variant.rawValue, passed, detail))
             if pending.isEmpty { completion?(results.sorted { $0.name < $1.name }) }
+        }
+    }
+}
+#endif
+
+#if PLAYTOOLS_FRAMEWORK_PROBES
+extension PlayToolsSelfTest {
+    private static func urlChecks(completion: @escaping ([Check]) -> Void) {
+        guard isContractFixture else {
+            completion([Check("urls.fixture", status: "skipped", "A marked contract fixture is required")])
+            return
+        }
+        let unknownScheme = "playcover-selftest-" + UUID().uuidString.lowercased()
+        guard let unknown = URL(string: unknownScheme + "://fixture"),
+              let relative = URL(string: "playcover-selftest-relative"),
+              let https = URL(string: "https://example.com"),
+              let settings = URL(string: UIApplication.openSettingsURLString),
+              let telephone = URL(string: "tel://10086") else {
+            completion([Check("urls.configuration", false, "Could not create fixture URLs")])
+            return
+        }
+
+        let app = UIApplication.shared
+        let unhandled = app.canOpenURL(unknown)
+        let capabilities = [
+            Check("urls.canOpen.https", true, "Returned \(app.canOpenURL(https)); no navigation"),
+            Check("urls.canOpen.settings", true, "Returned \(app.canOpenURL(settings)); no navigation"),
+            Check("urls.canOpen.telephone", true, "Returned \(app.canOpenURL(telephone)); no call"),
+            Check("urls.canOpen.unknown", !unhandled, "Returned \(unhandled)")
+        ]
+        openUnresolvableURL(unknown, name: "urls.open.unknown") { unknownResults in
+            openUnresolvableURL(relative, name: "urls.open.relative") { relativeResults in
+                completion(capabilities + unknownResults + relativeResults)
+            }
+        }
+    }
+
+    private static func openUnresolvableURL(_ url: URL, name: String, completion: @escaping ([Check]) -> Void) {
+        let start = ProcessInfo.processInfo.systemUptime
+        boundedChecks(name, seconds: 5) { done in
+            UIApplication.shared.open(url, options: [:]) { success in
+                let elapsed = ProcessInfo.processInfo.systemUptime - start
+                done([Check(name, !success, "Returned \(success) after \(String(format: "%.3f", elapsed)) s")])
+            }
+        } completion: { results in
+            completion(results)
         }
     }
 }
