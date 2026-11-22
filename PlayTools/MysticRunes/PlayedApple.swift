@@ -130,17 +130,21 @@ public class PlayKeychain: NSObject {
 
     // SecItemDelete(CFDictionaryRef query)
     @objc static public func delete(_ query: NSDictionary) -> OSStatus {
-        let result = playChainDB.delete(query)
-        guard result.ok else {
+        switch playChainDB.delete(query) {
+        case .ok(let changes):
+            guard changes > 0 else {
+                debugLogger("Failed to find keychain item")
+                return errSecItemNotFound
+            }
+            debugLogger("Deleted keychain item in db")
+            return errSecSuccess
+        case .invalidQuery:
+            debugLogger("Refusing to delete with an unsupported query")
+            return errSecParam
+        case .ioError:
             debugLogger("Failed to delete keychain item")
             return errSecIO
         }
-        guard result.changes > 0 else {
-            debugLogger("Failed to find keychain item")
-            return errSecItemNotFound
-        }
-        debugLogger("Deleted keychain item in db")
-        return errSecSuccess
     }
 
     @objc static public func keyCreateRandomKey(_ parameters: NSDictionary,

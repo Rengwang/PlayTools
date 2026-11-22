@@ -10,6 +10,12 @@ import Security
 import SQLite3
 import UIKit
 
+enum PlayKeychainDeleteOutcome {
+    case ok(Int)        // 受影响行数
+    case invalidQuery   // 含无法执行的限定键（绝不能退化成整表删除）
+    case ioError
+}
+
 class PlayKeychainDB: NSObject {
     public static let shared = PlayKeychainDB()
 
@@ -203,26 +209,46 @@ class PlayKeychainDB: NSObject {
         return (ok, ok ? changes : 0)
     }
 
-    /// Deletes every row matched by the query (all provided attributes are part of the WHERE
-    /// clause) and reports how many rows were removed.
-    func delete(_ attributes: NSDictionary) -> (ok: Bool, changes: Int) {
+    /// Deletes rows matched by `query`.
+    ///
+    /// A class-only query is Apple's "clear this class" call and is executed as such. Any other
+    /// query must constrain on columns we can actually translate into SQL: silently dropping an
+    /// unsupported qualifier (e.g. `kSecMatchItemList`) would turn a targeted delete into a full
+    /// table wipe, so those queries are rejected with `.invalidQuery` and no SQL is run.
+    func delete(_ attributes: NSDictionary) -> PlayKeychainDeleteOutcome {
         guard let tableName = attributes[kSecClass] as? String,
               let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString],
               let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] else {
-            return (false, 0)
+            return .invalidQuery
         }
 
         let allColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
+        var supported = Set(allColumns.map { $0 as String })
+        supported.insert(kSecClass as String)
+
+        for key in attributes.allKeys {
+            guard let name = key as? String, supported.contains(name) else {
+                PlayKeychain.debugLogger("SecItemDelete contains an unsupported qualifier")
+                return .invalidQuery
+            }
+        }
+
+        let classOnly = attributes.count == 1 && attributes[kSecClass] != nil
         let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: attributes)
-        // `SecItemDelete` with only kSecClass is the documented "clear this class" call.
+        if whereClause.isEmpty && !classOnly {
+            PlayKeychain.debugLogger("SecItemDelete has no executable constraint")
+            return .invalidQuery
+        }
         // `tableName` comes from the constants whitelist above, so it is safe to interpolate.
         let deleteQuery = whereClause.isEmpty
             ? "DELETE FROM \(tableName)"
             : "DELETE FROM \(tableName) WHERE \(whereClause)"
+
         var stmt: OpaquePointer?
         var changes = 0
+        var succeeded = false
 
-        let ok = usingDB { sqlite3DB in
+        let executed = usingDB { sqlite3DB in
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare(sqlite3DB, deleteQuery, -1, &stmt, nil) == SQLITE_OK,
                   let stmt = stmt else {
@@ -240,10 +266,12 @@ class PlayKeychainDB: NSObject {
 
             guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
             changes = Int(sqlite3_changes(sqlite3DB))
+            succeeded = true
             return true
         }
 
-        return (ok, ok ? changes : 0)
+        guard executed, succeeded else { return .ioError }
+        return .ok(changes)
     }
 
     private func structDB(_ sqlite3DB: OpaquePointer) -> Bool {
