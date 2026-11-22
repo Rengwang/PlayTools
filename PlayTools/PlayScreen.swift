@@ -483,6 +483,8 @@ public class PlayScreen: NSObject {
         activePrimaryWindow?.bounds
     }
 
+    var currentDisplayMode: PlayDisplayMode { displayMode }
+
     func windowPoint(forNormalizedContentX nx: CGFloat, y ny: CGFloat) -> CGPoint? {
         guard let win = activePrimaryWindow else {
             return CGPoint(x: nx * screenRect.width, y: ny * screenRect.height)

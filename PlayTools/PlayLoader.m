@@ -414,6 +414,19 @@ static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *
     return DYLD_INTERPOSE_ORIG(pt_sysctlbyname_fn, sysctlbyname)(name, oldp, oldlenp, newp, newlen);
 }
 
+// Same-image calls to the public symbols bypass their replacements. The opt-in
+// self-test uses these entry points to verify the values handed to other images.
+__attribute__((visibility("hidden")))
+uint32_t pt_selftest_platform(char *unameMachine, char *sysctlMachine) {
+    struct utsname information;
+    if (pt_uname(&information) == 0) {
+        strlcpy(unameMachine, information.machine, 256);
+    }
+    size_t length = 256;
+    pt_sysctlbyname("hw.machine", sysctlMachine, &length, NULL, 0);
+    return pt_active_platform();
+}
+
 // Interpose Apple Keychain functions (SecItemCopyMatching, SecItemAdd, SecItemUpdate, SecItemDelete)
 // This allows us to intercept keychain requests and return our own data
 

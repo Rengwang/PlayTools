@@ -1,0 +1,296 @@
+import Foundation
+import Security
+import UIKit
+
+@_silgen_name("pt_selftest_platform")
+private func selfTestPlatform(_ unameMachine: UnsafeMutablePointer<CChar>,
+                              _ sysctlMachine: UnsafeMutablePointer<CChar>) -> UInt32
+
+enum PlayToolsSelfTest {
+    private enum Group: String, CaseIterable {
+        case keychain
+        case platform
+        case geometry
+    }
+
+    private struct Check {
+        let name: String
+        let status: String
+        let detail: String
+
+        init(_ name: String, _ passed: Bool, _ detail: String = "") {
+            self.init(name, status: passed ? "pass" : "fail", detail)
+        }
+
+        init(_ name: String, status: String, _ detail: String) {
+            self.name = name
+            self.status = status
+            self.detail = detail
+        }
+
+        var json: [String: Any] {
+            ["name": name, "status": status, "detail": detail]
+        }
+    }
+
+    static func startIfRequested() {
+        guard getenv("PLAYTOOLS_SELFTEST").map({ strcmp($0, "1") == 0 }) == true else { return }
+        let environment = ProcessInfo.processInfo.environment
+        let requestedGroup = environment["PLAYTOOLS_SELFTEST_GROUP"]
+        DispatchQueue.main.async {
+            let deadline = ProcessInfo.processInfo.systemUptime + 8
+            runWhenReady(requestedGroup: requestedGroup, deadline: deadline)
+        }
+    }
+
+    private static func runWhenReady(requestedGroup: String?, deadline: TimeInterval) {
+        let needsWindow = requestedGroup == nil || requestedGroup == Group.geometry.rawValue
+        let window = needsWindow ? PlayScreen.shared.activePrimaryWindow : nil
+        if needsWindow && window == nil && ProcessInfo.processInfo.systemUptime < deadline {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                runWhenReady(requestedGroup: requestedGroup, deadline: deadline)
+            }
+            return
+        }
+        run(requestedGroup: requestedGroup, window: window)
+    }
+
+    private static func run(requestedGroup: String?, window: UIWindow?) {
+        var checks: [Check] = []
+        var observations: [String: Any] = [:]
+        for group in Group.allCases {
+            if let requestedGroup = requestedGroup, requestedGroup != group.rawValue {
+                checks.append(Check(group.rawValue, status: "skipped", "Group excluded by launch setting"))
+                continue
+            }
+            switch group {
+            case .keychain:
+                checks += keychainChecks()
+            case .platform:
+                checks += platformChecks(window: window, observations: &observations)
+            case .geometry:
+                checks += geometryChecks(window: window, observations: &observations)
+            }
+        }
+        if let requestedGroup = requestedGroup, Group(rawValue: requestedGroup) == nil {
+            checks.append(Check("configuration.group", false, "Unknown group: \(requestedGroup)"))
+        }
+
+        let bundleID = Bundle.main.bundleIdentifier ?? "unknown"
+        let passed = !checks.contains { $0.status == "fail" }
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "bundleId": bundleID,
+            "pid": ProcessInfo.processInfo.processIdentifier,
+            "timestamp": Date().timeIntervalSince1970,
+            "group": requestedGroup ?? "all",
+            "passed": passed,
+            "checks": checks.map(\.json),
+            "observations": observations
+        ]
+        let directory = PlaySettings.shared.settingsUrl.deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Automation", isDirectory: true)
+        let report = directory.appendingPathComponent("selftest_\(bundleID).json")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: report, options: .atomic)
+            let failures = checks.filter { $0.status == "fail" }.map(\.name).joined(separator: ", ")
+            NSLog("[PlayTools-SelfTest] %@ %@ %@", passed ? "PASS" : "FAIL", report.path, failures)
+        } catch {
+            NSLog("[PlayTools-SelfTest] FAIL could not write %@: %@", report.path, String(describing: error))
+        }
+    }
+
+    private static func keychainChecks() -> [Check] {
+        let service: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: "io.playcover.selftest"
+        ]
+        let runID = UUID().uuidString
+        let queries = (0..<3).map { index in
+            service.merging([kSecAttrAccount as String: "\(runID).\(index)"], uniquingKeysWith: { _, new in new })
+        }
+        // Scope limit checks to this run, including when two tests share a database.
+        let runQuery = service.merging([kSecAttrComment as String: runID], uniquingKeysWith: { _, new in new })
+        let payloads = (0..<queries.count).map { Data("\(runID).value.\($0)".utf8) }
+        var checks: [Check] = []
+        for (index, query) in queries.enumerated() {
+            var item = query
+            item[kSecValueData as String] = payloads[index]
+            item[kSecAttrComment as String] = runID
+            let status = PlayKeychain.add(item as NSDictionary, result: nil)
+            checks.append(Check("keychain.add.\(index)", status == errSecSuccess, "OSStatus \(status)"))
+            if index == 0 && status == errSecSuccess {
+                let duplicate = PlayKeychain.add(item as NSDictionary, result: nil)
+                checks.append(Check("keychain.duplicate", duplicate == errSecDuplicateItem, "OSStatus \(duplicate)"))
+            }
+        }
+
+        checks += keychainLimitChecks(query: runQuery, payloads: payloads)
+        let updated = Data("\(runID).updated".utf8)
+        let query = queries[0]
+        let updateStatus = PlayKeychain.update(
+            query as NSDictionary, attributesToUpdate: [kSecValueData as String: updated]
+        )
+        let readBack = copyKeychainItem(query, returning: kSecReturnData)
+        checks.append(Check("keychain.update", updateStatus == errSecSuccess &&
+                            readBack.status == errSecSuccess && readBack.value as? Data == updated,
+                            "Update OSStatus \(updateStatus), lookup OSStatus \(readBack.status)"))
+
+        let referenceResult = copyKeychainItem(query, returning: kSecReturnPersistentRef)
+        let reference = referenceResult.value as? Data
+        checks.append(Check("keychain.persistentRef.opaque", referenceResult.status == errSecSuccess &&
+                            reference?.isEmpty == false && reference != updated,
+                            "OSStatus \(referenceResult.status)"))
+        if let reference = reference, !reference.isEmpty, reference != updated {
+            let refQuery = [kSecValuePersistentRef as String: reference]
+            let resolved = copyKeychainItem(refQuery, returning: kSecReturnData)
+            checks.append(Check("keychain.persistentRef.lookup", resolved.status == errSecSuccess &&
+                                resolved.value as? Data == updated, "OSStatus \(resolved.status)"))
+        } else {
+            checks.append(Check("keychain.persistentRef.lookup", status: "skipped", "No opaque reference available"))
+        }
+        checks.append(Check("keychain.permanentKey", status: "skipped",
+                            "Generation requires validated tag preservation for targeted cleanup"))
+
+        for (index, query) in queries.enumerated() {
+            let deleted = PlayKeychain.delete(query as NSDictionary)
+            let lookup = copyKeychainItem(query, returning: kSecReturnData)
+            checks.append(Check("keychain.cleanup.\(index)",
+                                (deleted == errSecSuccess || deleted == errSecItemNotFound) &&
+                                lookup.status == errSecItemNotFound,
+                                "Delete OSStatus \(deleted), lookup OSStatus \(lookup.status)"))
+        }
+        return checks
+    }
+
+    private static func keychainLimitChecks(query: [String: Any], payloads: [Data]) -> [Check] {
+        let one = copyKeychainItem(query, returning: kSecReturnData)
+        let oneValue = (one.value as? Data).map { payloads.contains($0) } ?? false
+        let all = copyKeychainItem(query, returning: kSecReturnData, limit: kSecMatchLimitAll)
+        let allValues = all.value as? [Data] ?? []
+        let two = copyKeychainItem(query, returning: kSecReturnData, limit: NSNumber(value: 2))
+        let twoValues = two.value as? [Data] ?? []
+        let invalid = copyKeychainItem(query, returning: kSecReturnData, limit: NSNumber(value: 0))
+        return [
+            Check("keychain.limit.default", one.status == errSecSuccess && oneValue, "OSStatus \(one.status)"),
+            Check("keychain.limit.all", all.status == errSecSuccess && Set(allValues) == Set(payloads),
+                  "OSStatus \(all.status), array count \(allValues.count)"),
+            Check("keychain.limit.numeric", two.status == errSecSuccess && Set(twoValues).count == 2 &&
+                  Set(twoValues).isSubset(of: Set(payloads)),
+                  "OSStatus \(two.status), array count \(twoValues.count)"),
+            Check("keychain.limit.invalid", invalid.status == errSecParam, "OSStatus \(invalid.status)")
+        ]
+    }
+
+    private static func copyKeychainItem(_ query: [String: Any], returning key: CFString, limit: Any? = nil)
+        -> (status: OSStatus, value: CFTypeRef?) {
+        var search = query
+        search[key as String] = true
+        search[kSecMatchLimit as String] = limit
+        var value: Unmanaged<CFTypeRef>?
+        let status = PlayKeychain.copyMatching(search as NSDictionary, result: &value)
+        return (status, value?.takeRetainedValue())
+    }
+
+    private static func platformChecks(window: UIWindow?, observations: inout [String: Any]) -> [Check] {
+        let settings = PlaySettings.shared
+        let device = UIDevice.current
+        let process = ProcessInfo.processInfo
+        let traits = window?.traitCollection ?? UITraitCollection.current
+        var unameMachine = [CChar](repeating: 0, count: 256)
+        var sysctlMachine = [CChar](repeating: 0, count: 256)
+        let platform = selfTestPlatform(&unameMachine, &sysctlMachine)
+        let unameName = String(cString: unameMachine)
+        let sysctlName = String(cString: sysctlMachine)
+        let layout = settings.layoutIdiom
+        let native = settings.useNativePlatform
+        let phone = layout == 1 || layout == 3
+        #if targetEnvironment(macCatalyst)
+        let expectedPlatform: UInt32 = native ? 6 : 2
+        #else
+        let expectedPlatform: UInt32 = 2
+        #endif
+
+        observations["platform"] = [
+            "dyld_get_active_platform": platform,
+            "layoutIdiom": layout,
+            "useNativePlatform": native,
+            "isMacCatalystApp": process.isMacCatalystApp,
+            "isiOSAppOnMac": process.isiOSAppOnMac,
+            "deviceIdiom": device.userInterfaceIdiom.rawValue,
+            "traitIdiom": traits.userInterfaceIdiom.rawValue,
+            "model": device.model,
+            "localizedModel": device.localizedModel,
+            "systemName": device.systemName,
+            "configuredMachine": settings.deviceModel as String,
+            "uname.machine": unameName,
+            "hw.machine": sysctlName
+        ]
+        var checks = [
+            Check("platform.dyld", platform == expectedPlatform, "Expected \(expectedPlatform), received \(platform)"),
+            Check("platform.processInfo.exclusive", !(process.isMacCatalystApp && process.isiOSAppOnMac)),
+            Check("platform.machine", sysctlName == settings.deviceModel as String && unameName == sysctlName)
+        ]
+        if phone || layout == 2 {
+            let expected: UIUserInterfaceIdiom = phone ? .phone : .pad
+            let model = phone ? "iPhone" : "iPad"
+            checks += [
+                Check("platform.deviceIdiom", device.userInterfaceIdiom == expected),
+                Check("platform.traitIdiom", traits.userInterfaceIdiom == expected),
+                Check("platform.model", device.model == model && device.localizedModel == model)
+            ]
+        }
+        return checks
+    }
+
+    private static func geometryChecks(window: UIWindow?, observations: inout [String: Any]) -> [Check] {
+        let screen = window?.windowScene?.screen ?? UIScreen.main
+        let bounds = screen.bounds
+        let fixed = screen.fixedCoordinateSpace
+        let rotated = screen.coordinateSpace
+        var values: [String: Any] = [
+            "mode": PlayScreen.shared.currentDisplayMode.name,
+            "bounds": rectJSON(bounds),
+            "nativeBounds": rectJSON(screen.nativeBounds),
+            "scale": screen.scale,
+            "nativeScale": screen.nativeScale,
+            "coordinateSpace": rectJSON(rotated.bounds),
+            "fixedCoordinateSpace": rectJSON(fixed.bounds)
+        ]
+        defer { observations["geometry"] = values }
+        let sample = CGPoint(x: bounds.midX + bounds.width / 5, y: bounds.midY)
+        let roundTrip = rotated.convert(rotated.convert(sample, to: fixed), from: fixed)
+        var checks = [
+            Check("geometry.screenMetrics",
+                  validRect(bounds) && validRect(screen.nativeBounds) &&
+                  screen.scale.isFinite && screen.scale > 0 && screen.nativeScale.isFinite && screen.nativeScale > 0),
+            Check("geometry.coordinateSpace.bounds", validRect(rotated.bounds) && validRect(fixed.bounds)),
+            Check("geometry.coordinateSpace.roundTrip",
+                  abs(roundTrip.x - sample.x) <= 0.5 && abs(roundTrip.y - sample.y) <= 0.5)
+        ]
+        guard let window = window, let scene = window.windowScene else {
+            checks.append(Check("geometry.scene", status: "skipped", "No window scene appeared before the timeout"))
+            return checks
+        }
+        values["windowBounds"] = rectJSON(window.bounds)
+        values["sceneBounds"] = rectJSON(scene.coordinateSpace.bounds)
+        if let statusBar = scene.statusBarManager {
+            values["statusBarFrame"] = rectJSON(statusBar.statusBarFrame)
+        }
+        checks.append(Check("geometry.scene", validRect(scene.coordinateSpace.bounds) && validRect(window.bounds)))
+        return checks
+    }
+
+    private static func rectJSON(_ rect: CGRect) -> [String: Any] {
+        let components = ["x": rect.origin.x, "y": rect.origin.y,
+                          "width": rect.size.width, "height": rect.size.height]
+        return components.mapValues { $0.isFinite ? ($0 as Any) : NSNull() }
+    }
+
+    private static func validRect(_ rect: CGRect) -> Bool {
+        rect.origin.x.isFinite && rect.origin.y.isFinite && rect.width.isFinite && rect.height.isFinite
+            && rect.width > 0 && rect.height > 0
+    }
+}

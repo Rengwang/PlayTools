@@ -72,3 +72,8 @@
    - `SecItemDelete`：仅当 query 只有 `kSecClass` 时执行整表删除；若包含任何无法转成 SQL 的限定键（如 `kSecMatchItemList`），直接返回 `errSecParam` 且不执行 SQL，避免“定向删除变成清表”。`SecItemUpdate/Delete` 用 `sqlite3_changes` 判断是否命中，未命中返回 `errSecItemNotFound`。
    - `SecItemDelete` 的“无害选项键”放行：`kSecUseDataProtectionKeychain`、`kSecUseAuthenticationUI`、`kSecUseAuthenticationContext`、`kSecUseOperationPrompt`，以及值为 `kSecAttrSynchronizableAny` 或 `false` 的 `kSecAttrSynchronizable`；其余未知键（`kSecMatchItemList`、`kSecAttrSynchronizable: true` 等）仍返回 `errSecParam`。
    - 验证：class-only 清表 0 残留；带 `kSecMatchItemList` 返回 `errSecParam` 且 2 行数据零丢失；带 `svce+gena` 只删 1 行；改主键 `acct` 命中 1 行；无匹配返回 0。
+
+## iOS 语义契约自检
+
+- Phase 0 在注入进程中增加了 `PLAYTOOLS_SELFTEST=1`。默认运行 Keychain、平台身份和窗口几何检查，可用 `PLAYTOOLS_SELFTEST_GROUP=keychain|platform|geometry` 单独运行。报告位于 PlayCover 容器的 `Automation/selftest_<bundleId>.json`，包含进程 ID、时间、逐项结果和 API 观测值。
+- `./sync_upstream.sh build` 构建成功。B 站在 iPad 随航副屏冷启动并生成报告，3 条临时 Keychain 记录均已删除。基线重现重复项返回 `-36`、数值查找上限被忽略、持久引用无效和设备名称不一致。随后用同一构建启动 UpTimer，未开启自检时未生成报告。两个窗口均确认在随航屏并正常退出。

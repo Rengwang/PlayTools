@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		2847AE48298EFC0F00B0F983 /* PlayScreen.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2847AE47298EFC0F00B0F983 /* PlayScreen.swift */; };
+		F18A5C4A2ED92A510087610B /* PlayToolsSelfTest.swift in Sources */ = {isa = PBXBuildFile; fileRef = F18A5C492ED92A510087610B /* PlayToolsSelfTest.swift */; };
 		6E76639B28D0FAE700DE4AF9 /* Plugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E76639A28D0FAE700DE4AF9 /* Plugin.swift */; };
 		6E76639C28D0FAE700DE4AF9 /* Plugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E76639A28D0FAE700DE4AF9 /* Plugin.swift */; };
 		6E7663A128D0FB5300DE4AF9 /* AKPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6E7663A028D0FB5300DE4AF9 /* AKPlugin.swift */; };
@@ -106,6 +107,7 @@
 
 /* Begin PBXFileReference section */
 		2847AE47298EFC0F00B0F983 /* PlayScreen.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayScreen.swift; sourceTree = "<group>"; };
+		F18A5C492ED92A510087610B /* PlayToolsSelfTest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayToolsSelfTest.swift; sourceTree = "<group>"; };
 		6E76639628D0FA6200DE4AF9 /* AKInterface-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "AKInterface-Bridging-Header.h"; sourceTree = "<group>"; };
 		6E76639A28D0FAE700DE4AF9 /* Plugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Plugin.swift; sourceTree = "<group>"; };
 		6E7663A028D0FB5300DE4AF9 /* AKPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AKPlugin.swift; sourceTree = "<group>"; };
@@ -452,6 +454,7 @@
 				AA719702287A44D200623C15 /* PlayLoader.m */,
 				AA719708287A44D200623C15 /* PlayTools.h */,
 				2847AE47298EFC0F00B0F983 /* PlayScreen.swift */,
+				F18A5C492ED92A510087610B /* PlayToolsSelfTest.swift */,
 			);
 			path = PlayTools;
 			sourceTree = "<group>";
@@ -747,6 +750,7 @@
 				955A3F48AFD07B6583BFEFC3 /* UserPluginLoader.swift in Sources */,
 				9562D16F2AB50D34002C329D /* ActionDispatcher.swift in Sources */,
 				2847AE48298EFC0F00B0F983 /* PlayScreen.swift in Sources */,
+				F18A5C4A2ED92A510087610B /* PlayToolsSelfTest.swift in Sources */,
 				9562D1532AB484FD002C329D /* EventAdapter.swift in Sources */,
 				AA7197A2287A481500623C15 /* CircleMenu.swift in Sources */,
 				954389CE2B39F26600B063BB /* ElementView.swift in Sources */,
