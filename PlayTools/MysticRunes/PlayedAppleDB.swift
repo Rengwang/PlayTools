@@ -209,6 +209,32 @@ class PlayKeychainDB: NSObject {
         return (ok, ok ? changes : 0)
     }
 
+    /// Options that only describe *how* to talk to the keychain and carry no matching
+    /// semantics. Apple ignores them for delete, so they must not turn a valid call into
+    /// `errSecParam` (many third-party wrappers always pass them).
+    private static let benignDeleteKeys: Set<String> = [
+        kSecUseDataProtectionKeychain as String,
+        kSecUseAuthenticationUI as String,
+        kSecUseAuthenticationContext as String,
+        kSecUseOperationPrompt as String
+    ]
+
+    /// `kSecAttrSynchronizable` is benign only when it does not narrow the result:
+    /// `kSecAttrSynchronizableAny` or `false`. `true` would restrict the delete to synced
+    /// items, which this backend cannot honour, so it stays unsupported.
+    private static func isBenignSynchronizable(_ value: Any?) -> Bool {
+        if let string = value as? String, string == kSecAttrSynchronizableAny as String {
+            return true
+        }
+        if let number = value as? NSNumber, number.boolValue == false {
+            return true
+        }
+        if let bool = value as? Bool, bool == false {
+            return true
+        }
+        return false
+    }
+
     /// Deletes rows matched by `query`.
     ///
     /// A class-only query is Apple's "clear this class" call and is executed as such. Any other
@@ -226,14 +252,24 @@ class PlayKeychainDB: NSObject {
         var supported = Set(allColumns.map { $0 as String })
         supported.insert(kSecClass as String)
 
+        var hasColumnConstraint = false
         for key in attributes.allKeys {
-            guard let name = key as? String, supported.contains(name) else {
-                PlayKeychain.debugLogger("SecItemDelete contains an unsupported qualifier")
-                return .invalidQuery
+            guard let name = key as? String else { return .invalidQuery }
+            if name == kSecClass as String { continue }
+            if supported.contains(name) {
+                hasColumnConstraint = true
+                continue
             }
+            if Self.benignDeleteKeys.contains(name) { continue }
+            if name == kSecAttrSynchronizable as String, Self.isBenignSynchronizable(attributes[key]) {
+                continue
+            }
+            PlayKeychain.debugLogger("SecItemDelete contains an unsupported qualifier")
+            return .invalidQuery
         }
 
-        let classOnly = attributes.count == 1 && attributes[kSecClass] != nil
+        // Only a query with no column constraint at all may clear the class.
+        let classOnly = !hasColumnConstraint
         let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: attributes)
         if whereClause.isEmpty && !classOnly {
             PlayKeychain.debugLogger("SecItemDelete has no executable constraint")
