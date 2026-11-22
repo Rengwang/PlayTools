@@ -70,4 +70,5 @@
    - `encodeData`：零长度 `CFData` 改用 `sqlite3_bind_zeroblob(...,0)`，不再因为 `CFDataGetBytePtr == NULL` 被写成 `SQLITE_NULL`；`decodeData` 对 `SQLITE_BLOB` 先取 `column_bytes`，为 0 时返回 `Data()`，只有 `SQLITE_NULL` 才返回 `nil`。
    - `copyAllMatches` 与单条查询共用 `resultDictionary(_:query:)`：请求 `kSecReturnData` 但条目无 `v_Data` 时不视为匹配，空集合返回 `errSecItemNotFound`。
    - `SecItemDelete`：仅当 query 只有 `kSecClass` 时执行整表删除；若包含任何无法转成 SQL 的限定键（如 `kSecMatchItemList`），直接返回 `errSecParam` 且不执行 SQL，避免“定向删除变成清表”。`SecItemUpdate/Delete` 用 `sqlite3_changes` 判断是否命中，未命中返回 `errSecItemNotFound`。
+   - `SecItemDelete` 的“无害选项键”放行：`kSecUseDataProtectionKeychain`、`kSecUseAuthenticationUI`、`kSecUseAuthenticationContext`、`kSecUseOperationPrompt`，以及值为 `kSecAttrSynchronizableAny` 或 `false` 的 `kSecAttrSynchronizable`；其余未知键（`kSecMatchItemList`、`kSecAttrSynchronizable: true` 等）仍返回 `errSecParam`。
    - 验证：class-only 清表 0 残留；带 `kSecMatchItemList` 返回 `errSecParam` 且 2 行数据零丢失；带 `svce+gena` 只删 1 行；改主键 `acct` 命中 1 行；无匹配返回 0。
