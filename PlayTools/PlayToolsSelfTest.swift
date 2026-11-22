@@ -144,15 +144,11 @@ enum PlayToolsSelfTest {
                             reference?.isEmpty == false && reference != updated,
                             "OSStatus \(referenceResult.status)"))
         if let reference = reference, !reference.isEmpty, reference != updated {
-            let refQuery = [kSecValuePersistentRef as String: reference]
-            let resolved = copyKeychainItem(refQuery, returning: kSecReturnData)
-            checks.append(Check("keychain.persistentRef.lookup", resolved.status == errSecSuccess &&
-                                resolved.value as? Data == updated, "OSStatus \(resolved.status)"))
+            checks += persistentReferenceChecks(reference, scopedTo: query, payload: updated)
         } else {
             checks.append(Check("keychain.persistentRef.lookup", status: "skipped", "No opaque reference available"))
         }
-        checks.append(Check("keychain.permanentKey", status: "skipped",
-                            "Generation requires validated tag preservation for targeted cleanup"))
+        checks += permanentKeyChecks(tag: Data(runID.utf8))
 
         for (index, query) in queries.enumerated() {
             let deleted = PlayKeychain.delete(query as NSDictionary)
@@ -163,6 +159,80 @@ enum PlayToolsSelfTest {
                                 "Delete OSStatus \(deleted), lookup OSStatus \(lookup.status)"))
         }
         return checks
+    }
+
+    private static func persistentReferenceChecks(_ reference: Data, scopedTo query: [String: Any], payload: Data)
+        -> [Check] {
+        let refQuery = [kSecValuePersistentRef as String: reference]
+        let resolved = copyKeychainItem(refQuery, returning: kSecReturnData)
+        let resolvedTarget = resolved.status == errSecSuccess && resolved.value as? Data == payload
+        let lookup = Check("keychain.persistentRef.lookup", resolvedTarget, "OSStatus \(resolved.status)")
+        guard resolvedTarget else { return [lookup] }
+
+        // Keep every mutating probe scoped to the synthetic service and account.
+        var scopedQuery = query
+        scopedQuery[kSecValuePersistentRef as String] = reference
+        let replacement = payload + Data(".ref".utf8)
+        let updateStatus = PlayKeychain.update(
+            scopedQuery as NSDictionary, attributesToUpdate: [kSecValueData as String: replacement]
+        )
+        let changed = copyKeychainItem(refQuery, returning: kSecReturnData)
+        let removed = PlayKeychain.delete(scopedQuery as NSDictionary)
+        let missing = copyKeychainItem(query, returning: kSecReturnData)
+        return [
+            lookup,
+            Check("keychain.persistentRef.update", updateStatus == errSecSuccess && changed.status == errSecSuccess &&
+                  changed.value as? Data == replacement,
+                  "Update OSStatus \(updateStatus), lookup OSStatus \(changed.status)"),
+            Check("keychain.persistentRef.delete", removed == errSecSuccess && missing.status == errSecItemNotFound,
+                  "Delete OSStatus \(removed), lookup OSStatus \(missing.status)")
+        ]
+    }
+
+    private static func permanentKeyChecks(tag: Data) -> [Check] {
+        let parameters: [String: Any] = [
+            kSecAttrKeyType as String: kSecAttrKeyTypeECSECPrimeRandom,
+            kSecAttrKeySizeInBits as String: 256,
+            kSecPrivateKeyAttrs as String: [
+                kSecAttrIsPermanent as String: true,
+                kSecAttrApplicationTag as String: tag
+            ]
+        ]
+        var error: Unmanaged<CFError>?
+        guard let key = PlayKeychain.keyCreateRandomKey(parameters as NSDictionary, error: &error)?.takeRetainedValue()
+        else {
+            let code = error.map { CFErrorGetCode($0.takeRetainedValue()) }
+            return [Check("keychain.permanentKey.generate", false, "CFError code \(String(describing: code))")]
+        }
+        _ = error?.takeRetainedValue()
+
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassKey,
+            kSecAttrApplicationTag as String: tag
+        ]
+        let reference = copyKeychainItem(query, returning: kSecReturnRef)
+        let bytes = copyKeychainItem(query, returning: kSecReturnData)
+        let externalRepresentation = SecKeyCopyExternalRepresentation(key, nil) as Data?
+        let deleted = PlayKeychain.delete(query as NSDictionary)
+        if deleted != errSecSuccess, let externalRepresentation = externalRepresentation {
+            // A regression could drop the tag. The exact random bytes still identify this test key.
+            let fallback: [String: Any] = [
+                kSecClass as String: kSecClassKey,
+                kSecValueData as String: externalRepresentation
+            ]
+            _ = PlayKeychain.delete(fallback as NSDictionary)
+        }
+        let missing = copyKeychainItem(query, returning: kSecReturnData)
+        return [
+            Check("keychain.permanentKey.generate", true),
+            Check("keychain.permanentKey.reference", reference.status == errSecSuccess &&
+                  reference.value.map { CFGetTypeID($0) == SecKeyGetTypeID() } == true,
+                  "OSStatus \(reference.status)"),
+            Check("keychain.permanentKey.data", bytes.status == errSecSuccess && externalRepresentation != nil &&
+                  bytes.value as? Data == externalRepresentation, "OSStatus \(bytes.status)"),
+            Check("keychain.permanentKey.cleanup", deleted == errSecSuccess && missing.status == errSecItemNotFound,
+                  "Delete OSStatus \(deleted), lookup OSStatus \(missing.status)")
+        ]
     }
 
     private static func keychainLimitChecks(query: [String: Any], payloads: [Data]) -> [Check] {

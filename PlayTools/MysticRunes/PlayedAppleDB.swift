@@ -10,17 +10,28 @@ import Security
 import SQLite3
 import UIKit
 
-enum PlayKeychainDeleteOutcome {
-    case ok(Int)        // 受影响行数
-    case invalidQuery   // 含无法执行的限定键（绝不能退化成整表删除）
+enum PlayKeychainMutationOutcome {
+    case ok(Int)
+    case duplicate
+    case invalidQuery
     case ioError
+
+    var status: OSStatus {
+        switch self {
+        case .ok(let count): return count > 0 ? errSecSuccess : errSecItemNotFound
+        case .duplicate: return errSecDuplicateItem
+        case .invalidQuery: return errSecParam
+        case .ioError: return errSecIO
+        }
+    }
 }
 
 class PlayKeychainDB: NSObject {
     public static let shared = PlayKeychainDB()
 
     private var dbLock: DispatchSemaphore = .init(value: 1)
-    private var dbVersion: Int = 1
+    private let dbVersion = 2
+    static let itemIDColumn = "pt_item_id"
     private var isSchemaVerified: Bool = false
     private var didEnsureDirectory: Bool = false
     private var persistentDB: OpaquePointer?
@@ -44,27 +55,24 @@ class PlayKeychainDB: NSObject {
         closePersistentConnection()
     }
 
-    func query(_ attributes: NSDictionary) -> [NSMutableDictionary]? {
+    func query(_ attributes: NSDictionary, itemID: Data?, limit: Int) -> [NSMutableDictionary]? {
         guard let tableName = attributes[kSecClass] as? String,
               let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString] else {
             return nil
         }
 
-        // Keychain matching is conjunctive over *every* attribute in the query, not
-        // just the primary key. Ignoring the rest made a lookup for e.g. `gena =
-        // IMEIString` return an unrelated item that merely shared the access group,
-        // which hardened apps then dereference as if it were their own record.
         let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] ?? []
         let queryColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
-        let (whereClause, whereBindings) = buildWhereClause(columns: queryColumns, attributes: attributes)
-        guard !whereClause.isEmpty else { return nil }
-        let selectLimit = attributes[kSecMatchLimit] as? String == kSecMatchLimitOne as String ? 1 : Int.max
-
-        let selectQuery = "SELECT * FROM \(tableName) WHERE \(whereClause) LIMIT \(selectLimit)"
+        let (whereClause, whereBindings) = buildWhereClause(columns: queryColumns, attributes: attributes, itemID: itemID)
+        // An unsupported search key may not turn into a class-wide lookup.
+        if whereClause.isEmpty && !Self.canConstrain(attributes, with: [], lookup: true) { return [] }
+        let predicate = whereClause.isEmpty ? "" : " WHERE \(whereClause)"
+        let selectQuery = "SELECT * FROM \(tableName)\(predicate) LIMIT \(limit)"
         var stmt: OpaquePointer?
 
         var dictArr: [NSMutableDictionary] = []
         guard usingDB({ sqlite3DB in
+            dictArr.removeAll()
             defer { sqlite3_finalize(stmt) }
             guard sqlite3_prepare(sqlite3DB, selectQuery, -1, &stmt, nil) == SQLITE_OK,
                   let stmt = stmt else {
@@ -80,7 +88,8 @@ class PlayKeychainDB: NSObject {
                 return false
             }
 
-            while sqlite3_step(stmt) == SQLITE_ROW && dictArr.count < selectLimit {
+            var step = sqlite3_step(stmt)
+            while step == SQLITE_ROW {
                 let newDict: NSMutableDictionary = [:]
                 let columns = sqlite3_column_count(stmt)
                 newDict[kSecClass] = tableName
@@ -88,96 +97,121 @@ class PlayKeychainDB: NSObject {
                 for index in 0..<columns {
                     let name = String(cString: sqlite3_column_name(stmt, index))
                     if let value = decodeData(stmt: stmt, index: index) {
-                        newDict[name] = value
+                        newDict[name] = decodedAttribute(value, column: name, tableName: tableName)
                     }
                 }
                 dictArr.append(newDict)
+                step = sqlite3_step(stmt)
             }
 
-            return true
+            return step == SQLITE_DONE
         }) else { return nil }
 
         return dictArr
     }
 
-    func insert(_ attributes: NSDictionary) -> NSMutableDictionary? {
+    // A batch is needed when both members of a generated key pair are permanent.
+    func insert(_ items: [NSDictionary]) -> PlayKeychainMutationOutcome {
+        var outcome: PlayKeychainMutationOutcome = .ioError
+        let completed = usingDB { db in
+            guard sqlite3_exec(db, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else {
+                outcome = .ioError
+                return false
+            }
+            var committed = false
+            defer {
+                if !committed { sqlite3_exec(db, "ROLLBACK", nil, nil, nil) }
+            }
+
+            for item in items {
+                outcome = insert(item, using: db)
+                switch outcome {
+                case .ok: break
+                case .ioError: return false
+                case .duplicate, .invalidQuery: return true
+                }
+            }
+
+            guard sqlite3_exec(db, "COMMIT", nil, nil, nil) == SQLITE_OK else {
+                outcome = .ioError
+                return false
+            }
+            committed = true
+            outcome = .ok(items.count)
+            return true
+        }
+        return completed ? outcome : .ioError
+    }
+
+    private func insert(_ attributes: NSDictionary, using db: OpaquePointer) -> PlayKeychainMutationOutcome {
         guard let tableName = attributes[kSecClass] as? String,
-              let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString],
-              let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] else {
-            return nil
+              let primary = PlayedAppleDBConstants.primaries[tableName as CFString],
+              let secondary = PlayedAppleDBConstants.attributes[tableName as CFString],
+              let itemID = attributes[Self.itemIDColumn] as? Data else { return .invalidQuery }
+
+        let optional = secondary + PlayedAppleDBConstants.values
+        let columns = primary.map { $0 as String }
+            + optional.filter { attributes[$0] != nil }.map { $0 as String }
+            + [Self.itemIDColumn]
+        let values = columns.map { attributes[$0].map { $0 as CFTypeRef } ?? NSNull() }
+        let placeholders = Array(repeating: "?", count: values.count).joined(separator: ", ")
+
+        // A composite SQLite primary key treats NULLs as distinct. The explicit check preserves
+        // Keychain duplicate semantics for omitted attributes and rows written by older versions.
+        let primaryValues = primary.map { attributes[$0].map { $0 as CFTypeRef } ?? NSNull() }
+        let predicates = primary.map { column -> String in
+            let name = column as String
+            let allowLegacyNull = column == kSecAttrAccessGroup
+                ? (attributes[column] as? String) == PlayKeychain.defaultAccessGroup
+                : attributes[column] == nil
+            return allowLegacyNull ? "(\(name) IS ? OR \(name) IS NULL)" : "\(name) IS ?"
+        }.joined(separator: " AND ")
+        let sql = """
+            INSERT INTO \(tableName) (\(columns.joined(separator: ", ")))
+            SELECT \(placeholders) WHERE NOT EXISTS (SELECT 1 FROM \(tableName) WHERE \(predicates))
+            """
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard !itemID.isEmpty, sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else { return .ioError }
+        for (index, value) in (values + primaryValues).enumerated() {
+            guard encodeData(stmt: statement, index: Int32(index + 1), value: value) else { return .ioError }
         }
 
-        var columnsQuery = primaryColumns.map({ "\($0)" })
-        columnsQuery.append(contentsOf: secondaryColumns.compactMap({
-            attributes[$0] != nil ? "\($0)" : nil
-        }))
-        columnsQuery.append(contentsOf: PlayedAppleDBConstants.values.compactMap({
-            attributes[$0] != nil ? "\($0)" : nil
-        }))
-
-        let insertValues = columnsQuery.map({ attributes[$0] as CFTypeRef })
-
-        let insertColumns = columnsQuery.joined(separator: ", ")
-        let insertPlaceholders = Array(repeating: "?", count: insertValues.count).joined(separator: ", ")
-
-        let insertQuery = "INSERT INTO \(tableName) (\(insertColumns)) VALUES (\(insertPlaceholders))"
-        var stmt: OpaquePointer?
-
-        let newDict: NSMutableDictionary = [:]
-        newDict[kSecClassKey] = tableName
-        for column in columnsQuery {
-            newDict[column] = attributes[column]
+        let step = sqlite3_step(statement)
+        if step == SQLITE_CONSTRAINT || (step == SQLITE_DONE && sqlite3_changes(db) == 0) {
+            return .duplicate
         }
-
-        guard usingDB({ sqlite3DB in
-            defer { sqlite3_finalize(stmt) }
-            guard sqlite3_prepare(sqlite3DB, insertQuery, -1, &stmt, nil) == SQLITE_OK,
-                  let stmt = stmt else {
-                let errorMessage = String(cString: sqlite3_errmsg(sqlite3DB))
-                PlayKeychain.debugLogger("Failed query \(insertQuery)")
-                PlayKeychain.debugLogger("Failed to make query: \(errorMessage)")
-                return false
-            }
-
-            for (index, value) in insertValues.enumerated()
-            where !encodeData(stmt: stmt, index: Int32(index + 1), value: value) {
-                let erorrMessage = String(cString: sqlite3_errmsg(sqlite3DB))
-                PlayKeychain.debugLogger("Failed to insert into db: \(erorrMessage)")
-                return false
-            }
-
-            return sqlite3_step(stmt) == SQLITE_DONE
-        }) else { return nil }
-
-        return newDict
+        return step == SQLITE_DONE ? .ok(1) : .ioError
     }
 
     /// Applies a partial update: `query` only builds the WHERE clause, and
     /// `attributesToUpdate` only builds the SET clause. Returns the affected row count so the
     /// caller can report `errSecItemNotFound` instead of a false success.
-    func update(query: NSDictionary, attributesToUpdate: NSDictionary) -> (ok: Bool, changes: Int) {
+    func update(query: NSDictionary, attributesToUpdate: NSDictionary, itemID: Data?)
+    -> PlayKeychainMutationOutcome {
         guard let tableName = query[kSecClass] as? String,
               let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString],
               let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] else {
-            return (false, 0)
+            return .invalidQuery
         }
 
         let allColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
+        guard Self.canConstrain(query, with: allColumns) else { return .invalidQuery }
         var setClauses: [String] = []
         var setValues: [CFTypeRef] = []
-        for column in allColumns where column as String != kSecClass as String {
+        for column in allColumns where column != kSecValuePersistentRef {
             guard let value = attributesToUpdate[column] else { continue }
             setClauses.append("\(column) = ?")
             setValues.append(value as CFTypeRef)
         }
-        guard !setClauses.isEmpty else { return (false, 0) }
+        guard !setClauses.isEmpty else { return .invalidQuery }
 
-        let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: query)
-        guard !whereClause.isEmpty else { return (false, 0) }
-
+        let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: query, itemID: itemID)
+        guard !whereClause.isEmpty else { return .invalidQuery }
         let updateQuery = "UPDATE \(tableName) SET \(setClauses.joined(separator: ", ")) WHERE \(whereClause)"
         var stmt: OpaquePointer?
-        var changes = 0
+        var outcome: PlayKeychainMutationOutcome = .ioError
 
         let ok = usingDB { sqlite3DB in
             defer { sqlite3_finalize(stmt) }
@@ -201,18 +235,25 @@ class PlayKeychainDB: NSObject {
                 return false
             }
 
-            guard sqlite3_step(stmt) == SQLITE_DONE else { return false }
-            changes = Int(sqlite3_changes(sqlite3DB))
+            let step = sqlite3_step(stmt)
+            switch step {
+            case SQLITE_CONSTRAINT:
+                outcome = .duplicate
+            case SQLITE_DONE:
+                outcome = .ok(Int(sqlite3_changes(sqlite3DB)))
+            default:
+                return false
+            }
             return true
         }
 
-        return (ok, ok ? changes : 0)
+        return ok ? outcome : .ioError
     }
 
     /// Options that only describe *how* to talk to the keychain and carry no matching
     /// semantics. Apple ignores them for delete, so they must not turn a valid call into
     /// `errSecParam` (many third-party wrappers always pass them).
-    private static let benignDeleteKeys: Set<String> = [
+    private static let benignMutationKeys: Set<String> = [
         kSecUseDataProtectionKeychain as String,
         kSecUseAuthenticationUI as String,
         kSecUseAuthenticationContext as String,
@@ -235,13 +276,24 @@ class PlayKeychainDB: NSObject {
         return false
     }
 
-    /// Deletes rows matched by `query`.
-    ///
-    /// A class-only query is Apple's "clear this class" call and is executed as such. Any other
-    /// query must constrain on columns we can actually translate into SQL: silently dropping an
-    /// unsupported qualifier (e.g. `kSecMatchItemList`) would turn a targeted delete into a full
-    /// table wipe, so those queries are rejected with `.invalidQuery` and no SQL is run.
-    func delete(_ attributes: NSDictionary) -> PlayKeychainDeleteOutcome {
+    /// Reject a query with qualifiers this backend cannot evaluate before running a mutation.
+    /// In particular, a class-only query may match every row, but an unsupported targeted query must not.
+    private static let lookupOptions = Set([
+        kSecMatchLimit, kSecReturnAttributes, kSecReturnData, kSecReturnRef, kSecReturnPersistentRef
+    ].map { $0 as String })
+
+    private static func canConstrain(_ attributes: NSDictionary, with columns: [CFString],
+                                     lookup: Bool = false) -> Bool {
+        let supported = Set(columns.map { $0 as String }).union([kSecClass as String])
+        return attributes.allKeys.allSatisfy { key in
+            guard let name = key as? String else { return false }
+            if supported.contains(name) || benignMutationKeys.contains(name) ||
+                (lookup && lookupOptions.contains(name)) { return true }
+            return name == kSecAttrSynchronizable as String && isBenignSynchronizable(attributes[key])
+        }
+    }
+
+    func delete(_ attributes: NSDictionary, itemID: Data?) -> PlayKeychainMutationOutcome {
         guard let tableName = attributes[kSecClass] as? String,
               let primaryColumns = PlayedAppleDBConstants.primaries[tableName as CFString],
               let secondaryColumns = PlayedAppleDBConstants.attributes[tableName as CFString] else {
@@ -249,32 +301,8 @@ class PlayKeychainDB: NSObject {
         }
 
         let allColumns = primaryColumns + secondaryColumns + PlayedAppleDBConstants.values
-        var supported = Set(allColumns.map { $0 as String })
-        supported.insert(kSecClass as String)
-
-        var hasColumnConstraint = false
-        for key in attributes.allKeys {
-            guard let name = key as? String else { return .invalidQuery }
-            if name == kSecClass as String { continue }
-            if supported.contains(name) {
-                hasColumnConstraint = true
-                continue
-            }
-            if Self.benignDeleteKeys.contains(name) { continue }
-            if name == kSecAttrSynchronizable as String, Self.isBenignSynchronizable(attributes[key]) {
-                continue
-            }
-            PlayKeychain.debugLogger("SecItemDelete contains an unsupported qualifier")
-            return .invalidQuery
-        }
-
-        // Only a query with no column constraint at all may clear the class.
-        let classOnly = !hasColumnConstraint
-        let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: attributes)
-        if whereClause.isEmpty && !classOnly {
-            PlayKeychain.debugLogger("SecItemDelete has no executable constraint")
-            return .invalidQuery
-        }
+        guard Self.canConstrain(attributes, with: allColumns) else { return .invalidQuery }
+        let (whereClause, whereBindings) = buildWhereClause(columns: allColumns, attributes: attributes, itemID: itemID)
         // `tableName` comes from the constants whitelist above, so it is safe to interpolate.
         let deleteQuery = whereClause.isEmpty
             ? "DELETE FROM \(tableName)"
@@ -313,7 +341,7 @@ class PlayKeychainDB: NSObject {
     private func structDB(_ sqlite3DB: OpaquePointer) -> Bool {
         for (key, value) in PlayedAppleDBConstants.primaries {
             var columns: [CFString] = value
-            columns.append(contentsOf: PlayedAppleDBConstants.attributes[key]!)
+            columns.append(contentsOf: PlayedAppleDBConstants.attributes[key] ?? [])
             columns.append(contentsOf: PlayedAppleDBConstants.values)
             let columnsSetting = columns.map({ return "\($0) TEXT" }).joined(separator: ", ")
             let primaryKeysSetting = "PRIMARY KEY (\(value.map({ return "\($0)" }).joined(separator: ", ")))"
@@ -325,8 +353,6 @@ class PlayKeychainDB: NSObject {
                 return false
             }
         }
-
-        sqlite3_exec(sqlite3DB, "PRAGMA user_version = \(dbVersion)", nil, nil, nil)
 
         return true
     }
@@ -425,7 +451,8 @@ private extension PlayKeychainDB {
     /// Builds a parameterized SQL WHERE clause and ordered binding values from primary key attributes.
     func buildWhereClause(
         columns: [CFString],
-        attributes: NSDictionary
+        attributes: NSDictionary,
+        itemID: Data?
     ) -> (clause: String, bindings: [CFTypeRef]) {
         var clauses: [String] = []
         var bindings: [CFTypeRef] = []
@@ -435,20 +462,21 @@ private extension PlayKeychainDB {
             let ref = attr as CFTypeRef
             let typeID = CFGetTypeID(ref)
             if typeID == CFDataGetTypeID() {
-                let data = ref as! CFData // swiftlint:disable:this force_cast
                 clauses.append("(\(col) = ? OR CAST(\(col) AS BLOB) = ?)")
-                bindings.append(data)
-                bindings.append(data)
             } else {
-                let boundValue: CFTypeRef = (typeID == CFStringGetTypeID() || typeID == CFNullGetTypeID())
-                    ? ref
-                    : ("\(attr)" as CFString)
-                clauses.append("(\(col) = ? OR CAST(\(col) AS TEXT) = ?)")
-                bindings.append(boundValue)
-                bindings.append(boundValue)
+                let legacyDefaultGroup = col == kSecAttrAccessGroup &&
+                    (attr as? String) == PlayKeychain.defaultAccessGroup
+                let legacyMatch = legacyDefaultGroup ? " OR \(col) IS NULL" : ""
+                clauses.append("(\(col) = ? OR CAST(\(col) AS TEXT) = ?\(legacyMatch))")
             }
+            bindings.append(ref)
+            bindings.append(ref)
         }
 
+        if let itemID {
+            clauses.append("\(Self.itemIDColumn) = ?")
+            bindings.append(itemID as CFData)
+        }
         return (clauses.joined(separator: " AND "), bindings)
     }
 
@@ -470,6 +498,11 @@ private extension PlayKeychainDB {
                 let ptr = CFDataGetBytePtr(data)
                 result = sqlite3_bind_blob(stmt, index, ptr, Int32(size), sqliteTransient)
             }
+        case CFNumberGetTypeID(), CFBooleanGetTypeID():
+            guard let number = value as? NSNumber else { return false }
+            // Existing columns use TEXT affinity. Keep numeric attributes comparable to rows
+            // written as strings without losing them to the old unsupported-type NULL fallback.
+            result = sqlite3_bind_text(stmt, index, number.stringValue, -1, sqliteTransient)
         case CFNullGetTypeID():
             result = sqlite3_bind_null(stmt, index)
         default:
@@ -515,17 +548,57 @@ private extension PlayKeychainDB {
         }
     }
 
+    func decodedAttribute(_ value: CFTypeRef, column: String, tableName: String) -> CFTypeRef {
+        guard tableName == kSecClassKey as String, let string = value as? String,
+              let number = Int(string) else { return value }
+        if PlayedAppleDBConstants.keyNumericAttributes.contains(column) { return NSNumber(value: number) }
+        if PlayedAppleDBConstants.keyBooleanAttributes.contains(column) { return NSNumber(value: number != 0) }
+        return value
+    }
+
     func verifySchemaIfNeeded(_ sqlite3DB: OpaquePointer, fileSize: Int64) -> Bool {
-        var currentVersion: Int32 = 0
-        var verStmt: OpaquePointer?
-        if sqlite3_prepare_v2(sqlite3DB, "PRAGMA user_version", -1, &verStmt, nil) == SQLITE_OK {
-            if sqlite3_step(verStmt) == SQLITE_ROW {
-                currentVersion = sqlite3_column_int(verStmt, 0)
-            }
-            sqlite3_finalize(verStmt)
+        guard let currentVersion = readVersion(sqlite3DB) else { return false }
+        if currentVersion >= dbVersion && fileSize != 0 { return true }
+
+        // Serialize initial schema creation and additive migration across processes.
+        guard sqlite3_exec(sqlite3DB, "BEGIN IMMEDIATE", nil, nil, nil) == SQLITE_OK else { return false }
+        var committed = false
+        defer {
+            if !committed { sqlite3_exec(sqlite3DB, "ROLLBACK", nil, nil, nil) }
         }
-        if currentVersion < Int32(dbVersion) || fileSize == 0 {
-            return structDB(sqlite3DB)
+        guard let version = readVersion(sqlite3DB) else { return false }
+        if version < dbVersion {
+            guard structDB(sqlite3DB), migrateItemIDs(sqlite3DB),
+                  sqlite3_exec(sqlite3DB, "PRAGMA user_version = \(dbVersion)", nil, nil, nil) == SQLITE_OK else {
+                return false
+            }
+        }
+        committed = sqlite3_exec(sqlite3DB, "COMMIT", nil, nil, nil) == SQLITE_OK
+        return committed
+    }
+
+    func readVersion(_ db: OpaquePointer) -> Int? {
+        var statement: OpaquePointer?
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &statement, nil) == SQLITE_OK,
+              let statement, sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
+    func migrateItemIDs(_ db: OpaquePointer) -> Bool {
+        let column = Self.itemIDColumn
+        for key in PlayedAppleDBConstants.primaries.keys {
+            // The trigger also assigns an ID if an older PlayTools build subsequently adds a row.
+            let migration = """
+                ALTER TABLE \(key) ADD COLUMN \(column) BLOB;
+                UPDATE \(key) SET \(column) = randomblob(16);
+                CREATE UNIQUE INDEX \(key)_item_id ON \(key) (\(column));
+                CREATE TRIGGER \(key)_assign_item_id AFTER INSERT ON \(key) WHEN NEW.\(column) IS NULL
+                BEGIN
+                    UPDATE \(key) SET \(column) = randomblob(16) WHERE rowid = NEW.rowid;
+                END;
+                """
+            guard sqlite3_exec(db, migration, nil, nil, nil) == SQLITE_OK else { return false }
         }
         return true
     }

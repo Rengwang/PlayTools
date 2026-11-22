@@ -77,3 +77,5 @@
 
 - Phase 0 在注入进程中增加了 `PLAYTOOLS_SELFTEST=1`。默认运行 Keychain、平台身份和窗口几何检查，可用 `PLAYTOOLS_SELFTEST_GROUP=keychain|platform|geometry` 单独运行。报告位于 PlayCover 容器的 `Automation/selftest_<bundleId>.json`，包含进程 ID、时间、逐项结果和 API 观测值。
 - `./sync_upstream.sh build` 构建成功。B 站在 iPad 随航副屏冷启动并生成报告，3 条临时 Keychain 记录均已删除。基线重现重复项返回 `-36`、数值查找上限被忽略、持久引用无效和设备名称不一致。随后用同一构建启动 UpTimer，未开启自检时未生成报告。两个窗口均确认在随航屏并正常退出。
+- Phase 1 统一 PlayChain 的查询上限和返回类型，重复写入返回 `errSecDuplicateItem`。永久密钥保留调用方传入的标签和可持久化属性。数据库版本 2 为既有记录补充不透明标识，持久引用可回查、更新和删除，更新属性后仍保持稳定。省略查询的访问组时只扫描该应用的 PlayChain 数据库。
+- B 站和独立 Catalyst 测试应用的 Keychain 自检各通过 20 项。独立应用直接调用公开 `SecItem*` API 验证重复项返回 `-25299`、持久引用回查和删除。B 站数据库迁移后通过 SQLite 完整性检查，临时测试服务无残留。
