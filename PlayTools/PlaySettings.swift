@@ -147,6 +147,7 @@ let settings = PlaySettings.shared
     @objc lazy var sdkShift = settingsData.sdkShift
 
     @objc lazy var useNativePlatform = settingsData.useNativePlatform
+    @objc lazy var cameraRotation = settingsData.cameraRotation
 
     @objc lazy var spoofPowerState = settingsData.spoofPowerState
 }
@@ -188,6 +189,7 @@ struct AppSettingsData: Codable {
     var layoutIdiom: Int = 3
     var sdkShift = false
     var useNativePlatform = false
+    var cameraRotation = -1
     var spoofPowerState = false
 
     init() {}
@@ -237,6 +239,7 @@ struct AppSettingsData: Codable {
         layoutIdiom = try container.decodeIfPresent(Int.self, forKey: .layoutIdiom) ?? 3
         sdkShift = try container.decodeIfPresent(Bool.self, forKey: .sdkShift) ?? false
         useNativePlatform = try container.decodeIfPresent(Bool.self, forKey: .useNativePlatform) ?? false
+        cameraRotation = try container.decodeIfPresent(Int.self, forKey: .cameraRotation) ?? -1
         spoofPowerState = try container.decodeIfPresent(Bool.self, forKey: .spoofPowerState) ?? false
     }
 }

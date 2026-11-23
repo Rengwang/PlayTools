@@ -2,6 +2,8 @@ import Foundation
 #if PLAYTOOLS_FRAMEWORK_PROBES
 import AuthenticationServices
 import AVFAudio
+import CoreBluetooth
+import CoreLocation
 import CoreMotion
 import GameKit
 import PassKit
@@ -28,6 +30,7 @@ enum PlayToolsSelfTest {
         case webkit
         case urls
         case presentations
+        case services
     }
 
     private struct Check {
@@ -96,7 +99,7 @@ enum PlayToolsSelfTest {
                 checks += platformChecks(window: window, observations: &observations)
             case .geometry:
                 checks += geometryChecks(window: window, observations: &observations)
-            case .entitlements, .media, .webkit, .urls, .presentations:
+            case .entitlements, .media, .webkit, .urls, .presentations, .services:
                 continue
             }
         }
@@ -104,7 +107,7 @@ enum PlayToolsSelfTest {
             checks.append(Check("configuration.group", false, "Unknown group: \(requestedGroup)"))
         }
 
-        let frameworkGroups: [Group] = [.entitlements, .media, .webkit, .urls, .presentations]
+        let frameworkGroups: [Group] = [.entitlements, .media, .webkit, .urls, .presentations, .services]
         let selectedGroups = frameworkGroups.filter { requestedGroup == nil || requestedGroup == $0.rawValue }
         completeFrameworkChecks(selectedGroups[...], explicit: requestedGroup != nil, window: window) { results in
             writeReport(requestedGroup: requestedGroup, checks: checks + results, observations: observations)
@@ -134,6 +137,8 @@ enum PlayToolsSelfTest {
             urlChecks(completion: next)
         case .presentations:
             presentationChecks(window: window, completion: next)
+        case .services:
+            serviceChecks(completion: next)
         default:
             next([])
         }
@@ -620,6 +625,102 @@ extension PlayToolsSelfTest {
 
         group.notify(queue: .main) {
             completion(results.sorted { $0.name < $1.name })
+        }
+    }
+
+    private static func serviceChecks(completion: @escaping ([Check]) -> Void) {
+        guard isContractFixture else {
+            completion([Check("services.fixture", status: "skipped", "A marked contract fixture is required")])
+            return
+        }
+
+        let group = DispatchGroup()
+        var results: [Check] = []
+        func append(_ name: String, cleanup: @escaping () -> Void = {},
+                    start: (@escaping ([Check]) -> Void) -> Void) {
+            group.enter()
+            boundedChecks(name, cleanup: cleanup, start: start) { checks in
+                results.append(contentsOf: checks)
+                group.leave()
+            }
+        }
+
+        append("services.capabilities") { done in
+            DispatchQueue.global(qos: .utility).async {
+                let location = CLLocationManager.locationServicesEnabled()
+                let bluetooth = CBManager.authorization
+                let definedBluetoothStates: [CBManagerAuthorization] = [.notDetermined, .restricted, .denied, .allowedAlways]
+                done([
+                    Check("services.location.enabledQuery", true, "Location services enabled \(location)"),
+                    Check("services.bluetooth.authorization", definedBluetoothStates.contains(bluetooth),
+                          "CBManagerAuthorization \(bluetooth.rawValue)")
+                ])
+            }
+        }
+        let location = LocationAuthorizationProbe()
+        append("services.location.initialAuthorization", cleanup: location.stop, start: location.start)
+
+        let pushName = "services.push.registrationFailure"
+        if Bundle.main.object(forInfoDictionaryKey: "PlayToolsRemoteRegistrationFixture") as? Bool == true {
+            var observer: NSObjectProtocol?
+            var callbackCount = 0
+            let center = NotificationCenter.default
+            append(pushName, cleanup: {
+                if let observer = observer { center.removeObserver(observer) }
+            }) { done in
+                let name = Notification.Name("PlayToolsContractRemoteRegistration")
+                let application = UIApplication.shared
+                observer = center.addObserver(forName: name, object: application, queue: .main) { note in
+                    callbackCount += 1
+                    guard callbackCount == 1 else { return }
+                    let error = note.userInfo?["error"] as? NSError
+                    let registered = application.isRegisteredForRemoteNotifications
+                    let wasOnMain = note.userInfo?["mainThread"] as? Bool == true
+                    let detail = error.map { "\($0.domain) (\($0.code))" } ?? "Unexpected success callback"
+                    let first = Check(pushName, error != nil && !registered && wasOnMain, detail)
+                    DispatchQueue.main.async {
+                        application.registerForRemoteNotifications()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                            done([first, Check("services.push.retryLimit", callbackCount == 1,
+                                               "Observed \(callbackCount) callbacks after immediate retry")])
+                        }
+                    }
+                }
+                application.registerForRemoteNotifications()
+            }
+        } else {
+            results.append(Check(pushName, status: "skipped", "A fixture with remote registration callbacks is required"))
+        }
+
+        group.notify(queue: .main) { completion(results.sorted { $0.name < $1.name }) }
+    }
+
+    private final class LocationAuthorizationProbe: NSObject, CLLocationManagerDelegate {
+        private var manager: CLLocationManager?
+        private var completion: (([Check]) -> Void)?
+
+        func start(_ completion: @escaping ([Check]) -> Void) {
+            self.completion = completion
+            let manager = CLLocationManager()
+            self.manager = manager
+            manager.delegate = self
+        }
+
+        func stop() {
+            manager?.delegate = nil
+            manager = nil
+            completion = nil
+        }
+
+        func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+            let status = manager.authorizationStatus
+            let accuracy = manager.accuracyAuthorization
+            let knownStatus: [CLAuthorizationStatus] = [.notDetermined, .restricted, .denied,
+                                                        .authorizedAlways, .authorizedWhenInUse]
+            let knownAccuracy = accuracy == .fullAccuracy || accuracy == .reducedAccuracy
+            completion?([Check("services.location.initialAuthorization",
+                               Thread.isMainThread && knownStatus.contains(status) && knownAccuracy,
+                               "Status \(status.rawValue), accuracy \(accuracy.rawValue), main thread \(Thread.isMainThread)")])
         }
     }
 

@@ -121,8 +121,9 @@ private struct ScreenAppCapabilities {
         hasLandscape = orients.contains { $0.contains("Landscape") }
             || (orients.isEmpty && fallbackOrient.contains("Landscape"))
         hasScene = info["UIApplicationSceneManifest"] != nil
+        let prefersScaledWindow = info["PlayCoverPrefersScaledWindow"] as? Bool ?? false
         isAdaptive = forceShift
-            || ((supportsIPad || supportsDuoAdaptive)
+            || (!prefersScaledWindow && (supportsIPad || supportsDuoAdaptive)
                 && !requiresFullScreen
                 && ((hasPortrait && hasLandscape) || hasScene))
     }
@@ -183,6 +184,7 @@ public class PlayScreen: NSObject {
     private var savedRootAutoresizingMask: UIView.AutoresizingMask?
     private var scaledViews = NSHashTable<UIView>.weakObjects()
     private var scaledWindows = NSHashTable<UIWindow>.weakObjects()
+    private var offscreenWindows = NSHashTable<UIWindow>.weakObjects()
     private var isHostLiveResizing = false
     private var lastDuoLandscapeActive = false
     private weak var cachedPrimaryWindow: UIWindow?
@@ -347,7 +349,7 @@ public class PlayScreen: NSObject {
             return original
         }
         let targetWindow = scene?.windows.first(where: { shared.isEligiblePrimaryWindow($0) })
-            ?? scene?.windows.first(where: { shared.isAppWindow($0) && !$0.isHidden })
+            ?? scene?.windows.first(where: { shared.isAppWindow($0) && !$0.isHidden && !shared.isOffscreenWindow($0) })
             ?? shared.activePrimaryWindow
         let refSize: CGSize
         if let win = targetWindow, win.bounds.width > 1, win.bounds.height > 1 {
@@ -466,8 +468,7 @@ public class PlayScreen: NSObject {
     var activePrimaryWindow: UIWindow? {
         if Thread.isMainThread,
            let cached = cachedPrimaryWindow,
-           !cached.isHidden,
-           cached.alpha > 0.01,
+           isEligiblePrimaryWindow(cached),
            cached.windowScene != nil,
            cached.bounds.width > 1,
            cached.bounds.height > 1 {
@@ -646,8 +647,50 @@ private extension PlayScreen {
         return true
     }
 
+    func viewportReferenceBounds(for window: UIWindow) -> CGRect {
+        var ref = CGRect.null
+        if let s = window.windowScene?.coordinateSpace.bounds, s.width > 1, s.height > 1 {
+            ref = ref.union(s)
+        }
+        if case .scaled(let logicalSize, _, _) = displayMode,
+           logicalSize.width > 1, logicalSize.height > 1 {
+            ref = ref.union(CGRect(origin: .zero, size: logicalSize))
+        }
+        if ref.isNull {
+            if let last = lastAdaptiveBounds, last.width > 1, last.height > 1 {
+                return last
+            }
+            let screenBounds = UIScreen.main.bounds
+            if screenBounds.width > 1, screenBounds.height > 1 {
+                return screenBounds
+            }
+            return initialAdaptiveFallbackBounds()
+        }
+        return ref
+    }
+
+    func isOffscreenFrame(_ frame: CGRect, for window: UIWindow) -> Bool {
+        guard frame.origin.x.isFinite, frame.origin.y.isFinite,
+              frame.size.width.isFinite, frame.size.height.isFinite,
+              !frame.isNull, !frame.isInfinite else {
+            return false
+        }
+        guard frame.width > 1, frame.height > 1 else {
+            return false
+        }
+        let ref = viewportReferenceBounds(for: window)
+        guard !ref.isNull, ref.width > 1, ref.height > 1 else {
+            return false
+        }
+        return !frame.intersects(ref)
+    }
+
+    func isOffscreenWindow(_ window: UIWindow) -> Bool {
+        offscreenWindows.contains(window) || isOffscreenFrame(window.frame, for: window)
+    }
+
     func isEligiblePrimaryWindow(_ window: UIWindow) -> Bool {
-        !window.isHidden && window.alpha > 0.01 && isAppWindow(window)
+        !window.isHidden && window.alpha > 0.01 && isAppWindow(window) && !isOffscreenWindow(window)
     }
 
     func isUnfoldedDuoLandscape(for window: UIWindow) -> Bool {
@@ -768,8 +811,28 @@ private extension PlayScreen {
     func handleWindowSetFrame(_ window: UIWindow, frame: CGRect) -> Bool {
         guard PlaySettings.shared.dynamicWindowMode,
               !isApplyingScaledLayout,
-              case .scaled(let logicalSize, _, _) = displayMode,
               isAppWindow(window) else {
+            return false
+        }
+        if isOffscreenFrame(frame, for: window) {
+            offscreenWindows.add(window)
+            if scaledWindows.contains(window) {
+                scaledWindows.remove(window)
+                if window.transform != .identity {
+                    isApplyingScaledLayout = true
+                    window.transform = .identity
+                    isApplyingScaledLayout = false
+                }
+            }
+            if cachedPrimaryWindow === window {
+                cachedPrimaryWindow = nil
+            }
+            return false
+        }
+        if frame.width > 1, frame.height > 1 {
+            offscreenWindows.remove(window)
+        }
+        guard case .scaled(let logicalSize, _, _) = displayMode else {
             return false
         }
         let container = resolveContainerBounds(for: window, candidate: frame, logicalSize: logicalSize)
@@ -781,7 +844,8 @@ private extension PlayScreen {
         guard PlaySettings.shared.dynamicWindowMode,
               !isApplyingScaledLayout,
               case .scaled(let logicalSize, _, _) = displayMode,
-              isAppWindow(window) else {
+              isAppWindow(window),
+              !isOffscreenWindow(window) else {
             return false
         }
         let container: CGRect
@@ -800,7 +864,8 @@ private extension PlayScreen {
         guard PlaySettings.shared.dynamicWindowMode,
               !isApplyingScaledLayout,
               case .scaled(let logicalSize, _, _) = displayMode,
-              isAppWindow(window) else {
+              isAppWindow(window),
+              !isOffscreenWindow(window) else {
             return
         }
         let container = window.windowScene?.coordinateSpace.bounds
@@ -813,6 +878,7 @@ private extension PlayScreen {
         guard PlaySettings.shared.dynamicWindowMode,
               case .scaled(let logicalSize, _, _) = displayMode,
               isAppWindow(window),
+              !isOffscreenWindow(window),
               subview.superview === window else {
             return
         }
@@ -1466,6 +1532,22 @@ private extension PlayScreen {
                            "Primary \(primary.bounds) / \(primary.transform), "
                                + "overlay \(overlay.bounds) / \(overlay.transform)"))
         }
+        let offscreen = UIWindow(frame: CGRect(x: -10000, y: -10000, width: 320, height: 480))
+        offscreen.windowScene = scene
+        offscreen.windowLevel = .statusBar
+        offscreen.rootViewController = UIViewController()
+        offscreen.isHidden = false
+        defer {
+            offscreen.isHidden = true
+            offscreen.rootViewController = nil
+            offscreen.windowScene = nil
+        }
+        offscreen.layoutIfNeeded()
+        let preservedOffscreen = !offscreen.frame.intersects(scene.coordinateSpace.bounds)
+            && activePrimaryWindow !== offscreen
+        checks.append(("geometry.offscreenWindow.preserved", preservedOffscreen,
+                       "offscreenFrame=\(offscreen.frame), sceneBounds=\(scene.coordinateSpace.bounds), "
+                           + "primaryIsOffscreen=\(activePrimaryWindow === offscreen)"))
         return checks
     }
 
@@ -1594,6 +1676,7 @@ private extension PlayScreen {
     func isAutomationInspectableWindow(_ win: UIWindow) -> Bool {
         if win === EditorController.shared.editorWindow { return false }
         if win.isHidden || win.alpha <= 0.01 { return false }
+        if isOffscreenWindow(win) { return false }
         if win.bounds.width < 4 || win.bounds.height < 4 { return false }
         if win.subviews.isEmpty && win.rootViewController == nil { return false }
         let cls = NSStringFromClass(type(of: win))

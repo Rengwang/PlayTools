@@ -61,7 +61,8 @@ private struct AKAppLayoutInfo {
         hasLandscape = orients.contains { $0.contains("Landscape") }
             || (orients.isEmpty && fallbackOrient.contains("Landscape"))
         hasScene = info["UIApplicationSceneManifest"] != nil
-        isAdaptive = (supportsIPad || supportsDuoAdaptive)
+        let prefersScaledWindow = info["PlayCoverPrefersScaledWindow"] as? Bool ?? false
+        isAdaptive = !prefersScaledWindow && (supportsIPad || supportsDuoAdaptive)
             && !requiresFullScreen
             && ((hasPortrait && hasLandscape) || hasScene)
     }

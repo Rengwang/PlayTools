@@ -128,12 +128,24 @@ void pt_swizzleClassMethod(Class _Nullable cls, SEL origSelector, SEL newSelecto
     return false;
 }
 
+static CGRect (*sOrigFBSSceneSettingsFrame)(id, SEL) = NULL;
+static CGRect (*sOrigFBSSceneSettingsBounds)(id, SEL) = NULL;
+static CGSize (*sOrigFBSDisplayModeSize)(id, SEL) = NULL;
+static NSString *(*sOrigNSStringReplaceRegex)(id, SEL, NSString *, NSString *, NSRegularExpressionOptions, NSRange) = NULL;
+static void (*sOrigCMStartAccelerometer)(id, SEL, NSOperationQueue *, id) = NULL;
+static void (*sOrigCMStartGyro)(id, SEL, NSOperationQueue *, id) = NULL;
+static void (*sOrigCMStartMagnetometer)(id, SEL, NSOperationQueue *, id) = NULL;
+static void (*sOrigCMStartDeviceMotion)(id, SEL, NSOperationQueue *, id) = NULL;
+static void (*sOrigCMStartDeviceMotionRef)(id, SEL, CMAttitudeReferenceFrame, NSOperationQueue *, id) = NULL;
+
 - (CGRect) pt_hook_FBSSceneSettings_frameDefault {
-    return [PlayScreen frameDefault:[self pt_hook_FBSSceneSettings_frameDefault]];
+    CGRect rect = sOrigFBSSceneSettingsFrame ? sOrigFBSSceneSettingsFrame(self, _cmd) : CGRectZero;
+    return [PlayScreen frameDefault:rect];
 }
 
 - (CGRect) pt_hook_FBSSceneSettings_boundsDefault {
-    return [PlayScreen boundsDefault:[self pt_hook_FBSSceneSettings_boundsDefault]];
+    CGRect rect = sOrigFBSSceneSettingsBounds ? sOrigFBSSceneSettingsBounds(self, _cmd) : CGRectZero;
+    return [PlayScreen boundsDefault:rect];
 }
 
 - (CGRect) pt_hook_UIScreen_nativeBoundsDefault {
@@ -141,16 +153,19 @@ void pt_swizzleClassMethod(Class _Nullable cls, SEL origSelector, SEL newSelecto
 }
 
 - (CGSize) pt_hook_FBSDisplayMode_sizeDefault {
-    return [PlayScreen sizeAspectRatioDefault:[self pt_hook_FBSDisplayMode_sizeDefault]];
+    CGSize size = sOrigFBSDisplayModeSize ? sOrigFBSDisplayModeSize(self, _cmd) : CGSizeZero;
+    return [PlayScreen sizeAspectRatioDefault:size];
 }
 
 
 - (CGRect) pt_hook_FBSSceneSettings_frame {
-    return [PlayScreen frame:[self pt_hook_FBSSceneSettings_frame]];
+    CGRect rect = sOrigFBSSceneSettingsFrame ? sOrigFBSSceneSettingsFrame(self, _cmd) : CGRectZero;
+    return [PlayScreen frame:rect];
 }
 
 - (CGRect) pt_hook_FBSSceneSettings_bounds {
-    return [PlayScreen bounds:[self pt_hook_FBSSceneSettings_bounds]];
+    CGRect rect = sOrigFBSSceneSettingsBounds ? sOrigFBSSceneSettingsBounds(self, _cmd) : CGRectZero;
+    return [PlayScreen bounds:rect];
 }
 
 - (CGRect) pt_hook_UIScreen_nativeBounds {
@@ -158,7 +173,8 @@ void pt_swizzleClassMethod(Class _Nullable cls, SEL origSelector, SEL newSelecto
 }
 
 - (CGSize) pt_hook_FBSDisplayMode_size {
-    return [PlayScreen sizeAspectRatio:[self pt_hook_FBSDisplayMode_size]];
+    CGSize size = sOrigFBSDisplayModeSize ? sOrigFBSDisplayModeSize(self, _cmd) : CGSizeZero;
+    return [PlayScreen sizeAspectRatio:size];
 }
 
 
@@ -761,16 +777,17 @@ static BOOL PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
     if ([(NSString*)self isEqualToString:@""]) {
         return @"";
     }
-    return [self pt_hook_NSString_stringByReplacingOccurrencesOfRegularExpressionPattern:pattern
-                                                                withTemplate:template
-                                                                     options:options
-                                                                       range:range];
+    return sOrigNSStringReplaceRegex
+        ? sOrigNSStringReplaceRegex(self, _cmd, pattern, template, options, range)
+        : (NSString *)self;
 }
 
 - (void)pt_hook_AVAudioSession_requestRecordPermission:(void (^)(BOOL))response {
     BOOL granted = [[AVAudioSession sharedInstance] recordPermission] == AVAudioSessionRecordPermissionGranted;
     if (granted) {
-        response(granted);
+        if (response) {
+            response(granted);
+        }
     } else {
         [self pt_hook_AVAudioSession_requestRecordPermission:response];
     }
@@ -778,11 +795,64 @@ static BOOL PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
 
 - (instancetype)pt_hook_CMMotionManager_init {
     CMMotionManager *motionManager = (CMMotionManager *)[self pt_hook_CMMotionManager_init];
-    // The default update interval is 0, which may lead to excessive CPU usage
-    motionManager.accelerometerUpdateInterval = 0.01;
-    motionManager.deviceMotionUpdateInterval = 0.01;
-    motionManager.gyroUpdateInterval = 0.01;
+    if (motionManager) {
+        // The default update interval is 0, which may lead to excessive CPU usage
+        motionManager.accelerometerUpdateInterval = 0.01;
+        motionManager.deviceMotionUpdateInterval = 0.01;
+        motionManager.gyroUpdateInterval = 0.01;
+    }
     return (id)motionManager;
+}
+
+- (void)pt_hook_CMMotionManager_startAccelerometerUpdatesToQueue:(NSOperationQueue *)queue
+                                                     withHandler:(id)handler {
+    if (![(CMMotionManager *)self isAccelerometerAvailable]) {
+        return;
+    }
+    if (sOrigCMStartAccelerometer) {
+        sOrigCMStartAccelerometer(self, _cmd, queue, handler);
+    }
+}
+
+- (void)pt_hook_CMMotionManager_startGyroUpdatesToQueue:(NSOperationQueue *)queue
+                                            withHandler:(id)handler {
+    if (![(CMMotionManager *)self isGyroAvailable]) {
+        return;
+    }
+    if (sOrigCMStartGyro) {
+        sOrigCMStartGyro(self, _cmd, queue, handler);
+    }
+}
+
+- (void)pt_hook_CMMotionManager_startMagnetometerUpdatesToQueue:(NSOperationQueue *)queue
+                                                    withHandler:(id)handler {
+    if (![(CMMotionManager *)self isMagnetometerAvailable]) {
+        return;
+    }
+    if (sOrigCMStartMagnetometer) {
+        sOrigCMStartMagnetometer(self, _cmd, queue, handler);
+    }
+}
+
+- (void)pt_hook_CMMotionManager_startDeviceMotionUpdatesToQueue:(NSOperationQueue *)queue
+                                                    withHandler:(id)handler {
+    if (![(CMMotionManager *)self isDeviceMotionAvailable]) {
+        return;
+    }
+    if (sOrigCMStartDeviceMotion) {
+        sOrigCMStartDeviceMotion(self, _cmd, queue, handler);
+    }
+}
+
+- (void)pt_hook_CMMotionManager_startDeviceMotionUpdatesUsingReferenceFrame:(CMAttitudeReferenceFrame)referenceFrame
+                                                                    toQueue:(NSOperationQueue *)queue
+                                                                withHandler:(id)handler {
+    if (![(CMMotionManager *)self isDeviceMotionAvailable]) {
+        return;
+    }
+    if (sOrigCMStartDeviceMotionRef) {
+        sOrigCMStartDeviceMotionRef(self, _cmd, referenceFrame, queue, handler);
+    }
 }
 
 + (GCMouse *)pt_hook_GCMouse_current {
@@ -805,7 +875,7 @@ static BOOL PTEnsureCustomCollectionViewLayoutHooked(UICollectionViewLayout *lay
 bool menuWasCreated = false;
 - (instancetype)pt_hook_UIMenuBuilder_initWithRootMenu:(id)rootMenu {
     self = [self pt_hook_UIMenuBuilder_initWithRootMenu:rootMenu];
-    if (!menuWasCreated) {
+    if (self && !menuWasCreated) {
         [PlayCover initMenuWithMenu: self];
         menuWasCreated = TRUE;
     }
@@ -871,6 +941,71 @@ static void pt_overrideIdentityGetter(Class target, SEL selector, IMP implementa
     if (getter) {
         class_replaceMethod(target, selector, implementation, method_getTypeEncoding(getter));
     }
+}
+
+static void pt_replaceDirectInstanceMethod(Class targetCls, SEL selector, SEL hookAlias, IMP *outOrigImp) {
+    if (!targetCls) {
+        return;
+    }
+    Method hookMethod = class_getInstanceMethod(PTSwizzleMethods.class, hookAlias);
+    Method origMethod = class_getInstanceMethod(targetCls, selector);
+    if (!hookMethod || !origMethod) {
+        return;
+    }
+    if (strcmp(method_getTypeEncoding(origMethod), method_getTypeEncoding(hookMethod)) != 0) {
+        return;
+    }
+    IMP hookImp = method_getImplementation(hookMethod);
+    IMP origImp = method_getImplementation(origMethod);
+    if (origImp != hookImp) {
+        if (outOrigImp) {
+            *outOrigImp = origImp;
+        }
+        class_replaceMethod(targetCls, selector, hookImp, method_getTypeEncoding(origMethod));
+    }
+}
+
+static void pt_installFBSSceneSettingsFrameAndBoundsSwizzle(SEL frameAlias, SEL boundsAlias) {
+    Class frameCls = nil;
+    if (@available(iOS 17.1, *)) {
+        frameCls = objc_getClass("FBSSceneSettingsCore");
+    }
+    if (!frameCls) {
+        frameCls = objc_getClass("FBSSceneSettings");
+    }
+    pt_replaceDirectInstanceMethod(frameCls, @selector(frame), frameAlias, (IMP *)&sOrigFBSSceneSettingsFrame);
+    pt_replaceDirectInstanceMethod(objc_getClass("FBSSceneSettings"), @selector(bounds), boundsAlias, (IMP *)&sOrigFBSSceneSettingsBounds);
+}
+
+static void pt_installFBSDisplayModeSizeSwizzle(SEL sizeAlias) {
+    pt_replaceDirectInstanceMethod(objc_getClass("FBSDisplayMode"), @selector(size), sizeAlias, (IMP *)&sOrigFBSDisplayModeSize);
+}
+
+static void pt_installCoreMotionGuards(void) {
+    Class cmCls = objc_getClass("CMMotionManager");
+    if (!cmCls) {
+        return;
+    }
+    pt_replaceDirectInstanceMethod(cmCls,
+                                   @selector(startAccelerometerUpdatesToQueue:withHandler:),
+                                   @selector(pt_hook_CMMotionManager_startAccelerometerUpdatesToQueue:withHandler:),
+                                   (IMP *)&sOrigCMStartAccelerometer);
+    pt_replaceDirectInstanceMethod(cmCls,
+                                   @selector(startGyroUpdatesToQueue:withHandler:),
+                                   @selector(pt_hook_CMMotionManager_startGyroUpdatesToQueue:withHandler:),
+                                   (IMP *)&sOrigCMStartGyro);
+    pt_replaceDirectInstanceMethod(cmCls,
+                                   @selector(startMagnetometerUpdatesToQueue:withHandler:),
+                                   @selector(pt_hook_CMMotionManager_startMagnetometerUpdatesToQueue:withHandler:),
+                                   (IMP *)&sOrigCMStartMagnetometer);
+    pt_replaceDirectInstanceMethod(cmCls,
+                                   @selector(startDeviceMotionUpdatesToQueue:withHandler:),
+                                   @selector(pt_hook_CMMotionManager_startDeviceMotionUpdatesToQueue:withHandler:),
+                                   (IMP *)&sOrigCMStartDeviceMotion);
+    pt_replaceDirectInstanceMethod(cmCls,
+                                   @selector(startDeviceMotionUpdatesUsingReferenceFrame:toQueue:withHandler:),
+                                   @selector(pt_hook_CMMotionManager_startDeviceMotionUpdatesUsingReferenceFrame:toQueue:withHandler:),
+                                   (IMP *)&sOrigCMStartDeviceMotionRef);
 }
 
 static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
@@ -943,12 +1078,9 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
             if ([[PlaySettings shared] inverseScreenValues]) {
                 // This lines set External Scene settings and other IOS10 Runtime services by swizzling
                 // In Sonoma 14.1 betas, frame method seems to be moved to FBSSceneSettingsCore
-                if(@available(iOS 17.1, *))
-                    pt_installInstanceSwizzle(objc_getClass("FBSSceneSettingsCore"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frameDefault));
-                else
-                    pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frameDefault));
-                pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(bounds), @selector(pt_hook_FBSSceneSettings_boundsDefault));
-                pt_installInstanceSwizzle(objc_getClass("FBSDisplayMode"), @selector(size), @selector(pt_hook_FBSDisplayMode_sizeDefault));
+                pt_installFBSSceneSettingsFrameAndBoundsSwizzle(@selector(pt_hook_FBSSceneSettings_frameDefault),
+                                                                @selector(pt_hook_FBSSceneSettings_boundsDefault));
+                pt_installFBSDisplayModeSizeSwizzle(@selector(pt_hook_FBSDisplayMode_sizeDefault));
                 
                 // Fixes Apple mess at MacOS 13.2
                 pt_installInstanceSwizzle(objc_getClass("UIDevice"), @selector(orientation), @selector(pt_hook_UIDevice_orientation));
@@ -957,12 +1089,9 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
                 pt_installInstanceSwizzle(objc_getClass("UIScreen"), @selector(scale), @selector(pt_hook_UIScreen_scale));
             } else {
                 // This acutally runs when adaptiveDisplay is normally triggered
-                if(@available(iOS 17.1, *))
-                    pt_installInstanceSwizzle(objc_getClass("FBSSceneSettingsCore"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frame));
-                else
-                    pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frame));
-                pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(bounds), @selector(pt_hook_FBSSceneSettings_bounds));
-                pt_installInstanceSwizzle(objc_getClass("FBSDisplayMode"), @selector(size), @selector(pt_hook_FBSDisplayMode_size));
+                pt_installFBSSceneSettingsFrameAndBoundsSwizzle(@selector(pt_hook_FBSSceneSettings_frame),
+                                                                @selector(pt_hook_FBSSceneSettings_bounds));
+                pt_installFBSDisplayModeSizeSwizzle(@selector(pt_hook_FBSDisplayMode_size));
                 
                 pt_installInstanceSwizzle(objc_getClass("UIDevice"), @selector(orientation), @selector(pt_hook_UIDevice_orientation));
                 pt_installInstanceSwizzle(objc_getClass("UIScreen"), @selector(nativeBounds), @selector(pt_hook_UIScreen_nativeBounds));
@@ -979,12 +1108,9 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
                 [[PlaySettings shared] setValue:@(screenSize.width) forKey:@"windowSizeWidth"];
                 [[PlaySettings shared] setValue:@(screenSize.height) forKey:@"windowSizeHeight"];
                 if (![[PlaySettings shared] inverseScreenValues]) {
-                    if(@available(iOS 17.1, *))
-                        pt_installInstanceSwizzle(objc_getClass("FBSSceneSettingsCore"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frameDefault));
-                    else
-                        pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frameDefault));
-                    pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(bounds), @selector(pt_hook_FBSSceneSettings_boundsDefault));
-                    pt_installInstanceSwizzle(objc_getClass("FBSDisplayMode"), @selector(size), @selector(pt_hook_FBSDisplayMode_sizeDefault));
+                    pt_installFBSSceneSettingsFrameAndBoundsSwizzle(@selector(pt_hook_FBSSceneSettings_frameDefault),
+                                                                    @selector(pt_hook_FBSSceneSettings_boundsDefault));
+                    pt_installFBSDisplayModeSizeSwizzle(@selector(pt_hook_FBSDisplayMode_sizeDefault));
                 }
                 pt_installInstanceSwizzle(objc_getClass("UIDevice"), @selector(orientation), @selector(pt_hook_UIDevice_orientation));
                 pt_installInstanceSwizzle(objc_getClass("UIScreen"), @selector(nativeBounds), @selector(pt_hook_UIScreen_nativeBoundsDefault));
@@ -996,12 +1122,9 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
     } 
     else {
         if ([[PlaySettings shared] adaptiveDisplay]) {
-                if(@available(iOS 17.1, *))
-                    pt_installInstanceSwizzle(objc_getClass("FBSSceneSettingsCore"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frame));
-                else
-                    pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(frame), @selector(pt_hook_FBSSceneSettings_frame));
-                pt_installInstanceSwizzle(objc_getClass("FBSSceneSettings"), @selector(bounds), @selector(pt_hook_FBSSceneSettings_bounds));
-                pt_installInstanceSwizzle(objc_getClass("FBSDisplayMode"), @selector(size), @selector(pt_hook_FBSDisplayMode_size));
+                pt_installFBSSceneSettingsFrameAndBoundsSwizzle(@selector(pt_hook_FBSSceneSettings_frame),
+                                                                @selector(pt_hook_FBSSceneSettings_bounds));
+                pt_installFBSDisplayModeSizeSwizzle(@selector(pt_hook_FBSDisplayMode_size));
             }
     }
     
@@ -1015,13 +1138,15 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
         if (encoding == kCFStringEncodingMacChineseSimp || encoding == kCFStringEncodingMacChineseTrad) {
             SEL origSelector = NSSelectorFromString(@"_stringByReplacingOccurrencesOfRegularExpressionPattern:withTemplate:options:range:");
             SEL newSelector = @selector(pt_hook_NSString_stringByReplacingOccurrencesOfRegularExpressionPattern:withTemplate:options:range:);
-            pt_installInstanceSwizzle(objc_getClass("NSString"), origSelector, newSelector);
+            pt_replaceDirectInstanceMethod(objc_getClass("NSString"), origSelector, newSelector, (IMP *)&sOrigNSStringReplaceRegex);
         }
     }
 
     if ([[PlaySettings shared] checkMicPermissionSync]) {
         pt_installInstanceSwizzle(objc_getClass("AVAudioSession"), @selector(requestRecordPermission:), @selector(pt_hook_AVAudioSession_requestRecordPermission:));
     }
+
+    pt_installCoreMotionGuards();
 
     if ([[PlaySettings shared] limitMotionUpdateFrequency]) {
         pt_installInstanceSwizzle(objc_getClass("CMMotionManager"), @selector(init), @selector(pt_hook_CMMotionManager_init));

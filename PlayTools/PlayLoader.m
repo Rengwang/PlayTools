@@ -51,6 +51,13 @@ _Static_assert(sizeof(struct pt_if_msghdr_prefix) == 4, "pt_if_msghdr_prefix mus
 
 extern uint32_t dyld_get_active_platform(void);
 
+typedef struct {
+    uint32_t platform;
+    uint32_t version;
+} pt_build_version_t;
+
+extern bool _availability_version_check(uint32_t count, const pt_build_version_t versions[]);
+
 static atomic_bool pt_use_native_platform = ATOMIC_VAR_INIT(false);
 
 static BOOL pt_tencentVideoIsOnMacPlatform(id self, SEL cmd) {
@@ -146,7 +153,9 @@ typedef uint32_t (*pt_active_platform_fn)(void);
 typedef void *(*pt_dlsym_fn)(void *, const char *);
 typedef int (*pt_getifaddrs_fn)(struct ifaddrs **);
 typedef void (*pt_freeifaddrs_fn)(struct ifaddrs *);
+typedef bool (*pt_availability_version_check_fn)(uint32_t, const pt_build_version_t []);
 static uint32_t pt_active_platform(void);
+static bool pt_availability_version_check(uint32_t count, const pt_build_version_t versions[]);
 
 // Declare interposes before wrapper bodies so every wrapper can call the
 // dyld-bound original pointer directly from __DATA_CONST,__interpose via
@@ -161,6 +170,72 @@ DYLD_INTERPOSE(pt_CFNetworkCopySystemProxySettings, CFNetworkCopySystemProxySett
 DYLD_INTERPOSE(pt_CFNetworkCopyProxiesForURL, CFNetworkCopyProxiesForURL)
 DYLD_INTERPOSE(pt_getifaddrs, getifaddrs)
 DYLD_INTERPOSE(pt_freeifaddrs, freeifaddrs)
+DYLD_INTERPOSE(pt_availability_version_check, _availability_version_check)
+
+#define PT_MARKETPLACEKIT_PATH "/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit"
+
+static bool pt_caller_weak_links_marketplacekit(const void *caller) {
+    Dl_info info;
+    if (!dladdr(caller, &info) || !info.dli_fbase) {
+        return false;
+    }
+    const struct mach_header_64 *header = info.dli_fbase;
+    if (header->magic != MH_MAGIC_64) {
+        return false;
+    }
+
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    size_t remaining = header->sizeofcmds;
+    for (uint32_t i = 0; i < header->ncmds && remaining >= sizeof(struct load_command); i++) {
+        const struct load_command *command = (const struct load_command *)cursor;
+        if (command->cmdsize < sizeof(*command) || command->cmdsize > remaining || command->cmdsize % 8 != 0) {
+            return false;
+        }
+        if (command->cmd == LC_LOAD_WEAK_DYLIB && command->cmdsize >= sizeof(struct dylib_command)) {
+            const struct dylib_command *dylib = (const struct dylib_command *)command;
+            uint32_t offset = dylib->dylib.name.offset;
+            if (offset >= sizeof(*dylib) && offset <= command->cmdsize
+                && command->cmdsize - offset >= sizeof(PT_MARKETPLACEKIT_PATH)
+                && memcmp(cursor + offset, PT_MARKETPLACEKIT_PATH, sizeof(PT_MARKETPLACEKIT_PATH)) == 0) {
+                return true;
+            }
+        }
+        remaining -= command->cmdsize;
+        cursor += command->cmdsize;
+    }
+    return false;
+}
+
+static bool pt_marketplacekit_loaded(void) {
+    static bool loaded = false;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        void *handle = dlopen(PT_MARKETPLACEKIT_PATH, RTLD_LAZY | RTLD_NOLOAD);
+        if (!handle) {
+            handle = dlopen("/System/iOSSupport" PT_MARKETPLACEKIT_PATH, RTLD_LAZY | RTLD_NOLOAD);
+        }
+        if (handle) {
+            dlclose(handle);
+            loaded = true;
+        }
+    });
+    return loaded;
+}
+
+static bool pt_availability_version_check(uint32_t count, const pt_build_version_t versions[]) {
+    // MarketplaceKit's AppDistributor was introduced in iOS 17.4. Catalyst can
+    // report that version as available even when the weak framework is absent.
+    // Scope the fallback from upstream PlayTools #238 to that specific query.
+    const uint32_t appDistributorVersion = 0x00110400;
+    if (count == 1 && versions && versions[0].platform == PLATFORM_IOS
+        && versions[0].version == appDistributorVersion
+        && DYLD_INTERPOSE_ORIG(pt_active_platform_fn, dyld_get_active_platform)() == PLATFORM_MACCATALYST
+        && !pt_marketplacekit_loaded()
+        && pt_caller_weak_links_marketplacekit(__builtin_return_address(0))) {
+        return false;
+    }
+    return DYLD_INTERPOSE_ORIG(pt_availability_version_check_fn, _availability_version_check)(count, versions);
+}
 
 static void *pt_dlsym(void *handle, const char *symbol) {
     pt_dlsym_fn orig_dlsym = DYLD_INTERPOSE_ORIG(pt_dlsym_fn, dlsym);
@@ -780,12 +855,36 @@ static int pt_patchFirebaseInlineExits(void) {
 
 static IMP pt_origRegisterForRemoteNotifications;
 static os_unfair_lock pt_remoteRegLock = OS_UNFAIR_LOCK_INIT;
-static CFAbsoluteTime pt_lastRemoteRegTime = 0;
+static CFTimeInterval pt_lastRemoteRegTime = 0;
 
-// Rate-limit -[UIApplication registerForRemoteNotifications] so ad-hoc apps without
-// APNs entitlements do not spin in a 200% CPU failure/retry loop (e.g. JPush/TIMPush).
-static void pt_registerForRemoteNotifications(id self, SEL _cmd) {
-    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+static BOOL pt_shouldThrottleRemoteRegistration(void) {
+    static BOOL missingPushEntitlements = NO;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        typedef CFTypeRef (*CreateTask)(CFAllocatorRef);
+        typedef CFDictionaryRef (*CopyEntitlements)(CFTypeRef, CFArrayRef, CFErrorRef *);
+        CreateTask createTask = (CreateTask)dlsym(RTLD_DEFAULT, "SecTaskCreateFromSelf");
+        CopyEntitlements copyEntitlements = (CopyEntitlements)dlsym(RTLD_DEFAULT, "SecTaskCopyValuesForEntitlements");
+        if (!createTask || !copyEntitlements) {
+            return;
+        }
+        CFTypeRef task = createTask(kCFAllocatorDefault);
+        if (!task) {
+            return;
+        }
+        NSArray<NSString *> *keys = @[@"aps-environment", @"com.apple.developer.aps-environment"];
+        CFDictionaryRef entitlements = copyEntitlements(task, (__bridge CFArrayRef)keys, NULL);
+        if (entitlements) {
+            missingPushEntitlements = CFDictionaryGetCount(entitlements) == 0;
+            CFRelease(entitlements);
+        }
+        CFRelease(task);
+    });
+    return missingPushEntitlements;
+}
+
+static BOOL pt_allowUnentitledRemoteRegistration(void) {
+    CFTimeInterval now = CACurrentMediaTime();
     BOOL allow = NO;
     os_unfair_lock_lock(&pt_remoteRegLock);
     if (pt_lastRemoteRegTime == 0 || (now - pt_lastRemoteRegTime) >= 30.0) {
@@ -793,7 +892,15 @@ static void pt_registerForRemoteNotifications(id self, SEL _cmd) {
         allow = YES;
     }
     os_unfair_lock_unlock(&pt_remoteRegLock);
-    if (!allow) return;
+    return allow;
+}
+
+static void pt_registerForRemoteNotifications(id self, SEL _cmd) {
+    // Keep the retry-loop guard for confirmed unentitled processes. UIKit owns
+    // provisioning validation and callbacks whenever the signing state is unknown.
+    if (pt_shouldThrottleRemoteRegistration() && !pt_allowUnentitledRemoteRegistration()) {
+        return;
+    }
     if (pt_origRegisterForRemoteNotifications) {
         ((void (*)(id, SEL))pt_origRegisterForRemoteNotifications)(self, _cmd);
     }
@@ -1222,6 +1329,67 @@ static void pt_scheduleEmptySceneWindowRecoveryForScene(UIWindowScene *scene) {
     });
 }
 
+#if TARGET_OS_MACCATALYST
+static void (*pt_origPresentViewController)(UIViewController *, SEL, UIViewController *, BOOL, void (^)(void));
+static CFTimeInterval pt_startupPresentationDeadline;
+static char pt_deferredPresentationKey;
+
+static UIViewController *pt_attachedStartupPresenter(UIViewController *presenter) {
+    for (UIViewController *candidate = presenter; candidate; candidate = candidate.parentViewController) {
+        UIWindow *window = candidate.viewIfLoaded.window;
+        UIWindowScene *scene = window.windowScene;
+        if (pt_isAppWindow(window) && !window.hidden && window.alpha > 0.01 &&
+            scene.activationState == UISceneActivationStateForegroundActive &&
+            [scene.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) {
+            return candidate;
+        }
+    }
+    return nil;
+}
+
+static void pt_waitForStartupPresenter(UIViewController *presenter, SEL command, UIViewController *destination,
+                                       BOOL animated, void (^completion)(void), CFTimeInterval deadline) {
+    __weak UIViewController *weakPresenter = presenter;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        UIViewController *source = weakPresenter;
+        UIViewController *attached = pt_attachedStartupPresenter(source);
+        if (source && !destination.presentingViewController && CACurrentMediaTime() < deadline) {
+            if (!attached || attached.presentedViewController) {
+                pt_waitForStartupPresenter(source, command, destination, animated, completion, deadline);
+                return;
+            }
+            objc_setAssociatedObject(destination, &pt_deferredPresentationKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            pt_origPresentViewController(attached, command, destination, animated, completion);
+        } else {
+            objc_setAssociatedObject(destination, &pt_deferredPresentationKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
+    });
+}
+
+static void pt_presentViewControllerAtStartup(UIViewController *self, SEL command, UIViewController *destination,
+                                              BOOL animated, void (^completion)(void)) {
+    CFTimeInterval now = CACurrentMediaTime();
+    if (NSThread.isMainThread && destination && now < pt_startupPresentationDeadline) {
+        if (objc_getAssociatedObject(destination, &pt_deferredPresentationKey)) { return; }
+        if (!destination.presentingViewController && !pt_attachedStartupPresenter(self)) {
+            // The app can request a modal before Catalyst attaches its first scene window.
+            objc_setAssociatedObject(destination, &pt_deferredPresentationKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            pt_waitForStartupPresenter(self, command, destination, animated, completion, now + 3.5);
+            return;
+        }
+    }
+    pt_origPresentViewController(self, command, destination, animated, completion);
+}
+
+static void pt_installStartupPresentationGuard(void) {
+    Method method = class_getInstanceMethod(UIViewController.class, @selector(presentViewController:animated:completion:));
+    if (method) {
+        pt_startupPresentationDeadline = CACurrentMediaTime() + 4.0;
+        pt_origPresentViewController = (void *)method_setImplementation(method, (IMP)pt_presentViewControllerAtStartup);
+    }
+}
+#endif
+
 static void pt_installOrphanWindowSceneGuard(void) {
     if (pt_orphanWindowHooksInstalled) {
         return;
@@ -1275,65 +1443,37 @@ static void pt_installOrphanWindowSceneGuard(void) {
 
 static NSURL *(*pt_origContainerURLForGroupIdentifier)(id, SEL, NSString *) = NULL;
 static BOOL pt_appGroupHookInstalled = NO;
-static os_unfair_lock pt_appGroupCacheLock = OS_UNFAIR_LOCK_INIT;
-static NSMutableDictionary<NSString *, NSURL *> *pt_appGroupURLCache = nil;
+
+static BOOL pt_ensureWritableGroupDirectory(NSFileManager *manager, NSURL *url) {
+    if (!url.isFileURL || url.path.length == 0) {
+        return NO;
+    }
+
+    NSString *path = url.path;
+    BOOL isDirectory = NO;
+    if (![manager fileExistsAtPath:path isDirectory:&isDirectory]) {
+        [manager createDirectoryAtURL:url withIntermediateDirectories:YES attributes:nil error:nil];
+        [manager fileExistsAtPath:path isDirectory:&isDirectory];
+    }
+    return isDirectory && access(path.fileSystemRepresentation, W_OK | X_OK) == 0;
+}
 
 static NSURL *pt_containerURLForGroupIdentifier(NSFileManager *self, SEL _cmd, NSString *groupIdentifier) {
     NSURL *origURL = pt_origContainerURLForGroupIdentifier ? pt_origContainerURLForGroupIdentifier(self, _cmd, groupIdentifier) : nil;
-    if (groupIdentifier.length == 0) {
+    if (groupIdentifier.length == 0 || pt_ensureWritableGroupDirectory(self, origURL)) {
         return origURL;
     }
 
-    os_unfair_lock_lock(&pt_appGroupCacheLock);
-    NSURL *cached = pt_appGroupURLCache[groupIdentifier];
-    os_unfair_lock_unlock(&pt_appGroupCacheLock);
-    if (cached) {
-        return cached;
+    // Keep the existing layout for valid identifiers without mapping malformed ones to another group's path.
+    if ([groupIdentifier containsString:@"/"] || [groupIdentifier containsString:@".."] ||
+        [groupIdentifier isEqualToString:@"."] ||
+        [groupIdentifier rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location != NSNotFound) {
+        return nil;
     }
-
-    NSURL *resolvedURL = nil;
-    if (origURL != nil) {
-        const char *fsPath = origURL.path.fileSystemRepresentation;
-        if (fsPath && fsPath[0] != '\0') {
-            if (access(fsPath, W_OK) == 0) {
-                resolvedURL = origURL;
-            } else if ([self createDirectoryAtURL:origURL withIntermediateDirectories:YES attributes:nil error:nil] &&
-                       access(fsPath, W_OK) == 0) {
-                resolvedURL = origURL;
-            }
-        }
-    }
-
-    if (!resolvedURL) {
-        NSString *sanitized = [[groupIdentifier stringByReplacingOccurrencesOfString:@"/" withString:@"_"]
-            stringByReplacingOccurrencesOfString:@".." withString:@"_"];
-        if (sanitized.length == 0) {
-            sanitized = @"default";
-        }
-        NSURL *appSupport = [self URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
-        if (appSupport) {
-            NSURL *fallbackURL = [[appSupport URLByAppendingPathComponent:@"PlayCoverGroupContainers" isDirectory:YES]
-                URLByAppendingPathComponent:sanitized isDirectory:YES];
-            [self createDirectoryAtURL:fallbackURL withIntermediateDirectories:YES attributes:nil error:nil];
-            resolvedURL = fallbackURL;
-        }
-    }
-
-    if (resolvedURL) {
-        os_unfair_lock_lock(&pt_appGroupCacheLock);
-        if (!pt_appGroupURLCache) {
-            pt_appGroupURLCache = [NSMutableDictionary new];
-        }
-        NSURL *existing = pt_appGroupURLCache[groupIdentifier];
-        if (existing) {
-            resolvedURL = existing;
-        } else {
-            pt_appGroupURLCache[groupIdentifier] = resolvedURL;
-        }
-        os_unfair_lock_unlock(&pt_appGroupCacheLock);
-    }
-
-    return resolvedURL;
+    NSURL *appSupport = [self URLsForDirectory:NSApplicationSupportDirectory inDomains:NSUserDomainMask].firstObject;
+    NSURL *fallbackURL = [[appSupport URLByAppendingPathComponent:@"PlayCoverGroupContainers" isDirectory:YES]
+        URLByAppendingPathComponent:groupIdentifier isDirectory:YES];
+    return pt_ensureWritableGroupDirectory(self, fallbackURL) ? fallbackURL : nil;
 }
 
 static void pt_installAppGroupContainerGuard(void) {
@@ -2106,6 +2246,9 @@ static void pt_installUniversalCompatibilityGuards(void) {
 
     pt_installAppGroupContainerGuard();
     pt_installOrphanWindowSceneGuard();
+#if TARGET_OS_MACCATALYST
+    pt_installStartupPresentationGuard();
+#endif
     pt_installNavigationAppearanceBalanceGuard();
     pt_installGlassEffectCompatibilityGuard();
     pt_installFloatingTabBarCapsuleGuard();

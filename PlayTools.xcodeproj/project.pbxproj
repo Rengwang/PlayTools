@@ -48,6 +48,8 @@
 		95D474FB2C0BA77B0072797F /* JoystickElement.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95D474FA2C0BA77B0072797F /* JoystickElement.swift */; };
 		95D474FF2C0BDAB20072797F /* DraggableButtonElement.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95D474FE2C0BDAB20072797F /* DraggableButtonElement.swift */; };
 		AA71970B287A44D200623C15 /* PlayLoader.m in Sources */ = {isa = PBXBuildFile; fileRef = AA719702287A44D200623C15 /* PlayLoader.m */; };
+		F72BBCB236C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm in Sources */ = {isa = PBXBuildFile; fileRef = F72BBCB136C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm */; };
+		F079CA972438413D9615412B /* CameraCompatibility.m in Sources */ = {isa = PBXBuildFile; fileRef = F079CA962438413D9615412B /* CameraCompatibility.m */; };
 		AA71970D287A44D200623C15 /* PlaySettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA719704287A44D200623C15 /* PlaySettings.swift */; };
 		AA71970E287A44D200623C15 /* PlayLoader.h in Headers */ = {isa = PBXBuildFile; fileRef = AA719705287A44D200623C15 /* PlayLoader.h */; };
 		AA71970F287A44D200623C15 /* PlayCover.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA719706287A44D200623C15 /* PlayCover.swift */; };
@@ -148,6 +150,8 @@
 		95D474FE2C0BDAB20072797F /* DraggableButtonElement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraggableButtonElement.swift; sourceTree = "<group>"; };
 		AA7196D8287A447700623C15 /* PlayTools.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = PlayTools.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA719702287A44D200623C15 /* PlayLoader.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = PlayLoader.m; sourceTree = "<group>"; };
+		F72BBCB136C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = CTPocketOutputCompatibility.mm; sourceTree = "<group>"; };
+		F079CA962438413D9615412B /* CameraCompatibility.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CameraCompatibility.m; sourceTree = "<group>"; };
 		AA719704287A44D200623C15 /* PlaySettings.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = PlaySettings.swift; sourceTree = "<group>"; };
 		AA719705287A44D200623C15 /* PlayLoader.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = PlayLoader.h; sourceTree = "<group>"; };
 		AA719706287A44D200623C15 /* PlayCover.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = PlayCover.swift; sourceTree = "<group>"; };
@@ -452,6 +456,8 @@
 				AA719706287A44D200623C15 /* PlayCover.swift */,
 				AA719705287A44D200623C15 /* PlayLoader.h */,
 				AA719702287A44D200623C15 /* PlayLoader.m */,
+				F72BBCB136C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm */,
+				F079CA962438413D9615412B /* CameraCompatibility.m */,
 				AA719708287A44D200623C15 /* PlayTools.h */,
 				2847AE47298EFC0F00B0F983 /* PlayScreen.swift */,
 				F18A5C492ED92A510087610B /* PlayToolsSelfTest.swift */,
@@ -611,6 +617,7 @@
 				AA7196D4287A447700623C15 /* Sources */,
 				AA7196D5287A447700623C15 /* Frameworks */,
 				AA7196D6287A447700623C15 /* Resources */,
+				7F0842A9B91B4014A601C512 /* Build MarketplaceKit compatibility */,
 				6ED6ACAB28AAB30F0040D234 /* SwiftLint */,
 				6E84A14728D0F94E00BF7495 /* Embed Frameworks */,
 			);
@@ -687,6 +694,24 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
+		7F0842A9B91B4014A601C512 /* Build MarketplaceKit compatibility */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Compatibility/MarketplaceKit.swift",
+				"$(SRCROOT)/Compatibility/MarketplaceKit-Info.plist",
+			);
+			name = "Build MarketplaceKit compatibility";
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MarketplaceKitCompatibility/MarketplaceKit.framework/Versions/A/MarketplaceKit",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/MarketplaceKitCompatibility/MarketplaceKit.framework/Versions/A/Resources/Info.plist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "set -euo pipefail\nif [[ \"${EFFECTIVE_PLATFORM_NAME:-}\" != -maccatalyst ]]; then exit 0; fi\nframework=\"${SCRIPT_OUTPUT_FILE_0%/Versions/A/MarketplaceKit}\"\nmkdir -p \"$(dirname \"$SCRIPT_OUTPUT_FILE_1\")\"\ncp \"$SCRIPT_INPUT_FILE_1\" \"$SCRIPT_OUTPUT_FILE_1\"\nln -sfn A \"$framework/Versions/Current\"\nln -sfn Versions/Current/MarketplaceKit \"$framework/MarketplaceKit\"\nln -sfn Versions/Current/Resources \"$framework/Resources\"\nxcrun --sdk macosx swiftc -O -target arm64-apple-ios15.0-macabi -module-name MarketplaceKit -enable-library-evolution -emit-library \"$SCRIPT_INPUT_FILE_0\" -o \"$SCRIPT_OUTPUT_FILE_0\" -Xlinker -install_name -Xlinker @rpath/MarketplaceKit.framework/Versions/A/MarketplaceKit\n/usr/bin/codesign --force --sign - \"$framework\"\n";
+		};
 		6ED6ACAB28AAB30F0040D234 /* SwiftLint */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -762,6 +787,8 @@
 				AA7197AA287A481500623C15 /* Toast.swift in Sources */,
 				AA719789287A480D00623C15 /* PlayInput.swift in Sources */,
 				AA71970B287A44D200623C15 /* PlayLoader.m in Sources */,
+				F72BBCB236C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm in Sources */,
+				F079CA972438413D9615412B /* CameraCompatibility.m in Sources */,
 				9555ED332C058E36006E469C /* DebugController.swift in Sources */,
 				9562D1512AB484C7002C329D /* EventAdapters.swift in Sources */,
 				AA7197AF287A481500623C15 /* KeyCodeNames.swift in Sources */,
