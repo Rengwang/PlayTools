@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import GameController
+import Atomics
 
 // This class is a coordinator (and module entrance), coordinating other concrete classes
 
@@ -12,13 +13,22 @@ class PlayInput {
                                                autoreleaseFrequency: .workItem)
 
     private var displayLink: CADisplayLink?
-    private var isAppActive = true
+    private let appActive = ManagedAtomic(false)
+    private var isAppActive: Bool {
+        get { appActive.load(ordering: .acquiring) }
+        set { appActive.store(newValue, ordering: .releasing) }
+    }
+    private var initialized = false
+
+    var acceptsControllerInput: Bool { isAppActive }
 
     @objc func drainMainDispatchQueue() {
         _dispatch_main_queue_callback_4CF(nil)
     }
 
     func initialize() {
+        guard !initialized else { return }
+        initialized = true
         if PlaySettings.shared.disableBuiltinMouse {
             simulateGCMouseDisconnect()
         }
@@ -26,6 +36,9 @@ class PlayInput {
         guard PlaySettings.shared.keymapping else {
             return
         }
+
+        isAppActive = AKInterface.shared?.isApplicationActive
+            ?? (UIApplication.shared.applicationState == .active)
 
         let centre = NotificationCenter.default
         let main = OperationQueue.main
@@ -40,23 +53,21 @@ class PlayInput {
                 self?.updateDisplayLinkState()
             }
         }
-        centre.addObserver(
-            forName: UIApplication.didBecomeActiveNotification,
-            object: nil,
-            queue: main
-        ) { [weak self] _ in
-            self?.isAppActive = true
-            self?.updateDisplayLinkState()
+        for name in [UIApplication.didBecomeActiveNotification,
+                     NSNotification.Name("NSApplicationDidBecomeActiveNotification")] {
+            centre.addObserver(forName: name, object: nil, queue: main) { [weak self] _ in
+                self?.setAppActive(true)
+            }
         }
         for name in [
             UIApplication.willResignActiveNotification,
             UIApplication.didEnterBackgroundNotification,
+            NSNotification.Name("NSApplicationDidResignActiveNotification"),
             NSNotification.Name("NSApplicationDidHideNotification"),
-            NSNotification.Name("NSWindowDidMiniaturizeNotification")
+            NSNotification.Name("NSApplicationWillTerminateNotification")
         ] {
             centre.addObserver(forName: name, object: nil, queue: main) { [weak self] _ in
-                self?.isAppActive = false
-                self?.updateDisplayLinkState()
+                self?.setAppActive(false)
             }
         }
         updateDisplayLinkState()
@@ -77,23 +88,29 @@ class PlayInput {
         mode.initialize()
     }
 
+    private func setAppActive(_ active: Bool) {
+        // AppKit focus notifications are authoritative on Catalyst, where UIKit
+        // can remain foreground-active even when another Mac app owns focus.
+        let wasActive = isAppActive
+        isAppActive = active && (AKInterface.shared?.isApplicationActive ?? true)
+        if wasActive && !isAppActive {
+            ActionDispatcher.invalidateActions()
+        }
+        updateDisplayLinkState()
+    }
+
     private func updateDisplayLinkState() {
         let hasController = !GCController.controllers().isEmpty
-        if !hasController {
+        if !hasController || !isAppActive {
             displayLink?.invalidate()
             displayLink = nil
             return
         }
-        if isAppActive {
-            if displayLink == nil {
-                // Drain the main dispatch queue per frame while a GCController is active.
-                let link = CADisplayLink(target: self, selector: #selector(drainMainDispatchQueue))
-                link.add(to: .main, forMode: .common)
-                displayLink = link
-            }
-            displayLink?.isPaused = false
-        } else {
-            displayLink?.isPaused = true
+        if displayLink == nil {
+            // Drain the main dispatch queue per frame while a GCController is active.
+            let link = CADisplayLink(target: self, selector: #selector(drainMainDispatchQueue))
+            link.add(to: .main, forMode: .common)
+            displayLink = link
         }
     }
 

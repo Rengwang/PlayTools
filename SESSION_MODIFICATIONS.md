@@ -15,3 +15,9 @@
 
 - `services` 探针覆盖定位服务状态、初始授权代理回调、蓝牙授权状态与 APNs 注册失败回调。iPhone、Duo 和原生平台三种配置各通过 5 项。定位和蓝牙只读取授权状态。无 APNs entitlement 的夹具在主线程收到 `UNErrorDomain (1)`，与未注入 PlayTools 的 Catalyst 对照一致。
 - APNs 重试限流仅用于可确认缺少两种 APNs entitlement 的进程。限流使用单调时钟，已授权或无法确认签名状态的进程由 UIKit 处理。受控测试核对了两种签名键、签名查询失败和无权限重试分支。真实已签名的设备令牌注册待验证。
+
+## 2026-11-23 后台输入与对象生命周期
+
+手柄映射遵循 AppKit 激活状态，失焦时释放触摸并停止辅助显示回调与摇杆轮询。滑动计时器按需创建、弱引用回调并以激活状态取消。`python3 Tests/check-input-lifecycle.py` 验证空闲和活动对象释放、后台零新增分发及恢复。实体手柄的按键行为仍需设备回归。
+
+对照方法、37 项核心自检和实际应用冒烟结果见 [性能与兼容性核查](https://github.com/Rengwang/PlayCover/blob/develop/PERFORMANCE_REVIEW.md)。本轮没有建立普遍降低应用常驻内存或 GPU 功耗的结论。

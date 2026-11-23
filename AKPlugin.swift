@@ -151,6 +151,8 @@ class AKPlugin: NSObject, Plugin {
         primaryWindow?.styleMask.contains(.fullScreen) ?? false
     }
 
+    var isApplicationActive: Bool { NSApplication.shared.isActive }
+
     var cmdPressed: Bool = false
     var cursorHideLevel = 0
     func hideCursor() {
