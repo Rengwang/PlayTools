@@ -49,6 +49,7 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("PlayLoader:WirelessInsightsWeak", loader, "WirelessInsights"),
         ("PlayLoader:WirelessInsightsVersion", loader, "0x001a0000"),
         ("PlayLoader:MarketplaceKitVersion", loader, "0x00110400"),
+        ("PlayLoader:mscWebViewMouseTouchBridge", loader, "pt_installMSCMouseTouchCompatibility"),
         ("Camera:previewOnlyMirroring", camera, "if (!connection.videoPreviewLayer)"),
         ("Swizzle:FacebookBundleInfo", swizzle, "pt_installNSBundleInfoSwizzlesOnce"),
         ("pbxproj:OneNoteSceneCompatibility", pbxproj, "OneNoteSceneCompatibility.m"),
