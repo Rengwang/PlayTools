@@ -1080,12 +1080,19 @@ private extension PlayScreen {
         let matchesScene = sceneBounds.width > 1 && sceneBounds.height > 1
             && abs(subview.frame.width - sceneBounds.width) <= 6
             && abs(subview.frame.height - sceneBounds.height) <= 6
-        let exceedsWindow = subview.frame.width > window.bounds.width + 1
-            || subview.frame.height > window.bounds.height + 1
-            || subview.frame.maxX > window.bounds.width + 1
-            || subview.frame.maxY > window.bounds.height + 1
+        let exceedsFullCanvas = subview.frame.width > window.bounds.width + 1
+            && subview.frame.height > window.bounds.height + 1
 
-        guard isRootHost || matchesScene || exceedsWindow else { return }
+        guard isRootHost || matchesScene || exceedsFullCanvas else {
+            if subview.frame.height >= 0,
+               abs(subview.frame.origin.x) <= 1,
+               subview.frame.width > window.bounds.width + 1 {
+                var clamped = subview.frame
+                clamped.size.width = window.bounds.width
+                subview.frame = clamped
+            }
+            return
+        }
 
         if subview.transform != .identity {
             subview.transform = .identity
@@ -1584,6 +1591,41 @@ private extension PlayScreen {
                                abs(overlay.transform.d - primary.transform.d) <= 0.01,
                            "Primary \(primary.bounds) / \(primary.transform), "
                                + "overlay \(overlay.bounds) / \(overlay.transform)"))
+            do {
+                let statusBar = UIView(
+                    frame: CGRect(x: 0, y: 0, width: overlay.bounds.width + 10, height: 0)
+                )
+                overlay.addSubview(statusBar)
+                defer { statusBar.removeFromSuperview() }
+                clampDirectWindowSubviewIfNeeded(statusBar, in: overlay)
+                let postStatusTarget = resolveHitTarget(for: primaryPoint, primary: primary)
+                let hitAfterStatus = postStatusTarget.window === overlay
+                    && (postStatusTarget.hitView === button
+                        || postStatusTarget.hitView.isDescendant(of: button))
+                let zeroHeightOK = statusBar.frame.height <= 0.5
+                    && statusBar.frame.width <= overlay.bounds.width + 1
+                    && hitAfterStatus
+                checks.append(("geometry.scaled.zeroHeightStatusBarNonBlocking", zeroHeightOK,
+                               "statusBarFrame=\(statusBar.frame), overlayBounds=\(overlay.bounds), "
+                                   + "hit=\(type(of: postStatusTarget.hitView))"))
+            }
+            do {
+                let oversized = UIView(
+                    frame: CGRect(
+                        x: 0,
+                        y: 0,
+                        width: overlay.bounds.width + 20,
+                        height: overlay.bounds.height + 20
+                    )
+                )
+                overlay.addSubview(oversized)
+                defer { oversized.removeFromSuperview() }
+                clampDirectWindowSubviewIfNeeded(oversized, in: overlay)
+                let oversizedOK = abs(oversized.frame.width - overlay.bounds.width) <= 1
+                    && abs(oversized.frame.height - overlay.bounds.height) <= 1
+                checks.append(("geometry.scaled.oversizedFullscreenClamped", oversizedOK,
+                               "oversizedFrame=\(oversized.frame), overlayBounds=\(overlay.bounds)"))
+            }
         }
         let offscreen = UIWindow(frame: CGRect(x: -10000, y: -10000, width: 320, height: 480))
         offscreen.windowScene = scene
