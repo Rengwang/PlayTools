@@ -89,10 +89,17 @@ static void pt_installTencentVideoPhoneNavigation(void) {
 // libc interpose paths (sysctl/sysctlbyname/uname/usleep) avoid ObjC messaging.
 
 static os_unfair_lock pt_settings_cache_lock = OS_UNFAIR_LOCK_INIT;
+#if TARGET_OS_MACCATALYST
+static char pt_cached_device_model_buf[128] = "iPhone17,2";
+static size_t pt_cached_device_model_len = 10;
+static char pt_cached_oem_id_buf[64] = "A3084";
+static size_t pt_cached_oem_id_len = 5;
+#else
 static char pt_cached_device_model_buf[128] = "iPhone19,4";
 static size_t pt_cached_device_model_len = 10;
 static char pt_cached_oem_id_buf[64] = "J320xAP";
 static size_t pt_cached_oem_id_len = 7;
+#endif
 static atomic_bool pt_device_cache_ready = ATOMIC_VAR_INIT(false);
 static atomic_bool pt_block_sleep_cache_ready = ATOMIC_VAR_INIT(false);
 static atomic_bool pt_block_sleep_spamming_val = ATOMIC_VAR_INIT(false);
@@ -2402,6 +2409,110 @@ static void (*pt_origTabBarTraitCollectionDidChange)(id, SEL, UITraitCollection 
 static BOOL pt_floatingTabBarGuardInstalled = NO;
 static const void *kPTFloatingTabBarStyledKey = &kPTFloatingTabBarStyledKey;
 static const void *kPTFloatingTabBarStateKey = &kPTFloatingTabBarStateKey;
+static const void *kPTCustomTabBarHiddenPlattersKey = &kPTCustomTabBarHiddenPlattersKey;
+
+static BOOL pt_isSystemTabBarSubviewClassName(NSString *clsName) {
+    if (clsName.length == 0) {
+        return YES;
+    }
+    return [clsName hasPrefix:@"UI"] ||
+           [clsName hasPrefix:@"_UI"] ||
+           [clsName hasPrefix:@"_Tt"] ||
+           [clsName hasPrefix:@"NS"] ||
+           [clsName hasPrefix:@"CA"];
+}
+
+static BOOL pt_isTabBarPlatterClassName(NSString *clsName) {
+    if (clsName.length == 0) {
+        return NO;
+    }
+    return [clsName containsString:@"_UITabBarItemPlatterView"] ||
+           [clsName containsString:@"_UITabBarPlatterView"] ||
+           [clsName containsString:@"_UILiquidLensView"];
+}
+
+static BOOL pt_isVisuallyEmptyTabBarImage(UIImage *image) {
+    if (!image) {
+        return YES;
+    }
+    CGSize size = image.size;
+    return size.width <= 2.0 && size.height <= 2.0;
+}
+
+static BOOL pt_tabBarItemsAreEmpty(UITabBar *tabBar) {
+    NSArray<UITabBarItem *> *items = tabBar.items;
+    for (UITabBarItem *item in items) {
+        if (item.title.length > 0) {
+            return NO;
+        }
+        if (!pt_isVisuallyEmptyTabBarImage(item.image) ||
+            !pt_isVisuallyEmptyTabBarImage(item.selectedImage)) {
+            return NO;
+        }
+    }
+    return YES;
+}
+
+// On iOS 26/27 Catalyst, _UITabBarVisualProvider_Floating still installs a floating
+// _UITabBarItemPlatterView/_UILiquidLensView selection pill even when an app replaces
+// UITabBar with a full-width custom subview and leaves all native UITabBarItems empty.
+static void pt_updateCustomTabBarPlatterVisibility(UITabBar *tabBar) {
+    CGFloat width = CGRectGetWidth(tabBar.bounds);
+    CGFloat height = CGRectGetHeight(tabBar.bounds);
+    if (width <= 1.0 || height <= 1.0) {
+        return;
+    }
+
+    BOOL hasCustomReplacement = NO;
+    for (UIView *subview in tabBar.subviews) {
+        if (subview.hidden || subview.alpha <= 0.01) {
+            continue;
+        }
+        NSString *clsName = NSStringFromClass([subview class]);
+        if (pt_isSystemTabBarSubviewClassName(clsName)) {
+            continue;
+        }
+        CGRect frame = subview.frame;
+        if (CGRectGetWidth(frame) >= width * 0.75 && CGRectGetHeight(frame) >= 28.0) {
+            hasCustomReplacement = YES;
+            break;
+        }
+    }
+
+    BOOL shouldHidePlatter = hasCustomReplacement && pt_tabBarItemsAreEmpty(tabBar);
+    NSHashTable<UIView *> *hiddenPlatters = objc_getAssociatedObject(tabBar, kPTCustomTabBarHiddenPlattersKey);
+
+    if (shouldHidePlatter) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        for (UIView *subview in tabBar.subviews) {
+            NSString *clsName = NSStringFromClass([subview class]);
+            if (pt_isTabBarPlatterClassName(clsName)) {
+                if (!subview.hidden) {
+                    subview.hidden = YES;
+                }
+                if (!hiddenPlatters) {
+                    hiddenPlatters = [NSHashTable weakObjectsHashTable];
+                    objc_setAssociatedObject(tabBar, kPTCustomTabBarHiddenPlattersKey,
+                                             hiddenPlatters, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
+                [hiddenPlatters addObject:subview];
+            }
+        }
+        [CATransaction commit];
+    } else if (hiddenPlatters.count > 0) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        for (UIView *platter in hiddenPlatters) {
+            if (platter.superview == tabBar && platter.hidden) {
+                platter.hidden = NO;
+            }
+        }
+        objc_setAssociatedObject(tabBar, kPTCustomTabBarHiddenPlattersKey,
+                                 nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        [CATransaction commit];
+    }
+}
 
 typedef struct {
     CGFloat w;
@@ -2498,6 +2609,7 @@ static void pt_tabBarLayoutSubviews(UITabBar *self, SEL _cmd) {
     if (pt_origTabBarLayoutSubviews) {
         pt_origTabBarLayoutSubviews(self, _cmd);
     }
+    pt_updateCustomTabBarPlatterVisibility(self);
     pt_updateFloatingTabBarCapsule(self);
 }
 

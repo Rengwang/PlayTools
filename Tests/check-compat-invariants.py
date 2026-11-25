@@ -34,6 +34,7 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     """Check critical source files, Xcode target membership, and absence of temp traces."""
     pt_dir = root / "PlayTools" / "PlayTools"
     loader = read_text(pt_dir / "PlayLoader.m")
+    settings = read_text(pt_dir / "PlaySettings.swift")
     swizzle = read_text(pt_dir / "Controls" / "PTFakeTouch" / "NSObject+Swizzle.m")
     camera = read_text(pt_dir / "CameraCompatibility.m")
     screen = read_text(pt_dir / "PlayScreen.swift")
@@ -58,6 +59,13 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("PlayLoader:gdtTangramSplash", loader, "showSplashWithOrder:withCustomUI:inContainerView:"),
         ("PlayLoader:miguSplash", loader, "MGPolymerAdSDKLaunchAdRequestSerialization"),
         ("PlayLoader:qlSplashGate", loader, "QLAppLaunchMananger"),
+        ("PlayLoader:customTabBarPlatterGuard", loader, "pt_updateCustomTabBarPlatterVisibility"),
+        ("PlayLoader:customTabBarPlatterClass", loader, "_UITabBarItemPlatterView"),
+        ("PlayLoader:catalystNonDuoDefaultModel", loader, '"iPhone17,2"'),
+        ("PlaySettings:catalystNonDuoEffectiveModel", settings, 'return "iPhone17,2"'),
+        ("PlaySettings:hideTitleBarDefault", settings, "var hideTitleBar = true"),
+        ("PlaySettings:hideTitleBarDecodeDefault", settings, "forKey: .hideTitleBar) ?? true"),
+        ("AKPlugin:hideTitleBarDefault", ak_plugin, "hideTitleBar ?? true"),
         ("Camera:previewOnlyMirroring", camera, "if (!connection.videoPreviewLayer)"),
         ("Swizzle:FacebookBundleInfo", swizzle, "pt_installNSBundleInfoSwizzlesOnce"),
         ("pbxproj:OneNoteSceneCompatibility", pbxproj, "OneNoteSceneCompatibility.m"),
@@ -101,6 +109,9 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("Camera:noTempCamTrace", camera, "PC_CAMTRACE"),
         ("Camera:noBundleIdHardcode", camera, "bundleIdentifier"),
         ("Location:noBundleIdHardcode", location, "bundleIdentifier"),
+        ("PlayLoader:noXhsBundleHardcode", loader, "com.xingin.discover"),
+        ("PlayLoader:noAmapBundleHardcode", loader, "com.autonavi.amap"),
+        ("PlaySettings:noAmapBundleHardcode", settings, "com.autonavi.amap"),
     ]
     for name, content, token in forbidden:
         if token not in content:

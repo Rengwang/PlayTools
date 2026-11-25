@@ -71,9 +71,19 @@ let settings = PlaySettings.shared
 
     private var effectiveDeviceModel: String {
         if effectiveLayoutIdiom == 3 {
+            #if targetEnvironment(macCatalyst)
+            // Mac Catalyst does not provide iPhone Duo's physical hinge or system
+            // vertical bar (UITraitCollection.verticalBarEdge is always .unspecified).
+            // Keep Duo adaptive windowing via layoutIdiom == 3 while reporting a
+            // standard modern iPhone model so iOS 27.1 Duo-aware apps do not move
+            // primary navigation controls into a permanently hidden vertical sidebar.
+            return "iPhone17,2"
+            #else
             return "iPhone19,4"
+            #endif
         }
-        if effectiveLayoutIdiom == 1 && settingsData.iosDeviceModel.hasPrefix("iPad") {
+        if effectiveLayoutIdiom == 1
+            && (settingsData.iosDeviceModel.hasPrefix("iPad") || settingsData.iosDeviceModel == "iPhone19,4") {
             return "iPhone15,3"
         }
         if effectiveLayoutIdiom == 2 && settingsData.iosDeviceModel.hasPrefix("iPhone") {
@@ -82,6 +92,11 @@ let settings = PlaySettings.shared
         if !Self.appSupportsPhone && settingsData.iosDeviceModel.hasPrefix("iPhone") {
             return "iPad13,8"
         }
+        #if targetEnvironment(macCatalyst)
+        if settingsData.iosDeviceModel == "iPhone19,4" {
+            return "iPhone17,2"
+        }
+        #endif
         return settingsData.iosDeviceModel
     }
 
@@ -196,7 +211,7 @@ struct AppSettingsData: Codable {
     var rootWorkDir = true
     var noKMOnInput = false
     var enableScrollWheel = true
-    var hideTitleBar = false
+    var hideTitleBar = true
     var floatingWindow = false
     var checkMicPermissionSync = false
     var limitMotionUpdateFrequency = false
@@ -245,7 +260,7 @@ struct AppSettingsData: Codable {
         rootWorkDir = try container.decodeIfPresent(Bool.self, forKey: .rootWorkDir) ?? true
         noKMOnInput = try container.decodeIfPresent(Bool.self, forKey: .noKMOnInput) ?? false
         enableScrollWheel = try container.decodeIfPresent(Bool.self, forKey: .enableScrollWheel) ?? true
-        hideTitleBar = try container.decodeIfPresent(Bool.self, forKey: .hideTitleBar) ?? false
+        hideTitleBar = try container.decodeIfPresent(Bool.self, forKey: .hideTitleBar) ?? true
         floatingWindow = try container.decodeIfPresent(Bool.self, forKey: .floatingWindow) ?? false
         checkMicPermissionSync = try container.decodeIfPresent(
             Bool.self, forKey: .checkMicPermissionSync) ?? false

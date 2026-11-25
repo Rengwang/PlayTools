@@ -380,7 +380,7 @@ class AKPlugin: NSObject, Plugin {
 
     /// Convenience instance property that exposes the cached static preference.
     private var keymappingSetting: Bool { Self.akAppSettingsData?.keymapping ?? false }
-    private var hideTitleBarSetting: Bool { Self.akAppSettingsData?.hideTitleBar ?? false }
+    private var hideTitleBarSetting: Bool { Self.akAppSettingsData?.hideTitleBar ?? true }
     private var floatingWindowSetting: Bool { Self.akAppSettingsData?.floatingWindow ?? false }
     private var resolutionSetting: Int { Self.akAppSettingsData?.resolution ?? 7 }
     private var layoutIdiomSetting: Int { Self.akAppSettingsData?.layoutIdiom ?? 3 }
