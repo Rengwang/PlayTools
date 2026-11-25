@@ -183,11 +183,33 @@ PT_INTERPOSE_EXPORT int pt_atexit(void (*func)(void));
 DYLD_INTERPOSE(pt_atexit, atexit)
 #endif
 
-#define PT_MARKETPLACEKIT_PATH "/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit"
+typedef struct {
+    uint32_t minVersion;
+    const char *frameworkPath;
+    size_t frameworkPathLen;
+    const char *iosSupportPath;
+    const char *probeSymbol;
+    atomic_bool checked;
+    atomic_bool loaded;
+} pt_weak_ios_framework_t;
 
-static bool pt_caller_weak_links_marketplacekit(const void *caller) {
+#define PT_WEAK_IOS_FRAMEWORK_ENTRY(ver, pathStr, symStr) \
+    { (ver), (pathStr), sizeof(pathStr), "/System/iOSSupport" pathStr, (symStr), ATOMIC_VAR_INIT(false), ATOMIC_VAR_INIT(false) }
+
+static pt_weak_ios_framework_t pt_weak_ios_frameworks[] = {
+    // MarketplaceKit.AppDistributor was introduced in iOS 17.4.
+    PT_WEAK_IOS_FRAMEWORK_ENTRY(0x00110400,
+                                "/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit",
+                                "$s14MarketplaceKit14AppDistributorOMn"),
+    // WirelessInsights.ServicePredictionProvider was introduced in iOS 26.0 (@available(macCatalyst, unavailable)).
+    PT_WEAK_IOS_FRAMEWORK_ENTRY(0x001a0000,
+                                "/System/Library/Frameworks/WirelessInsights.framework/WirelessInsights",
+                                "$s16WirelessInsights25ServicePredictionProviderCMn"),
+};
+
+static bool pt_caller_weak_links_framework(const void *caller, const char *frameworkPath, size_t pathLen) {
     Dl_info info;
-    if (!dladdr(caller, &info) || !info.dli_fbase) {
+    if (!caller || !dladdr(caller, &info) || !info.dli_fbase) {
         return false;
     }
     const struct mach_header_64 *header = info.dli_fbase;
@@ -206,8 +228,8 @@ static bool pt_caller_weak_links_marketplacekit(const void *caller) {
             const struct dylib_command *dylib = (const struct dylib_command *)command;
             uint32_t offset = dylib->dylib.name.offset;
             if (offset >= sizeof(*dylib) && offset <= command->cmdsize
-                && command->cmdsize - offset >= sizeof(PT_MARKETPLACEKIT_PATH)
-                && memcmp(cursor + offset, PT_MARKETPLACEKIT_PATH, sizeof(PT_MARKETPLACEKIT_PATH)) == 0) {
+                && command->cmdsize - offset >= pathLen
+                && memcmp(cursor + offset, frameworkPath, pathLen) == 0) {
                 return true;
             }
         }
@@ -217,35 +239,44 @@ static bool pt_caller_weak_links_marketplacekit(const void *caller) {
     return false;
 }
 
-static bool pt_marketplacekit_loaded(void) {
-    static bool loaded = false;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        void *handle = dlopen(PT_MARKETPLACEKIT_PATH, RTLD_LAZY | RTLD_NOLOAD);
-        if (!handle) {
-            handle = dlopen("/System/iOSSupport" PT_MARKETPLACEKIT_PATH, RTLD_LAZY | RTLD_NOLOAD);
-        }
-        if (handle) {
-            dlclose(handle);
-            loaded = true;
-        } else if (DYLD_INTERPOSE_ORIG(pt_dlsym_fn, dlsym)(RTLD_DEFAULT, "$s14MarketplaceKit14AppDistributorOMn") != NULL) {
-            loaded = true;
-        }
-    });
-    return loaded;
+static bool pt_weak_framework_loaded(pt_weak_ios_framework_t *entry) {
+    if (atomic_load_explicit(&entry->checked, memory_order_acquire)) {
+        return atomic_load_explicit(&entry->loaded, memory_order_relaxed);
+    }
+
+    bool isLoaded = false;
+    void *handle = dlopen(entry->frameworkPath, RTLD_LAZY | RTLD_NOLOAD);
+    if (!handle) {
+        handle = dlopen(entry->iosSupportPath, RTLD_LAZY | RTLD_NOLOAD);
+    }
+    if (handle) {
+        dlclose(handle);
+        isLoaded = true;
+    } else if (entry->probeSymbol &&
+               DYLD_INTERPOSE_ORIG(pt_dlsym_fn, dlsym)(RTLD_DEFAULT, entry->probeSymbol) != NULL) {
+        isLoaded = true;
+    }
+
+    atomic_store_explicit(&entry->loaded, isLoaded, memory_order_relaxed);
+    atomic_store_explicit(&entry->checked, true, memory_order_release);
+    return isLoaded;
 }
 
 PT_INTERPOSE_EXPORT bool pt_availability_version_check(uint32_t count, const pt_build_version_t versions[]) {
-    // MarketplaceKit's AppDistributor was introduced in iOS 17.4. Catalyst can
-    // report that version as available even when the weak framework is absent.
-    // Scope the fallback from upstream PlayTools #238 to that specific query.
-    const uint32_t appDistributorVersion = 0x00110400;
+    // Catalyst can report newer iOS versions as available even when iOS-only weak
+    // frameworks (e.g. MarketplaceKit, WirelessInsights) are absent on the host.
     if (count == 1 && versions && versions[0].platform == PLATFORM_IOS
-        && versions[0].version == appDistributorVersion
-        && DYLD_INTERPOSE_ORIG(pt_active_platform_fn, dyld_get_active_platform)() == PLATFORM_MACCATALYST
-        && !pt_marketplacekit_loaded()
-        && pt_caller_weak_links_marketplacekit(__builtin_return_address(0))) {
-        return false;
+        && DYLD_INTERPOSE_ORIG(pt_active_platform_fn, dyld_get_active_platform)() == PLATFORM_MACCATALYST) {
+        const void *caller = __builtin_return_address(0);
+        const size_t entryCount = sizeof(pt_weak_ios_frameworks) / sizeof(pt_weak_ios_frameworks[0]);
+        for (size_t i = 0; i < entryCount; i++) {
+            pt_weak_ios_framework_t *entry = &pt_weak_ios_frameworks[i];
+            if (versions[0].version == entry->minVersion
+                && !pt_weak_framework_loaded(entry)
+                && pt_caller_weak_links_framework(caller, entry->frameworkPath, entry->frameworkPathLen)) {
+                return false;
+            }
+        }
     }
     return DYLD_INTERPOSE_ORIG(pt_availability_version_check_fn, _availability_version_check)(count, versions);
 }
