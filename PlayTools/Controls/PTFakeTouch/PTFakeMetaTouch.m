@@ -146,6 +146,7 @@ void eventSendCallback(void* info) {
         }
     }
     CFRunLoopSourceSignal(source);
+    CFRunLoopWakeUp(CFRunLoopGetMain());
     // Check on actual phase of touch
     if([touch phase] == UITouchPhaseEnded || [touch phase] == UITouchPhaseCancelled) {
         pointId = -1;

@@ -62,6 +62,7 @@ class PlayInput {
         if PlaySettings.shared.disableBuiltinMouse {
             simulateGCMouseDisconnect()
         }
+        OptionScrollZoomController.shared.initialize()
 
         guard PlaySettings.shared.keymapping else {
             return

@@ -39,6 +39,8 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     camera = read_text(pt_dir / "CameraCompatibility.m")
     screen = read_text(pt_dir / "PlayScreen.swift")
     ak_plugin = read_text(root / "PlayTools" / "AKPlugin.swift")
+    plugin_proto = read_text(root / "PlayTools" / "Plugin.swift")
+    option_zoom = read_text(pt_dir / "Controls" / "OptionScrollZoomController.swift")
     ak_loader = read_text(pt_dir / "Utils" / "AKPluginLoader.swift")
     location = read_text(pt_dir / "LocationCompatibility.m")
     pbxproj = read_text(root / "PlayTools" / "PlayTools.xcodeproj" / "project.pbxproj")
@@ -83,6 +85,14 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("PlayScreen:scaledOversizedSelfTest", screen, "geometry.scaled.oversizedFullscreenClamped"),
         ("AKPlugin:savedWindowFrame", ak_plugin, "PlayCover.SavedWindowFrame.v1"),
         ("AKPluginLoader:preferFrameworkPlugin", ak_loader, "Bundle(for: AKInterface.self)"),
+        ("PlaySettings:optionScrollZoomDefault", settings, "var optionScrollZoom = true"),
+        ("PlaySettings:optionScrollZoomDecodeDefault", settings, "forKey: .optionScrollZoom) ?? true"),
+        ("PlaySettings:optionScrollZoomDict", settings, '"optionScrollZoom": settingsData.optionScrollZoom'),
+        ("Plugin:setupOptionScrollZoom", plugin_proto, "setupOptionScrollZoom"),
+        ("AKPlugin:optionScrollZoomSetting", ak_plugin, "optionScrollZoom ?? true"),
+        ("AKPlugin:setupOptionScrollZoom", ak_plugin, "func setupOptionScrollZoom("),
+        ("OptionScrollZoom:controller", option_zoom, "class OptionScrollZoomController"),
+        ("pbxproj:OptionScrollZoomController", pbxproj, "OptionScrollZoomController.swift"),
     ]
     for name, content, token in required_tokens:
         if token in content:
@@ -112,6 +122,7 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("Camera:noTempCamTrace", camera, "PC_CAMTRACE"),
         ("Camera:noBundleIdHardcode", camera, "bundleIdentifier"),
         ("Location:noBundleIdHardcode", location, "bundleIdentifier"),
+        ("OptionScrollZoom:noBundleIdHardcode", option_zoom, "bundleIdentifier"),
         ("PlayLoader:noXhsBundleHardcode", loader, "com.xingin.discover"),
         ("PlayLoader:noAmapBundleHardcode", loader, "com.autonavi.amap"),
         ("PlaySettings:noAmapBundleHardcode", settings, "com.autonavi.amap"),
@@ -197,6 +208,14 @@ def check_tests(root: Path, failures: list[str], passed: list[str]) -> None:
             passed.append("Test:check-input-lifecycle")
         else:
             failures.append(f"Test:check-input-lifecycle failed: {res.stdout} {res.stderr}")
+
+    option_zoom_test = root / "PlayTools" / "Tests" / "check-option-scroll-zoom.py"
+    if option_zoom_test.is_file():
+        res = subprocess.run([sys.executable, str(option_zoom_test)], capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            passed.append("Test:check-option-scroll-zoom")
+        else:
+            failures.append(f"Test:check-option-scroll-zoom failed: {res.stdout} {res.stderr}")
 
     msc_bridge = root / "PlayTools" / "Tests" / "check-msc-mouse-bridge.py"
     if msc_bridge.is_file():

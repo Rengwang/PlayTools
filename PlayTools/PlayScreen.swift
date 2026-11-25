@@ -529,6 +529,40 @@ public class PlayScreen: NSObject {
         return CGPoint(x: nx * win.bounds.width, y: ny * win.bounds.height)
     }
 
+    func resolveTouchTarget(
+        forNormalizedContentX normalizedX: CGFloat,
+        y normalizedY: CGFloat
+    ) -> (window: UIWindow, point: CGPoint, hitView: UIView)? {
+        guard let primary = activePrimaryWindow,
+              primary.bounds.width >= 1,
+              primary.bounds.height >= 1 else {
+            return nil
+        }
+        let primaryPoint: CGPoint
+        if PlaySettings.shared.dynamicWindowMode {
+            guard let mapped = windowPoint(forNormalizedContentX: normalizedX, y: normalizedY) else {
+                return nil
+            }
+            primaryPoint = mapped
+        } else if let space = primary.windowScene?.coordinateSpace,
+                  space.bounds.width > 1,
+                  space.bounds.height > 1 {
+            let scenePoint = CGPoint(
+                x: space.bounds.minX + normalizedX * space.bounds.width,
+                y: space.bounds.minY + normalizedY * space.bounds.height
+            )
+            let converted = primary.convert(scenePoint, from: space)
+            guard primary.bounds.contains(converted) else { return nil }
+            primaryPoint = converted
+        } else {
+            primaryPoint = CGPoint(
+                x: normalizedX * primary.bounds.width,
+                y: normalizedY * primary.bounds.height
+            )
+        }
+        return resolveHitTarget(for: primaryPoint, primary: primary)
+    }
+
     var keyWindow: UIWindow? { activePrimaryWindow }
     var windowScene: UIWindowScene? { activePrimaryWindow?.windowScene }
     var window: UIWindow? { activePrimaryWindow }

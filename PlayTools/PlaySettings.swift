@@ -139,6 +139,8 @@ let settings = PlaySettings.shared
 
     @objc lazy var enableScrollWheel = settingsData.enableScrollWheel
 
+    @objc lazy var optionScrollZoom = settingsData.optionScrollZoom
+
     @objc lazy var hideTitleBar = settingsData.hideTitleBar
 
     @objc lazy var floatingWindow = settingsData.floatingWindow
@@ -176,6 +178,7 @@ let settings = PlaySettings.shared
     @objc public func akPluginSettingsDictionary() -> NSDictionary {
         return [
             "keymapping": settingsData.keymapping,
+            "optionScrollZoom": settingsData.optionScrollZoom,
             "hideTitleBar": settingsData.hideTitleBar,
             "floatingWindow": settingsData.floatingWindow,
             "resolution": settingsData.resolution,
@@ -211,6 +214,7 @@ struct AppSettingsData: Codable {
     var rootWorkDir = true
     var noKMOnInput = false
     var enableScrollWheel = true
+    var optionScrollZoom = true
     var hideTitleBar = true
     var floatingWindow = false
     var checkMicPermissionSync = false
@@ -260,6 +264,7 @@ struct AppSettingsData: Codable {
         rootWorkDir = try container.decodeIfPresent(Bool.self, forKey: .rootWorkDir) ?? true
         noKMOnInput = try container.decodeIfPresent(Bool.self, forKey: .noKMOnInput) ?? false
         enableScrollWheel = try container.decodeIfPresent(Bool.self, forKey: .enableScrollWheel) ?? true
+        optionScrollZoom = try container.decodeIfPresent(Bool.self, forKey: .optionScrollZoom) ?? true
         hideTitleBar = try container.decodeIfPresent(Bool.self, forKey: .hideTitleBar) ?? true
         floatingWindow = try container.decodeIfPresent(Bool.self, forKey: .floatingWindow) ?? false
         checkMicPermissionSync = try container.decodeIfPresent(

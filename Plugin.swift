@@ -32,6 +32,10 @@ public protocol Plugin: NSObjectProtocol {
     func setupMouseMoved(_ mouseMoved: @escaping (CGFloat, CGFloat) -> Bool)
     func setupMouseButton(left: Bool, right: Bool, _ consumed: @escaping (Int, Bool) -> Bool)
     func setupScrollWheel(_ onMoved: @escaping (CGFloat, CGFloat) -> Bool)
+    @objc optional func setupOptionScrollZoom(
+        _ onZoom: @escaping (CGFloat, CGFloat, CGFloat, Bool) -> Bool,
+        onEnd: @escaping () -> Void
+    )
     func urlForApplicationWithBundleIdentifier(_ value: String) -> URL?
     func setMenuBarVisible(_ value: Bool)
     func applyWindowAspectLock(width: CGFloat, height: CGFloat, minWidth: CGFloat, minHeight: CGFloat)
