@@ -3971,6 +3971,7 @@ void pt_initializePlatformIdentity(void) {
     });
 }
 
+#if TARGET_OS_MACCATALYST
 typedef id (*pt_msc_load_html_fn)(id, SEL, NSString *, NSURL *);
 static pt_msc_load_html_fn pt_origMSCLoadHTML = NULL;
 static NSString *const kPTMSCMouseTouchMarker = @"__ptMscMouseTouchBridgeInstalled";
@@ -3987,6 +3988,15 @@ static NSString *pt_mscMouseTouchBridgeSource(void) {
         @"    if (!pendingDedup) return;\n"
         @"    clearTimeout(pendingDedup.timer);\n"
         @"    pendingDedup = null;\n"
+        @"  }\n"
+        @"  function isMatchingMouseClick(e, dedup) {\n"
+        @"    if (!e || !e.isTrusted || !dedup) return false;\n"
+        @"    if (e.button !== 0 || !(e.detail > 0)) return false;\n"
+        @"    if (e.pointerType !== 'mouse') return false;\n"
+        @"    if (typeof e.pointerId !== 'number' || e.pointerId !== dedup.pointerId) return false;\n"
+        @"    var dt = dedup.target;\n"
+        @"    var et = e.target;\n"
+        @"    return et === dt || (dt && dt.contains && dt.contains(et)) || (et && et.contains && et.contains(dt));\n"
         @"  }\n"
         @"  function makeTouch(target, id, src) {\n"
         @"    try {\n"
@@ -4077,19 +4087,16 @@ static NSString *pt_mscMouseTouchBridgeSource(void) {
         @"    var endAllowed = dispatchTouch('touchend', cur.target, [], t);\n"
         @"    if (cur.prevented || !endAllowed) {\n"
         @"      clearPendingDedup();\n"
-        @"      pendingDedup = { target: cur.target, timer: setTimeout(clearPendingDedup, 0) };\n"
+        @"      pendingDedup = { pointerId: cur.pointerId, target: cur.target, timer: setTimeout(clearPendingDedup, 0) };\n"
         @"    }\n"
         @"  }, true);\n"
         @"  window.addEventListener('click', function(e) {\n"
-        @"    if (!pendingDedup || !e.isTrusted) return;\n"
-        @"    var dt = pendingDedup.target;\n"
-        @"    var et = e.target;\n"
-        @"    if (et === dt || (dt && dt.contains && dt.contains(et)) || (et && et.contains && et.contains(dt))) {\n"
-        @"      e.preventDefault();\n"
-        @"      e.stopPropagation();\n"
-        @"      clearPendingDedup();\n"
-        @"    }\n"
+        @"    if (!isMatchingMouseClick(e, pendingDedup)) return;\n"
+        @"    e.preventDefault();\n"
+        @"    e.stopPropagation();\n"
+        @"    clearPendingDedup();\n"
         @"  }, true);\n"
+        @"  window.addEventListener('keydown', clearPendingDedup, true);\n"
         @"  window.addEventListener('pointercancel', function(e) {\n"
         @"    if (active && e.isTrusted && e.pointerType === 'mouse' && e.pointerId === active.pointerId) {\n"
         @"      cancelActive();\n"
@@ -4168,6 +4175,7 @@ static void pt_installMSCMouseTouchCompatibility(void) {
         }
     });
 }
+#endif
 
 @implementation PlayLoader
 
@@ -4184,7 +4192,9 @@ static void __attribute__((constructor)) initialize(void) {
     // Install CloudKit entitlement guard synchronously before any background startup queue runs.
     pt_installCloudKitCompatibilityHooks();
     pt_installUniversalCompatibilityGuards();
+#if TARGET_OS_MACCATALYST
     pt_installMSCMouseTouchCompatibility();
+#endif
     [PlayCover launch];
     
     if (ue_status == 0) {

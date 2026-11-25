@@ -132,11 +132,23 @@ def check_installed_invariants(root: Path, failures: list[str], passed: list[str
         ("MachO:WirelessInsights", "$s16WirelessInsights25ServicePredictionProviderCMn"),
         ("MachO:HorizonPreview", "videoRotationAngleForHorizonLevelPreview"),
         ("MachO:VideoMirrored", "setVideoMirrored:"),
+        ("MachO:MSCMouseTouchBridge", "__ptMscMouseTouchBridgeInstalled"),
     ]:
         if needle in macho_strings:
             passed.append(s_name)
         else:
             failures.append(f"{s_name}: missing compiled string '{needle}'")
+
+    ios_slice = (
+        root / "PlayCover" / "Carthage" / "Build" / "PlayTools.xcframework"
+        / "ios-arm64" / "PlayTools.framework" / "PlayTools"
+    )
+    if ios_slice.is_file():
+        ios_st = subprocess.run(["strings", str(ios_slice)], capture_output=True, text=True, errors="ignore", check=False)
+        if "__ptMscMouseTouchBridgeInstalled" in ios_st.stdout or "pt_installMSCMouseTouchCompatibility" in ios_st.stdout:
+            failures.append("XCFramework:iosSliceExcludesMSCBridge: unexpected MSC mouse-touch bridge found in ios-arm64 slice")
+        else:
+            passed.append("XCFramework:iosSliceExcludesMSCBridge")
 
 
 def check_tests(root: Path, failures: list[str], passed: list[str]) -> None:
@@ -148,6 +160,14 @@ def check_tests(root: Path, failures: list[str], passed: list[str]) -> None:
             passed.append("Test:check-input-lifecycle")
         else:
             failures.append(f"Test:check-input-lifecycle failed: {res.stdout} {res.stderr}")
+
+    msc_bridge = root / "PlayTools" / "Tests" / "check-msc-mouse-bridge.py"
+    if msc_bridge.is_file():
+        res = subprocess.run([sys.executable, str(msc_bridge)], capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            passed.append("Test:check-msc-mouse-bridge")
+        else:
+            failures.append(f"Test:check-msc-mouse-bridge failed: {res.stdout} {res.stderr}")
 
     routing = root / "build" / "diagnostics" / "installed-compat" / "camera" / "cross-app" / "test-routing"
     if routing.is_file() and os.access(routing, os.X_OK):
