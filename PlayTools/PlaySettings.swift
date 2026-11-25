@@ -153,6 +153,9 @@ let settings = PlaySettings.shared
 
     @objc lazy var spoofPowerState = settingsData.spoofPowerState
     @objc lazy var blockSplashAds = settingsData.blockSplashAds
+    @objc lazy var mockLocationEnabled = settingsData.mockLocationEnabled
+    @objc lazy var mockLocationLatitude = settingsData.mockLocationLatitude
+    @objc lazy var mockLocationLongitude = settingsData.mockLocationLongitude
 }
 
 struct AppSettingsData: Codable {
@@ -197,6 +200,9 @@ struct AppSettingsData: Codable {
     var cameraBackMirror = -1
     var spoofPowerState = false
     var blockSplashAds = true
+    var mockLocationEnabled = false
+    var mockLocationLatitude: Double = 39.9042
+    var mockLocationLongitude: Double = 116.4074
 
     init() {}
 
@@ -250,5 +256,8 @@ struct AppSettingsData: Codable {
         cameraBackMirror = try container.decodeIfPresent(Int.self, forKey: .cameraBackMirror) ?? -1
         spoofPowerState = try container.decodeIfPresent(Bool.self, forKey: .spoofPowerState) ?? false
         blockSplashAds = try container.decodeIfPresent(Bool.self, forKey: .blockSplashAds) ?? true
+        mockLocationEnabled = try container.decodeIfPresent(Bool.self, forKey: .mockLocationEnabled) ?? false
+        mockLocationLatitude = try container.decodeIfPresent(Double.self, forKey: .mockLocationLatitude) ?? 39.9042
+        mockLocationLongitude = try container.decodeIfPresent(Double.self, forKey: .mockLocationLongitude) ?? 116.4074
     }
 }

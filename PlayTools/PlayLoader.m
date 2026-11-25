@@ -4177,6 +4177,10 @@ static void pt_installMSCMouseTouchCompatibility(void) {
 }
 #endif
 
+#if TARGET_OS_MACCATALYST
+__attribute__((visibility("hidden"))) void pt_installLocationCompatibility(void);
+#endif
+
 @implementation PlayLoader
 
 + (void)load {
@@ -4194,6 +4198,7 @@ static void __attribute__((constructor)) initialize(void) {
     pt_installUniversalCompatibilityGuards();
 #if TARGET_OS_MACCATALYST
     pt_installMSCMouseTouchCompatibility();
+    pt_installLocationCompatibility();
 #endif
     [PlayCover launch];
     

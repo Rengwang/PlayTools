@@ -1,0 +1,197 @@
+//
+//  LocationCompatibility.m
+//  PlayTools
+//
+
+#import <Foundation/Foundation.h>
+#import <CoreLocation/CoreLocation.h>
+#import <objc/runtime.h>
+#import <PlayTools/PlayTools-Swift.h>
+
+#if TARGET_OS_MACCATALYST
+
+static const void *kPTLocationTimerKey = &kPTLocationTimerKey;
+static NSHashTable *pt_activeManagers = nil;
+static NSLock *pt_managersLock = nil;
+
+@interface PTLocationTimerBox : NSObject
+@property (nonatomic, strong) dispatch_source_t timer;
+@end
+
+@implementation PTLocationTimerBox
+- (void)invalidate {
+    if (_timer) {
+        dispatch_source_cancel(_timer);
+        _timer = nil;
+    }
+}
+- (void)dealloc {
+    [self invalidate];
+}
+@end
+
+static CLLocation *pt_currentMockLocation(void) {
+    CLLocationCoordinate2D coord = CLLocationCoordinate2DMake(
+        PlaySettings.shared.mockLocationLatitude,
+        PlaySettings.shared.mockLocationLongitude
+    );
+    return [[CLLocation alloc] initWithCoordinate:coord
+                                         altitude:30.0
+                               horizontalAccuracy:5.0
+                                 verticalAccuracy:5.0
+                                           course:-1.0
+                                            speed:0.0
+                                        timestamp:[NSDate date]];
+}
+
+static void pt_deliverLocationToManager(CLLocationManager *manager) {
+    if (!manager) { return; }
+    id<CLLocationManagerDelegate> delegate = manager.delegate;
+    if (!delegate) { return; }
+    CLLocation *loc = pt_currentMockLocation();
+    if ([delegate respondsToSelector:@selector(locationManager:didUpdateLocations:)]) {
+        [delegate locationManager:manager didUpdateLocations:@[loc]];
+    } else {
+        SEL legacySel = NSSelectorFromString(@"locationManager:didUpdateToLocation:fromLocation:");
+        if ([delegate respondsToSelector:legacySel]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            typedef void (*pt_legacy_loc_fn)(id, SEL, CLLocationManager *, CLLocation *, CLLocation *);
+            ((pt_legacy_loc_fn)[(NSObject *)delegate methodForSelector:legacySel])(delegate, legacySel, manager, loc, loc);
+#pragma clang diagnostic pop
+        }
+    }
+}
+
+static void pt_deliverAuthorizedToManager(CLLocationManager *manager) {
+    if (!manager) { return; }
+    id<CLLocationManagerDelegate> delegate = manager.delegate;
+    if (!delegate) { return; }
+    if (@available(iOS 14.0, *)) {
+        if ([delegate respondsToSelector:@selector(locationManagerDidChangeAuthorization:)]) {
+            [delegate locationManagerDidChangeAuthorization:manager];
+            return;
+        }
+    }
+    if ([delegate respondsToSelector:@selector(locationManager:didChangeAuthorizationStatus:)]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        [delegate locationManager:manager didChangeAuthorizationStatus:kCLAuthorizationStatusAuthorizedAlways];
+#pragma clang diagnostic pop
+    }
+}
+
+static BOOL pt_clLocationServicesEnabled(id self, SEL _cmd) {
+    return YES;
+}
+
+static CLAuthorizationStatus pt_clClassAuthStatus(id self, SEL _cmd) {
+    return kCLAuthorizationStatusAuthorizedAlways;
+}
+
+static CLAuthorizationStatus pt_clInstanceAuthStatus(CLLocationManager *self, SEL _cmd) {
+    return kCLAuthorizationStatusAuthorizedAlways;
+}
+
+static CLAccuracyAuthorization pt_clAccuracyAuth(CLLocationManager *self, SEL _cmd) {
+    return CLAccuracyAuthorizationFullAccuracy;
+}
+
+static CLLocation *pt_clLocation(CLLocationManager *self, SEL _cmd) {
+    return pt_currentMockLocation();
+}
+
+static void pt_clRequestAuth(CLLocationManager *self, SEL _cmd) {
+    __weak CLLocationManager *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        pt_deliverAuthorizedToManager(weakSelf);
+    });
+}
+
+static void pt_clRequestLocation(CLLocationManager *self, SEL _cmd) {
+    __weak CLLocationManager *weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CLLocationManager *strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+        pt_deliverAuthorizedToManager(strongSelf);
+        pt_deliverLocationToManager(strongSelf);
+    });
+}
+
+static void pt_clStartUpdatingLocation(CLLocationManager *self, SEL _cmd) {
+    [pt_managersLock lock];
+    [pt_activeManagers addObject:self];
+    [pt_managersLock unlock];
+
+    PTLocationTimerBox *existing = objc_getAssociatedObject(self, kPTLocationTimerKey);
+    [existing invalidate];
+
+    PTLocationTimerBox *box = [[PTLocationTimerBox alloc] init];
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+    __weak CLLocationManager *weakSelf = self;
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                              3 * NSEC_PER_SEC,
+                              250 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(timer, ^{
+        CLLocationManager *strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+        pt_deliverLocationToManager(strongSelf);
+    });
+    box.timer = timer;
+    objc_setAssociatedObject(self, kPTLocationTimerKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    dispatch_resume(timer);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CLLocationManager *strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+        pt_deliverAuthorizedToManager(strongSelf);
+    });
+}
+
+static void pt_clStopUpdatingLocation(CLLocationManager *self, SEL _cmd) {
+    PTLocationTimerBox *box = objc_getAssociatedObject(self, kPTLocationTimerKey);
+    [box invalidate];
+    objc_setAssociatedObject(self, kPTLocationTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static void pt_replaceInstanceMethod(Class cls, SEL sel, IMP imp, const char *fallbackTypes) {
+    Method m = class_getInstanceMethod(cls, sel);
+    const char *types = m ? method_getTypeEncoding(m) : fallbackTypes;
+    class_replaceMethod(cls, sel, imp, types);
+}
+
+static void pt_replaceClassMethod(Class cls, SEL sel, IMP imp, const char *fallbackTypes) {
+    Class meta = object_getClass(cls);
+    Method m = class_getClassMethod(cls, sel);
+    const char *types = m ? method_getTypeEncoding(m) : fallbackTypes;
+    class_replaceMethod(meta, sel, imp, types);
+}
+
+__attribute__((visibility("hidden")))
+void pt_installLocationCompatibility(void) {
+    if (!PlaySettings.shared.mockLocationEnabled) {
+        return;
+    }
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        pt_activeManagers = [NSHashTable weakObjectsHashTable];
+        pt_managersLock = [[NSLock alloc] init];
+
+        Class cls = [CLLocationManager class];
+        if (!cls) { return; }
+
+        pt_replaceClassMethod(cls, @selector(locationServicesEnabled), (IMP)pt_clLocationServicesEnabled, "B@:");
+        pt_replaceClassMethod(cls, @selector(authorizationStatus), (IMP)pt_clClassAuthStatus, "i@:");
+        pt_replaceInstanceMethod(cls, @selector(authorizationStatus), (IMP)pt_clInstanceAuthStatus, "i@:");
+        pt_replaceInstanceMethod(cls, @selector(accuracyAuthorization), (IMP)pt_clAccuracyAuth, "q@:");
+        pt_replaceInstanceMethod(cls, @selector(location), (IMP)pt_clLocation, "@@:");
+        pt_replaceInstanceMethod(cls, @selector(requestWhenInUseAuthorization), (IMP)pt_clRequestAuth, "v@:");
+        pt_replaceInstanceMethod(cls, @selector(requestAlwaysAuthorization), (IMP)pt_clRequestAuth, "v@:");
+        pt_replaceInstanceMethod(cls, @selector(requestLocation), (IMP)pt_clRequestLocation, "v@:");
+        pt_replaceInstanceMethod(cls, @selector(startUpdatingLocation), (IMP)pt_clStartUpdatingLocation, "v@:");
+        pt_replaceInstanceMethod(cls, @selector(stopUpdatingLocation), (IMP)pt_clStopUpdatingLocation, "v@:");
+    });
+}
+
+#endif
