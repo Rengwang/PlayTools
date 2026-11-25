@@ -11,8 +11,12 @@ static BOOL (*pt_nativePickerAvailability)(id, SEL, UIImagePickerControllerCamer
 static void (*pt_nativeSetPickerCameraDevice)(UIImagePickerController *, SEL, UIImagePickerControllerCameraDevice);
 static AVCaptureDevice *(*pt_nativeTypedCamera)(id, SEL, AVCaptureDeviceType, AVMediaType, AVCaptureDevicePosition);
 static AVCaptureDeviceDiscoverySession *(*pt_nativeCameraDiscovery)(id, SEL, NSArray *, AVMediaType, AVCaptureDevicePosition);
+static NSArray<AVCaptureDevice *> *(*pt_nativeDiscoveryDevices)(AVCaptureDeviceDiscoverySession *, SEL);
+static id (*pt_nativeInitDeviceInput)(AVCaptureDeviceInput *, SEL, AVCaptureDevice *, NSError **);
 static void (*pt_nativeCameraOrientation)(AVCaptureConnection *, SEL, AVCaptureVideoOrientation);
 static void (*pt_nativeCameraAngle)(AVCaptureConnection *, SEL, CGFloat);
+static void (*pt_nativeSetVideoMirrored)(AVCaptureConnection *, SEL, BOOL);
+static void (*pt_nativeSetAutoMirroring)(AVCaptureConnection *, SEL, BOOL);
 static void (*pt_nativeStartCameraSession)(AVCaptureSession *, SEL);
 static void (*pt_nativeCommitCameraConfiguration)(AVCaptureSession *, SEL);
 static id (*pt_nativePreviewInitWithSession)(AVCaptureVideoPreviewLayer *, SEL, AVCaptureSession *);
@@ -21,9 +25,23 @@ static CGFloat (*pt_nativeHorizonPreviewAngle)(AVCaptureDeviceRotationCoordinato
 static CGFloat (*pt_nativeHorizonCaptureAngle)(AVCaptureDeviceRotationCoordinator *, SEL) API_AVAILABLE(macCatalyst(17.0));
 static __thread NSUInteger pt_nativePickerCheckDepth;
 static __thread BOOL pt_applyingCameraAngle;
+static __thread BOOL pt_applyingCameraMirror;
+static const void *pt_devicePendingRoleKey = &pt_devicePendingRoleKey;
+static const void *pt_discoveryRoleKey = &pt_discoveryRoleKey;
+static const void *pt_inputRoleKey = &pt_inputRoleKey;
 
 // The settings are shared with PlayCover. An explicit angle overrides the app's orientation.
 static const NSInteger pt_automaticCameraRotation = -1;
+static const NSInteger pt_automaticCameraMirror = -1;
+
+static void pt_recordPendingRole(AVCaptureDevice *device, AVCaptureDevicePosition position) {
+    if (!device) { return; }
+    if (position == AVCaptureDevicePositionBack || position == AVCaptureDevicePositionFront) {
+        objc_setAssociatedObject(device, pt_devicePendingRoleKey, @(position), OBJC_ASSOCIATION_RETAIN);
+    } else {
+        objc_setAssociatedObject(device, pt_devicePendingRoleKey, nil, OBJC_ASSOCIATION_RETAIN);
+    }
+}
 
 static BOOL pt_callNativePicker(id self, SEL command, UIImagePickerControllerCameraDevice device) {
     pt_nativePickerCheckDepth++;
@@ -96,40 +114,85 @@ static void pt_setPickerCameraDevice(UIImagePickerController *self, SEL command,
 static AVCaptureDevice *pt_selectCamera(id self, SEL command, AVCaptureDeviceType type,
                                        AVMediaType media, AVCaptureDevicePosition position) {
     AVCaptureDevice *requested = pt_nativeTypedCamera(self, command, type, media, position);
-    if (pt_nativePickerCheckDepth > 0 || position != AVCaptureDevicePositionBack ||
-        ![media isEqualToString:AVMediaTypeVideo] || ![type isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera] ||
-        (pt_usableCamera(requested) && pt_hasNativeRearCamera())) {
-        return requested;
+    AVCaptureDevice *chosen = requested;
+    if (!(pt_nativePickerCheckDepth > 0 || position != AVCaptureDevicePositionBack ||
+          ![media isEqualToString:AVMediaTypeVideo] || ![type isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera] ||
+          (pt_usableCamera(requested) && pt_hasNativeRearCamera()))) {
+        AVCaptureDevice *front = pt_findLocalFrontCamera();
+        if (front) { chosen = front; }
     }
-
-    AVCaptureDevice *front = pt_findLocalFrontCamera();
-    return front ?: requested;
+    if (pt_nativePickerCheckDepth == 0 && [media isEqualToString:AVMediaTypeVideo]) {
+        pt_recordPendingRole(chosen, position);
+    }
+    return chosen;
 }
 
 static AVCaptureDeviceDiscoverySession *pt_discoverCameras(id self, SEL command, NSArray *types, AVMediaType media,
                                                           AVCaptureDevicePosition position) {
     AVCaptureDeviceDiscoverySession *requested = pt_nativeCameraDiscovery(self, command, types, media, position);
-    if (pt_nativePickerCheckDepth > 0 || position != AVCaptureDevicePositionBack || ![media isEqualToString:AVMediaTypeVideo] ||
-        ![types containsObject:AVCaptureDeviceTypeBuiltInWideAngleCamera]) {
-        return requested;
-    }
-    if (pt_hasNativeRearCamera()) {
-        for (AVCaptureDevice *device in requested.devices) {
-            if (pt_usableCamera(device)) { return requested; }
+    AVCaptureDeviceDiscoverySession *result = requested;
+    if (!(pt_nativePickerCheckDepth > 0 || position != AVCaptureDevicePositionBack || ![media isEqualToString:AVMediaTypeVideo] ||
+          ![types containsObject:AVCaptureDeviceTypeBuiltInWideAngleCamera])) {
+        BOOL keepRequested = NO;
+        if (pt_hasNativeRearCamera()) {
+            for (AVCaptureDevice *device in requested.devices) {
+                if (pt_usableCamera(device)) {
+                    keepRequested = YES;
+                    break;
+                }
+            }
+        }
+        if (!keepRequested && pt_cameraAccessCanBeRequested()) {
+            AVCaptureDeviceDiscoverySession *front = pt_nativeCameraDiscovery(self, command,
+                @[AVCaptureDeviceTypeBuiltInWideAngleCamera], media, AVCaptureDevicePositionFront);
+            BOOL hasFront = NO;
+            for (AVCaptureDevice *device in front.devices) {
+                if (pt_localFrontCamera(device)) {
+                    hasFront = YES;
+                }
+            }
+            if (hasFront) {
+                // Report the actual front-facing device, including its true position and capabilities.
+                result = front;
+            }
         }
     }
-    if (!pt_cameraAccessCanBeRequested()) { return requested; }
+    if (pt_nativePickerCheckDepth == 0 && [media isEqualToString:AVMediaTypeVideo] && result) {
+        id roleValue = (position == AVCaptureDevicePositionBack || position == AVCaptureDevicePositionFront)
+            ? @(position) : nil;
+        objc_setAssociatedObject(result, pt_discoveryRoleKey, roleValue, OBJC_ASSOCIATION_RETAIN);
+        for (AVCaptureDevice *device in pt_nativeDiscoveryDevices ? pt_nativeDiscoveryDevices(result, @selector(devices)) : result.devices) {
+            pt_recordPendingRole(device, position);
+        }
+    }
+    return result;
+}
 
-    AVCaptureDeviceDiscoverySession *front = pt_nativeCameraDiscovery(self, command,
-        @[AVCaptureDeviceTypeBuiltInWideAngleCamera], media, AVCaptureDevicePositionFront);
-    BOOL hasFront = NO;
-    for (AVCaptureDevice *device in front.devices) {
-        if (pt_localFrontCamera(device)) {
-            hasFront = YES;
+static NSArray<AVCaptureDevice *> *pt_discoveryDevices(AVCaptureDeviceDiscoverySession *self, SEL command) {
+    NSArray<AVCaptureDevice *> *devices = pt_nativeDiscoveryDevices(self, command);
+    NSNumber *roleNum = objc_getAssociatedObject(self, pt_discoveryRoleKey);
+    if (roleNum) {
+        AVCaptureDevicePosition role = (AVCaptureDevicePosition)roleNum.integerValue;
+        if (role == AVCaptureDevicePositionBack || role == AVCaptureDevicePositionFront) {
+            for (AVCaptureDevice *device in devices) {
+                pt_recordPendingRole(device, role);
+            }
         }
     }
-    // Report the actual front-facing device, including its true position and capabilities.
-    return hasFront ? front : requested;
+    return devices;
+}
+
+static id pt_initDeviceInput(AVCaptureDeviceInput *self, SEL command, AVCaptureDevice *device, NSError **error) {
+    id input = pt_nativeInitDeviceInput(self, command, device, error);
+    if (input && [device hasMediaType:AVMediaTypeVideo]) {
+        NSNumber *roleNum = objc_getAssociatedObject(device, pt_devicePendingRoleKey);
+        objc_setAssociatedObject(device, pt_devicePendingRoleKey, nil, OBJC_ASSOCIATION_RETAIN);
+        AVCaptureDevicePosition role = roleNum ? (AVCaptureDevicePosition)roleNum.integerValue : device.position;
+        if (role == AVCaptureDevicePositionBack || role == AVCaptureDevicePositionFront) {
+            objc_setAssociatedObject(input, pt_inputRoleKey, @(role), OBJC_ASSOCIATION_RETAIN);
+        }
+    }
+    return input;
 }
 
 static AVCaptureDevice *pt_videoDeviceForConnection(AVCaptureConnection *connection) {
@@ -139,6 +202,17 @@ static AVCaptureDevice *pt_videoDeviceForConnection(AVCaptureConnection *connect
         }
     }
     return nil;
+}
+
+static AVCaptureDevicePosition pt_requestedCameraRoleForConnection(AVCaptureConnection *connection) {
+    for (AVCaptureInputPort *port in connection.inputPorts) {
+        if ([port.mediaType isEqualToString:AVMediaTypeVideo] && [port.input isKindOfClass:AVCaptureDeviceInput.class]) {
+            AVCaptureDeviceInput *input = (AVCaptureDeviceInput *)port.input;
+            NSNumber *roleNum = objc_getAssociatedObject(input, pt_inputRoleKey);
+            return roleNum ? (AVCaptureDevicePosition)roleNum.integerValue : input.device.position;
+        }
+    }
+    return AVCaptureDevicePositionUnspecified;
 }
 
 API_AVAILABLE(macCatalyst(17.0))
@@ -189,6 +263,34 @@ static BOOL pt_applyCameraRotation(AVCaptureConnection *connection) {
     return NO;
 }
 
+static BOOL pt_applyCameraMirroring(AVCaptureConnection *connection) {
+    if (pt_applyingCameraMirror || !pt_nativeSetVideoMirrored || !connection) { return NO; }
+    if (!connection.videoPreviewLayer) { return NO; }
+    AVCaptureDevicePosition role = pt_requestedCameraRoleForConnection(connection);
+    NSInteger setting = pt_automaticCameraMirror;
+    if (role == AVCaptureDevicePositionFront) {
+        setting = PlaySettings.shared.cameraFrontMirror;
+    } else if (role == AVCaptureDevicePositionBack) {
+        setting = PlaySettings.shared.cameraBackMirror;
+    }
+    if (setting != 0 && setting != 1) { return NO; }
+    if (![connection isVideoMirroringSupported]) { return NO; }
+
+    BOOL wantMirrored = (setting == 1);
+    pt_applyingCameraMirror = YES;
+    @try {
+        if (pt_nativeSetAutoMirroring && connection.automaticallyAdjustsVideoMirroring) {
+            pt_nativeSetAutoMirroring(connection, @selector(setAutomaticallyAdjustsVideoMirroring:), NO);
+        }
+        if (connection.isVideoMirrored != wantMirrored) {
+            pt_nativeSetVideoMirrored(connection, @selector(setVideoMirrored:), wantMirrored);
+        }
+    } @finally {
+        pt_applyingCameraMirror = NO;
+    }
+    return YES;
+}
+
 static void pt_setCameraOrientation(AVCaptureConnection *connection, SEL command, AVCaptureVideoOrientation requested) {
     if (!pt_applyCameraRotation(connection)) { pt_nativeCameraOrientation(connection, command, requested); }
 }
@@ -197,9 +299,20 @@ static void pt_setCameraAngle(AVCaptureConnection *connection, SEL command, CGFl
     if (!pt_applyCameraRotation(connection)) { pt_nativeCameraAngle(connection, command, requested); }
 }
 
+static void pt_setCameraMirrored(AVCaptureConnection *connection, SEL command, BOOL mirrored) {
+    if (!pt_applyCameraMirroring(connection)) { pt_nativeSetVideoMirrored(connection, command, mirrored); }
+}
+
+static void pt_setCameraAutoMirroring(AVCaptureConnection *connection, SEL command, BOOL autoAdjusts) {
+    if (!pt_applyCameraMirroring(connection) && pt_nativeSetAutoMirroring) {
+        pt_nativeSetAutoMirroring(connection, command, autoAdjusts);
+    }
+}
+
 static void pt_applySessionRotations(AVCaptureSession *session) {
     for (AVCaptureConnection *connection in session.connections) {
         pt_applyCameraRotation(connection);
+        pt_applyCameraMirroring(connection);
     }
 }
 
@@ -216,14 +329,18 @@ static void pt_commitCameraConfiguration(AVCaptureSession *session, SEL command)
 static id pt_previewInitWithSession(AVCaptureVideoPreviewLayer *layer, SEL command, AVCaptureSession *session) {
     id result = pt_nativePreviewInitWithSession(layer, command, session);
     if ([result isKindOfClass:AVCaptureVideoPreviewLayer.class]) {
-        pt_applyCameraRotation(((AVCaptureVideoPreviewLayer *)result).connection);
+        AVCaptureConnection *conn = ((AVCaptureVideoPreviewLayer *)result).connection;
+        pt_applyCameraRotation(conn);
+        pt_applyCameraMirroring(conn);
     }
     return result;
 }
 
 static void pt_previewSetSession(AVCaptureVideoPreviewLayer *layer, SEL command, AVCaptureSession *session) {
     pt_nativePreviewSetSession(layer, command, session);
-    pt_applyCameraRotation(layer.connection);
+    AVCaptureConnection *conn = layer.connection;
+    pt_applyCameraRotation(conn);
+    pt_applyCameraMirroring(conn);
 }
 
 __attribute__((constructor))
@@ -240,6 +357,21 @@ static void pt_installCameraCompatibility(void) {
                        pt_nativeTypedCamera, pt_selectCamera);
         PT_CAMERA_HOOK(AVCaptureDeviceDiscoverySession, Class, discoverySessionWithDeviceTypes:mediaType:position:,
                        pt_nativeCameraDiscovery, pt_discoverCameras);
+        PT_CAMERA_HOOK(AVCaptureDeviceDiscoverySession, Instance, devices,
+                       pt_nativeDiscoveryDevices, pt_discoveryDevices);
+        PT_CAMERA_HOOK(AVCaptureDeviceInput, Instance, initWithDevice:error:,
+                       pt_nativeInitDeviceInput, pt_initDeviceInput);
+        PT_CAMERA_HOOK(AVCaptureConnection, Instance, setVideoMirrored:,
+                       pt_nativeSetVideoMirrored, pt_setCameraMirrored);
+        PT_CAMERA_HOOK(AVCaptureConnection, Instance, setAutomaticallyAdjustsVideoMirroring:,
+                       pt_nativeSetAutoMirroring, pt_setCameraAutoMirroring);
+        PT_CAMERA_HOOK(AVCaptureSession, Instance, startRunning, pt_nativeStartCameraSession, pt_startCameraSession);
+        PT_CAMERA_HOOK(AVCaptureSession, Instance, commitConfiguration,
+                       pt_nativeCommitCameraConfiguration, pt_commitCameraConfiguration);
+        PT_CAMERA_HOOK(AVCaptureVideoPreviewLayer, Instance, initWithSession:,
+                       pt_nativePreviewInitWithSession, pt_previewInitWithSession);
+        PT_CAMERA_HOOK(AVCaptureVideoPreviewLayer, Instance, setSession:,
+                       pt_nativePreviewSetSession, pt_previewSetSession);
         if (@available(macCatalyst 17.0, *)) {
             PT_CAMERA_HOOK(AVCaptureDeviceRotationCoordinator, Instance, videoRotationAngleForHorizonLevelPreview,
                            pt_nativeHorizonPreviewAngle, pt_horizonPreviewAngle);
@@ -248,13 +380,6 @@ static void pt_installCameraCompatibility(void) {
             PT_CAMERA_HOOK(AVCaptureConnection, Instance, setVideoRotationAngle:, pt_nativeCameraAngle, pt_setCameraAngle);
             PT_CAMERA_HOOK(AVCaptureConnection, Instance, setVideoOrientation:,
                            pt_nativeCameraOrientation, pt_setCameraOrientation);
-            PT_CAMERA_HOOK(AVCaptureSession, Instance, startRunning, pt_nativeStartCameraSession, pt_startCameraSession);
-            PT_CAMERA_HOOK(AVCaptureSession, Instance, commitConfiguration,
-                           pt_nativeCommitCameraConfiguration, pt_commitCameraConfiguration);
-            PT_CAMERA_HOOK(AVCaptureVideoPreviewLayer, Instance, initWithSession:,
-                           pt_nativePreviewInitWithSession, pt_previewInitWithSession);
-            PT_CAMERA_HOOK(AVCaptureVideoPreviewLayer, Instance, setSession:,
-                           pt_nativePreviewSetSession, pt_previewSetSession);
         }
         if (pt_nativeTypedCamera) {
             PT_CAMERA_HOOK(UIImagePickerController, Class, isCameraDeviceAvailable:,

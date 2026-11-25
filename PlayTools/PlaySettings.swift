@@ -148,6 +148,8 @@ let settings = PlaySettings.shared
 
     @objc lazy var useNativePlatform = settingsData.useNativePlatform
     @objc lazy var cameraRotation = settingsData.cameraRotation
+    @objc lazy var cameraFrontMirror = settingsData.cameraFrontMirror
+    @objc lazy var cameraBackMirror = settingsData.cameraBackMirror
 
     @objc lazy var spoofPowerState = settingsData.spoofPowerState
     @objc lazy var blockSplashAds = settingsData.blockSplashAds
@@ -191,6 +193,8 @@ struct AppSettingsData: Codable {
     var sdkShift = false
     var useNativePlatform = false
     var cameraRotation = -1
+    var cameraFrontMirror = -1
+    var cameraBackMirror = -1
     var spoofPowerState = false
     var blockSplashAds = true
 
@@ -242,6 +246,8 @@ struct AppSettingsData: Codable {
         sdkShift = try container.decodeIfPresent(Bool.self, forKey: .sdkShift) ?? false
         useNativePlatform = try container.decodeIfPresent(Bool.self, forKey: .useNativePlatform) ?? false
         cameraRotation = try container.decodeIfPresent(Int.self, forKey: .cameraRotation) ?? -1
+        cameraFrontMirror = try container.decodeIfPresent(Int.self, forKey: .cameraFrontMirror) ?? -1
+        cameraBackMirror = try container.decodeIfPresent(Int.self, forKey: .cameraBackMirror) ?? -1
         spoofPowerState = try container.decodeIfPresent(Bool.self, forKey: .spoofPowerState) ?? false
         blockSplashAds = try container.decodeIfPresent(Bool.self, forKey: .blockSplashAds) ?? true
     }
