@@ -43,6 +43,7 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     option_zoom = read_text(pt_dir / "Controls" / "OptionScrollZoomController.swift")
     ak_loader = read_text(pt_dir / "Utils" / "AKPluginLoader.swift")
     location = read_text(pt_dir / "LocationCompatibility.m")
+    duo_vbar = read_text(pt_dir / "DuoVerticalBarCompatibility.m")
     pbxproj = read_text(root / "PlayTools" / "PlayTools.xcodeproj" / "project.pbxproj")
 
     required_tokens = [
@@ -66,8 +67,18 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("PlayLoader:qlSplashGate", loader, "QLAppLaunchMananger"),
         ("PlayLoader:customTabBarPlatterGuard", loader, "pt_updateCustomTabBarPlatterVisibility"),
         ("PlayLoader:customTabBarPlatterClass", loader, "_UITabBarItemPlatterView"),
-        ("PlayLoader:catalystNonDuoDefaultModel", loader, '"iPhone17,2"'),
-        ("PlaySettings:catalystNonDuoEffectiveModel", settings, 'return "iPhone17,2"'),
+        ("PlayLoader:duoDefaultModel", loader, 'pt_cached_device_model_buf[128] = "iPhone19,4"'),
+        ("PlaySettings:duoEffectiveModel", settings, 'return "iPhone19,4"'),
+        ("PlaySettings:duoVerticalBarDefault", settings, "var duoVerticalBar = false"),
+        ("PlaySettings:duoVerticalBarDecodeDefault", settings, "forKey: .duoVerticalBar) ?? false"),
+        ("PlayLoader:duoVerticalBarCompatibility", loader, "pt_installDuoVerticalBarCompatibility"),
+        ("DuoVerticalBar:enableGate", duo_vbar, "PTShouldEnableDuoVerticalBar"),
+        ("DuoVerticalBar:hostView", duo_vbar, "PTDuoVerticalBarHostView"),
+        ("DuoVerticalBar:layoutRegionGuide", duo_vbar, "layoutGuideForLayoutRegion:"),
+        ("DuoVerticalBar:preferredBehavior", duo_vbar, "preferredVerticalBarBehavior"),
+        ("DuoVerticalBar:navBarDedup", duo_vbar, "PTDuoClassifyNavBarSuppression"),
+        ("DuoVerticalBar:navInsetCollapse", duo_vbar, "_edgeInsetsForChildViewController:insetsAreAbsolute:"),
+        ("pbxproj:DuoVerticalBarCompatibility", pbxproj, "DuoVerticalBarCompatibility.m"),
         ("PlaySettings:hideTitleBarDefault", settings, "var hideTitleBar = true"),
         ("PlaySettings:hideTitleBarDecodeDefault", settings, "forKey: .hideTitleBar) ?? true"),
         ("AKPlugin:hideTitleBarDefault", ak_plugin, "hideTitleBar ?? true"),
@@ -110,6 +121,11 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     else:
         passed.append("Location:sourceFileExists")
 
+    if not (pt_dir / "DuoVerticalBarCompatibility.m").is_file():
+        failures.append("DuoVerticalBar: DuoVerticalBarCompatibility.m missing")
+    else:
+        passed.append("DuoVerticalBar:sourceFileExists")
+
     # Ensure App Group path resolves under Library/PlayCoverGroupContainers (space-free), not Library/Application Support
     if 'URLByAppendingPathComponent:@"PlayCoverGroupContainers"' in loader and "NSLibraryDirectory" in loader:
         passed.append("PlayLoader:libraryGroupContainersRoot")
@@ -122,7 +138,9 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("Camera:noTempCamTrace", camera, "PC_CAMTRACE"),
         ("Camera:noBundleIdHardcode", camera, "bundleIdentifier"),
         ("Location:noBundleIdHardcode", location, "bundleIdentifier"),
+        ("DuoVerticalBar:noBundleIdHardcode", duo_vbar, "bundleIdentifier"),
         ("OptionScrollZoom:noBundleIdHardcode", option_zoom, "bundleIdentifier"),
+        ("PlayLoader:noAJXSidebarDuoGuard", loader, "pt_installAJXSidebarDuoGuard"),
         ("PlayLoader:noXhsBundleHardcode", loader, "com.xingin.discover"),
         ("PlayLoader:noAmapBundleHardcode", loader, "com.autonavi.amap"),
         ("PlaySettings:noAmapBundleHardcode", settings, "com.autonavi.amap"),
@@ -177,6 +195,7 @@ def check_installed_invariants(root: Path, failures: list[str], passed: list[str
         ("MachO:VideoMirrored", "setVideoMirrored:"),
         ("MachO:MSCMouseTouchBridge", "__ptMscMouseTouchBridgeInstalled"),
         ("MachO:LocationCompat", "PTLocationTimerBox"),
+        ("MachO:DuoVerticalBar", "PTDuoVerticalBarHostView"),
     ]:
         if needle in macho_strings:
             passed.append(s_name)
@@ -197,6 +216,10 @@ def check_installed_invariants(root: Path, failures: list[str], passed: list[str
             failures.append("XCFramework:iosSliceExcludesLocationCompat: unexpected LocationCompatibility found in ios-arm64 slice")
         else:
             passed.append("XCFramework:iosSliceExcludesLocationCompat")
+        if "PTDuoVerticalBarHostView" in ios_st.stdout or "pt_installDuoVerticalBarCompatibility" in ios_st.stdout:
+            failures.append("XCFramework:iosSliceExcludesDuoVerticalBar: unexpected DuoVerticalBarCompatibility found in ios-arm64 slice")
+        else:
+            passed.append("XCFramework:iosSliceExcludesDuoVerticalBar")
 
 
 def check_tests(root: Path, failures: list[str], passed: list[str]) -> None:
@@ -224,6 +247,14 @@ def check_tests(root: Path, failures: list[str], passed: list[str]) -> None:
             passed.append("Test:check-msc-mouse-bridge")
         else:
             failures.append(f"Test:check-msc-mouse-bridge failed: {res.stdout} {res.stderr}")
+
+    duo_vbar_test = root / "PlayTools" / "Tests" / "check-duo-vertical-bar.py"
+    if duo_vbar_test.is_file():
+        res = subprocess.run([sys.executable, str(duo_vbar_test)], capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            passed.append("Test:check-duo-vertical-bar")
+        else:
+            failures.append(f"Test:check-duo-vertical-bar failed: {res.stdout} {res.stderr}")
 
     routing = root / "build" / "diagnostics" / "installed-compat" / "camera" / "cross-app" / "test-routing"
     if routing.is_file() and os.access(routing, os.X_OK):

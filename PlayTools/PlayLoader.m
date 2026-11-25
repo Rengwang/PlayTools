@@ -89,17 +89,10 @@ static void pt_installTencentVideoPhoneNavigation(void) {
 // libc interpose paths (sysctl/sysctlbyname/uname/usleep) avoid ObjC messaging.
 
 static os_unfair_lock pt_settings_cache_lock = OS_UNFAIR_LOCK_INIT;
-#if TARGET_OS_MACCATALYST
-static char pt_cached_device_model_buf[128] = "iPhone17,2";
-static size_t pt_cached_device_model_len = 10;
-static char pt_cached_oem_id_buf[64] = "A3084";
-static size_t pt_cached_oem_id_len = 5;
-#else
 static char pt_cached_device_model_buf[128] = "iPhone19,4";
 static size_t pt_cached_device_model_len = 10;
 static char pt_cached_oem_id_buf[64] = "J320xAP";
 static size_t pt_cached_oem_id_len = 7;
-#endif
 static atomic_bool pt_device_cache_ready = ATOMIC_VAR_INIT(false);
 static atomic_bool pt_block_sleep_cache_ready = ATOMIC_VAR_INIT(false);
 static atomic_bool pt_block_sleep_spamming_val = ATOMIC_VAR_INIT(false);
@@ -4424,6 +4417,7 @@ static void pt_installMSCMouseTouchCompatibility(void) {
 
 #if TARGET_OS_MACCATALYST
 __attribute__((visibility("hidden"))) void pt_installLocationCompatibility(void);
+__attribute__((visibility("hidden"))) void pt_installDuoVerticalBarCompatibility(void);
 #endif
 
 @implementation PlayLoader
@@ -4444,6 +4438,7 @@ static void __attribute__((constructor)) initialize(void) {
 #if TARGET_OS_MACCATALYST
     pt_installMSCMouseTouchCompatibility();
     pt_installLocationCompatibility();
+    pt_installDuoVerticalBarCompatibility();
 #endif
     [PlayCover launch];
     

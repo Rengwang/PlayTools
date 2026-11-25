@@ -71,16 +71,7 @@ let settings = PlaySettings.shared
 
     private var effectiveDeviceModel: String {
         if effectiveLayoutIdiom == 3 {
-            #if targetEnvironment(macCatalyst)
-            // Mac Catalyst does not provide iPhone Duo's physical hinge or system
-            // vertical bar (UITraitCollection.verticalBarEdge is always .unspecified).
-            // Keep Duo adaptive windowing via layoutIdiom == 3 while reporting a
-            // standard modern iPhone model so iOS 27.1 Duo-aware apps do not move
-            // primary navigation controls into a permanently hidden vertical sidebar.
-            return "iPhone17,2"
-            #else
             return "iPhone19,4"
-            #endif
         }
         if effectiveLayoutIdiom == 1
             && (settingsData.iosDeviceModel.hasPrefix("iPad") || settingsData.iosDeviceModel == "iPhone19,4") {
@@ -92,11 +83,6 @@ let settings = PlaySettings.shared
         if !Self.appSupportsPhone && settingsData.iosDeviceModel.hasPrefix("iPhone") {
             return "iPad13,8"
         }
-        #if targetEnvironment(macCatalyst)
-        if settingsData.iosDeviceModel == "iPhone19,4" {
-            return "iPhone17,2"
-        }
-        #endif
         return settingsData.iosDeviceModel
     }
 
@@ -161,6 +147,12 @@ let settings = PlaySettings.shared
 
     @objc lazy var layoutIdiom = effectiveLayoutIdiom
 
+    @objc lazy var duoVerticalBar = settingsData.duoVerticalBar
+
+    @objc var shouldEnableDuoVerticalBar: Bool {
+        effectiveLayoutIdiom == 3 && settingsData.duoVerticalBar
+    }
+
     @objc lazy var sdkShift = settingsData.sdkShift
 
     @objc lazy var useNativePlatform = settingsData.useNativePlatform
@@ -186,6 +178,7 @@ let settings = PlaySettings.shared
             "resizableAspectRatioWidth": settingsData.resizableAspectRatioWidth,
             "resizableAspectRatioHeight": settingsData.resizableAspectRatioHeight,
             "layoutIdiom": settingsData.layoutIdiom,
+            "duoVerticalBar": settingsData.duoVerticalBar,
             "sdkShift": settingsData.sdkShift
         ]
     }
@@ -227,6 +220,7 @@ struct AppSettingsData: Codable {
     var ignoreUnityKeyboardInitializationError = false
     var uiScale: Double = 1.0
     var layoutIdiom: Int = 3
+    var duoVerticalBar = false
     var sdkShift = false
     var useNativePlatform = false
     var cameraRotation = -1
@@ -284,6 +278,7 @@ struct AppSettingsData: Codable {
         let decodedUIScale = try container.decodeIfPresent(Double.self, forKey: .uiScale) ?? 1.0
         uiScale = decodedUIScale <= 0.0 ? 1.0 : decodedUIScale
         layoutIdiom = try container.decodeIfPresent(Int.self, forKey: .layoutIdiom) ?? 3
+        duoVerticalBar = try container.decodeIfPresent(Bool.self, forKey: .duoVerticalBar) ?? false
         sdkShift = try container.decodeIfPresent(Bool.self, forKey: .sdkShift) ?? false
         useNativePlatform = try container.decodeIfPresent(Bool.self, forKey: .useNativePlatform) ?? false
         cameraRotation = try container.decodeIfPresent(Int.self, forKey: .cameraRotation) ?? -1

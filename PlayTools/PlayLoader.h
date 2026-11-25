@@ -16,6 +16,7 @@
 __attribute__((visibility("hidden"))) void pt_initializePlatformIdentity(void);
 void pt_setPlayScreenScaledMode(BOOL isScaled);
 BOOL pt_isPlayScreenScaledMode(void);
+BOOL PTShouldEnableDuoVerticalBar(void);
 
 @interface PlayLoader : NSObject
 
