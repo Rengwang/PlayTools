@@ -88,9 +88,12 @@ private struct AKAppLayoutInfo {
 }
 
 class AKPlugin: NSObject, Plugin {
+    private static let savedFrameDefaultsKey = "PlayCover.SavedWindowFrame.v1"
+
     private let layoutInfo = AKAppLayoutInfo()
     private let configuredWindows = NSHashTable<NSWindow>.weakObjects()
     private let verifiedTargetWindows = NSHashTable<NSWindow>.weakObjects()
+    private var isRestoringSavedFrame = false
 
     required override init() {
         super.init()
@@ -119,6 +122,29 @@ class AKPlugin: NSObject, Plugin {
             center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notif in
                 guard let win = notif.object as? NSWindow else { return }
                 self?.configureWindowIfNeeded(win)
+            }
+        }
+
+        for name in [
+            NSWindow.didEndLiveResizeNotification,
+            NSWindow.didMoveNotification,
+            NSWindow.willCloseNotification
+        ] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notif in
+                guard let win = notif.object as? NSWindow else { return }
+                self?.saveWindowFrameIfAppropriate(win)
+            }
+        }
+
+        center.addObserver(forName: NSWindow.didResizeNotification, object: nil, queue: .main) { [weak self] notif in
+            guard let win = notif.object as? NSWindow, !win.inLiveResize else { return }
+            self?.saveWindowFrameIfAppropriate(win)
+        }
+
+        center.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            guard let self else { return }
+            for win in self.configuredWindows.allObjects {
+                self.saveWindowFrameIfAppropriate(win)
             }
         }
     }
@@ -527,6 +553,63 @@ private extension AKPlugin {
     }
 
     func applyInitialSizing(_ win: NSWindow) {
+        let env = ProcessInfo.processInfo.environment
+        let isAutomatedRun = env["PLAYTOOLS_AUTOMATION"] == "1"
+            || !(env["PLAYCOVER_TARGET_SCREEN"] ?? "").isEmpty
+
+        if !isAutomatedRun,
+           (resolutionSetting == 7 || resolutionSetting == 6),
+           let saved = loadSavedWindowFrame(),
+           saved.resolution == resolutionSetting {
+            let target = screenForSavedFrame(saved.frame)
+                ?? win.screen ?? NSScreen.main ?? NSScreen.screens.first
+            let visible = target?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
+            let titleOverhead = estimatedTitleOverhead(win)
+            let maxW = max(240, floor(visible.width - 24))
+            let maxH = max(240, floor(visible.height - titleOverhead - 20))
+
+            isRestoringSavedFrame = true
+            defer { isRestoringSavedFrame = false }
+
+            if resolutionSetting == 7 && (layoutInfo.isAdaptive || sdkShiftSetting) {
+                win.resizeIncrements = NSSize(width: 1, height: 1)
+                let minW: CGFloat = (layoutIdiomSetting == 1 || (layoutIdiomSetting == 3 && layoutInfo.families.contains(1))) ? 320 : 360
+                let minH: CGFloat = (layoutIdiomSetting == 1 || (layoutIdiomSetting == 3 && layoutInfo.families.contains(1))) ? 520 : 540
+                win.contentMinSize = NSSize(width: minW, height: minH)
+                let targetW = min(max(saved.frame.width, minW), visible.width)
+                let targetH = min(max(saved.frame.height, minH + titleOverhead), visible.height)
+                var clamped = NSRect(origin: saved.frame.origin, size: NSSize(width: targetW, height: targetH))
+                clamped.origin.x = max(visible.minX, min(clamped.origin.x, visible.maxX - clamped.width))
+                clamped.origin.y = max(visible.minY, min(clamped.origin.y, visible.maxY - clamped.height))
+                win.setFrame(clamped, display: true)
+                return
+            } else {
+                let aspect: (width: CGFloat, height: CGFloat, minW: CGFloat, minH: CGFloat)
+                if resolutionSetting == 7 {
+                    aspect = resolvedNonAdaptiveAspect()
+                } else if let ar = aspectRatioSetting, ar.width > 0, ar.height > 0 {
+                    aspect = (ar.width, ar.height, 240, 240)
+                } else {
+                    aspect = layoutInfo.recommendedAspect
+                }
+                win.contentMinSize = NSSize(width: aspect.minW, height: aspect.minH)
+                win.contentAspectRatio = NSSize(width: aspect.width, height: aspect.height)
+                let savedContentH = max(aspect.minH, saved.frame.height - titleOverhead)
+                var targetH = min(savedContentH, maxH)
+                var targetW = round(targetH * (aspect.width / aspect.height))
+                if targetW > maxW {
+                    targetW = maxW
+                    targetH = round(targetW * (aspect.height / aspect.width))
+                }
+                win.setContentSize(NSSize(width: max(aspect.minW, targetW), height: max(aspect.minH, targetH)))
+                let updated = win.frame
+                let ox = max(visible.minX, min(saved.frame.origin.x, visible.maxX - updated.width))
+                let oy = max(visible.minY, min(saved.frame.origin.y, visible.maxY - updated.height))
+                win.setFrameOrigin(NSPoint(x: ox, y: oy))
+                return
+            }
+        }
+
         let target = resolvedTargetScreen() ?? win.screen ?? NSScreen.main ?? NSScreen.screens.first
         let visible = target?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
 
@@ -578,6 +661,56 @@ private extension AKPlugin {
 
         if win.isVisible, let target = resolvedTargetScreen(), target.visibleFrame.intersects(win.frame) {
             verifiedTargetWindows.add(win)
+        }
+    }
+
+    func saveWindowFrameIfAppropriate(_ win: NSWindow) {
+        let env = ProcessInfo.processInfo.environment
+        guard !isRestoringSavedFrame,
+              configuredWindows.contains(win),
+              isMainAppWindow(win),
+              win.isVisible,
+              !win.styleMask.contains(.fullScreen),
+              env["PLAYTOOLS_AUTOMATION"] != "1",
+              (env["PLAYCOVER_TARGET_SCREEN"] ?? "").isEmpty,
+              resolvedTargetScreen() == nil else {
+            return
+        }
+        let frame = win.frame
+        guard frame.width >= 200, frame.height >= 200 else { return }
+        let payload: [String: Any] = [
+            "x": Double(frame.origin.x),
+            "y": Double(frame.origin.y),
+            "width": Double(frame.size.width),
+            "height": Double(frame.size.height),
+            "resolution": resolutionSetting,
+            "layoutIdiom": layoutIdiomSetting
+        ]
+        UserDefaults.standard.set(payload, forKey: Self.savedFrameDefaultsKey)
+    }
+
+    func loadSavedWindowFrame() -> (frame: NSRect, resolution: Int)? {
+        guard let dict = UserDefaults.standard.dictionary(forKey: Self.savedFrameDefaultsKey),
+              let x = (dict["x"] as? NSNumber)?.doubleValue,
+              let y = (dict["y"] as? NSNumber)?.doubleValue,
+              let w = (dict["width"] as? NSNumber)?.doubleValue,
+              let h = (dict["height"] as? NSNumber)?.doubleValue,
+              let res = (dict["resolution"] as? NSNumber)?.intValue,
+              w >= 200, h >= 200 else {
+            return nil
+        }
+        return (NSRect(x: x, y: y, width: w, height: h), res)
+    }
+
+    func screenForSavedFrame(_ frame: NSRect) -> NSScreen? {
+        let center = NSPoint(x: frame.midX, y: frame.midY)
+        if let containing = NSScreen.screens.first(where: { $0.frame.contains(center) }) {
+            return containing
+        }
+        return NSScreen.screens.max { a, b in
+            let ia = a.frame.intersection(frame)
+            let ib = b.frame.intersection(frame)
+            return (ia.width * ia.height) < (ib.width * ib.height)
         }
     }
 

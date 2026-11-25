@@ -206,6 +206,7 @@ public class PlayScreen: NSObject {
     private var shouldAllowRuntimeFallback: Bool {
         PlaySettings.shared.smartAdaptive
             && displayMode == .adaptive
+            && !appCapabilities.supportsIPad
             && !(isDuoIdentity && appCapabilities.supportsDuoAdaptive)
             && !PlaySettings.shared.sdkShift
     }
@@ -833,9 +834,6 @@ private extension PlayScreen {
                 return
             }
             scheduleAdaptiveRelayout(for: win)
-            if PlaySettings.shared.smartAdaptive && !didTriggerRuntimeFallback {
-                scheduleRuntimeFallbackCheck(delay: 0.8)
-            }
         case .scaled(let logicalSize, _, _):
             applyScaledCanvasToScene(containing: win, logicalSize: logicalSize)
             DispatchQueue.main.async { [weak self, weak win] in
@@ -959,9 +957,6 @@ private extension PlayScreen {
                         return
                     }
                     scheduleAdaptiveRelayout(for: window)
-                    if PlaySettings.shared.smartAdaptive && !didTriggerRuntimeFallback {
-                        scheduleRuntimeFallbackCheck(delay: 0.8)
-                    }
                 }
             }
         }
@@ -1328,7 +1323,7 @@ private extension PlayScreen {
               !didTriggerRuntimeFallback,
               let win = activePrimaryWindow,
               let rootView = win.rootViewController?.view,
-              win.bounds.width >= 100 else { return }
+              win.bounds.width >= 500 else { return }
 
         let overflowFound = hasNonScrollableWidthOverflow(in: rootView, window: win, threshold: 24)
         guard overflowFound else { return }
