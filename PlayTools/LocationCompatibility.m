@@ -11,8 +11,17 @@
 #if TARGET_OS_MACCATALYST
 
 static const void *kPTLocationTimerKey = &kPTLocationTimerKey;
+static const void *kPTLocationDelegateKey = &kPTLocationDelegateKey;
 static NSHashTable *pt_activeManagers = nil;
 static NSLock *pt_managersLock = nil;
+static void (*pt_origSetDelegate)(id, SEL, id) = NULL;
+
+@interface PTWeakDelegateBox : NSObject
+@property (nonatomic, weak) id<CLLocationManagerDelegate> delegate;
+@end
+
+@implementation PTWeakDelegateBox
+@end
 
 @interface PTLocationTimerBox : NSObject
 @property (nonatomic, strong) dispatch_source_t timer;
@@ -20,9 +29,11 @@ static NSLock *pt_managersLock = nil;
 
 @implementation PTLocationTimerBox
 - (void)invalidate {
-    if (_timer) {
-        dispatch_source_cancel(_timer);
-        _timer = nil;
+    @synchronized(self) {
+        if (_timer) {
+            dispatch_source_cancel(_timer);
+            _timer = nil;
+        }
     }
 }
 - (void)dealloc {
@@ -44,9 +55,36 @@ static CLLocation *pt_currentMockLocation(void) {
                                         timestamp:[NSDate date]];
 }
 
+static id<CLLocationManagerDelegate> pt_delegateForManager(CLLocationManager *manager) {
+    if (!manager) { return nil; }
+    [pt_managersLock lock];
+    PTWeakDelegateBox *box = objc_getAssociatedObject(manager, kPTLocationDelegateKey);
+    id<CLLocationManagerDelegate> del = box ? box.delegate : nil;
+    [pt_managersLock unlock];
+    return del;
+}
+
+static void pt_clSetDelegate(CLLocationManager *self, SEL _cmd, id<CLLocationManagerDelegate> delegate) {
+    [pt_managersLock lock];
+    if (delegate) {
+        PTWeakDelegateBox *box = objc_getAssociatedObject(self, kPTLocationDelegateKey);
+        if (!box) {
+            box = [[PTWeakDelegateBox alloc] init];
+            objc_setAssociatedObject(self, kPTLocationDelegateKey, box, OBJC_ASSOCIATION_RETAIN);
+        }
+        box.delegate = delegate;
+    } else {
+        objc_setAssociatedObject(self, kPTLocationDelegateKey, nil, OBJC_ASSOCIATION_RETAIN);
+    }
+    [pt_managersLock unlock];
+    if (pt_origSetDelegate) {
+        pt_origSetDelegate(self, _cmd, delegate);
+    }
+}
+
 static void pt_deliverLocationToManager(CLLocationManager *manager) {
     if (!manager) { return; }
-    id<CLLocationManagerDelegate> delegate = manager.delegate;
+    id<CLLocationManagerDelegate> delegate = pt_delegateForManager(manager);
     if (!delegate) { return; }
     CLLocation *loc = pt_currentMockLocation();
     if ([delegate respondsToSelector:@selector(locationManager:didUpdateLocations:)]) {
@@ -65,7 +103,7 @@ static void pt_deliverLocationToManager(CLLocationManager *manager) {
 
 static void pt_deliverAuthorizedToManager(CLLocationManager *manager) {
     if (!manager) { return; }
-    id<CLLocationManagerDelegate> delegate = manager.delegate;
+    id<CLLocationManagerDelegate> delegate = pt_delegateForManager(manager);
     if (!delegate) { return; }
     if (@available(iOS 14.0, *)) {
         if ([delegate respondsToSelector:@selector(locationManagerDidChangeAuthorization:)]) {
@@ -119,13 +157,6 @@ static void pt_clRequestLocation(CLLocationManager *self, SEL _cmd) {
 }
 
 static void pt_clStartUpdatingLocation(CLLocationManager *self, SEL _cmd) {
-    [pt_managersLock lock];
-    [pt_activeManagers addObject:self];
-    [pt_managersLock unlock];
-
-    PTLocationTimerBox *existing = objc_getAssociatedObject(self, kPTLocationTimerKey);
-    [existing invalidate];
-
     PTLocationTimerBox *box = [[PTLocationTimerBox alloc] init];
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     __weak CLLocationManager *weakSelf = self;
@@ -139,7 +170,14 @@ static void pt_clStartUpdatingLocation(CLLocationManager *self, SEL _cmd) {
         pt_deliverLocationToManager(strongSelf);
     });
     box.timer = timer;
-    objc_setAssociatedObject(self, kPTLocationTimerKey, box, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+
+    [pt_managersLock lock];
+    [pt_activeManagers addObject:self];
+    PTLocationTimerBox *existing = objc_getAssociatedObject(self, kPTLocationTimerKey);
+    objc_setAssociatedObject(self, kPTLocationTimerKey, box, OBJC_ASSOCIATION_RETAIN);
+    [pt_managersLock unlock];
+
+    [existing invalidate];
     dispatch_resume(timer);
 
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -150,9 +188,12 @@ static void pt_clStartUpdatingLocation(CLLocationManager *self, SEL _cmd) {
 }
 
 static void pt_clStopUpdatingLocation(CLLocationManager *self, SEL _cmd) {
+    [pt_managersLock lock];
+    [pt_activeManagers removeObject:self];
     PTLocationTimerBox *box = objc_getAssociatedObject(self, kPTLocationTimerKey);
+    objc_setAssociatedObject(self, kPTLocationTimerKey, nil, OBJC_ASSOCIATION_RETAIN);
+    [pt_managersLock unlock];
     [box invalidate];
-    objc_setAssociatedObject(self, kPTLocationTimerKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 static void pt_replaceInstanceMethod(Class cls, SEL sel, IMP imp, const char *fallbackTypes) {
@@ -180,6 +221,15 @@ void pt_installLocationCompatibility(void) {
 
         Class cls = [CLLocationManager class];
         if (!cls) { return; }
+
+        Method setDelM = class_getInstanceMethod(cls, @selector(setDelegate:));
+        if (setDelM) {
+            IMP origImp = method_getImplementation(setDelM);
+            if (origImp != (IMP)pt_clSetDelegate) {
+                pt_origSetDelegate = (void (*)(id, SEL, id))origImp;
+                class_replaceMethod(cls, @selector(setDelegate:), (IMP)pt_clSetDelegate, method_getTypeEncoding(setDelM));
+            }
+        }
 
         pt_replaceClassMethod(cls, @selector(locationServicesEnabled), (IMP)pt_clLocationServicesEnabled, "B@:");
         pt_replaceClassMethod(cls, @selector(authorizationStatus), (IMP)pt_clClassAuthStatus, "i@:");

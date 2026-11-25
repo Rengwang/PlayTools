@@ -3588,6 +3588,72 @@ static void pt_installNSDataURLTypeGuard(void) {
 }
 #endif
 
+#if TARGET_OS_MACCATALYST
+static NSInteger pt_systemAppearanceUpdateDepth = 0;
+static void (*pt_origUpdateFromSystemAppearance)(id, SEL, id) = NULL;
+static void (*pt_origWindowSetOverrideUserInterfaceStyle)(UIWindow *, SEL, UIUserInterfaceStyle) = NULL;
+static BOOL pt_appearanceReentrancyGuardInstalled = NO;
+
+static void pt_updateFromSystemAppearance(id self, SEL _cmd, id sender) {
+    pt_systemAppearanceUpdateDepth++;
+    @try {
+        if (pt_origUpdateFromSystemAppearance) {
+            pt_origUpdateFromSystemAppearance(self, _cmd, sender);
+        }
+    } @finally {
+        pt_systemAppearanceUpdateDepth--;
+    }
+}
+
+static void pt_windowSetOverrideUserInterfaceStyle(UIWindow *self, SEL _cmd, UIUserInterfaceStyle style) {
+    if (pt_systemAppearanceUpdateDepth > 0 && [NSThread isMainThread]) {
+        if (self.overrideUserInterfaceStyle == style) {
+            return;
+        }
+        __weak UIWindow *weakWin = self;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIWindow *win = weakWin;
+            if (win && win.overrideUserInterfaceStyle != style && pt_origWindowSetOverrideUserInterfaceStyle) {
+                pt_origWindowSetOverrideUserInterfaceStyle(win, _cmd, style);
+            }
+        });
+        return;
+    }
+    if (pt_origWindowSetOverrideUserInterfaceStyle) {
+        pt_origWindowSetOverrideUserInterfaceStyle(self, _cmd, style);
+    }
+}
+
+static void pt_installWindowAppearanceReentrancyGuard(void) {
+    if (pt_appearanceReentrancyGuardInstalled) {
+        return;
+    }
+    pt_appearanceReentrancyGuardInstalled = YES;
+
+    Class uiApp = objc_getClass("UIApplication");
+    SEL updateSel = sel_registerName("_updateFromSystemAppearance:");
+    Method updateM = uiApp ? class_getInstanceMethod(uiApp, updateSel) : NULL;
+    if (updateM) {
+        IMP origImp = method_getImplementation(updateM);
+        if (origImp != (IMP)pt_updateFromSystemAppearance) {
+            pt_origUpdateFromSystemAppearance = (void (*)(id, SEL, id))origImp;
+            class_replaceMethod(uiApp, updateSel, (IMP)pt_updateFromSystemAppearance, method_getTypeEncoding(updateM));
+        }
+    }
+
+    Class uiWin = objc_getClass("UIWindow");
+    SEL styleSel = @selector(setOverrideUserInterfaceStyle:);
+    Method styleM = uiWin ? class_getInstanceMethod(uiWin, styleSel) : NULL;
+    if (styleM) {
+        IMP origImp = method_getImplementation(styleM);
+        if (origImp != (IMP)pt_windowSetOverrideUserInterfaceStyle) {
+            pt_origWindowSetOverrideUserInterfaceStyle = (void (*)(UIWindow *, SEL, UIUserInterfaceStyle))origImp;
+            class_replaceMethod(uiWin, styleSel, (IMP)pt_windowSetOverrideUserInterfaceStyle, method_getTypeEncoding(styleM));
+        }
+    }
+}
+#endif
+
 static void pt_installUniversalCompatibilityGuards(void) {
     pt_ensure_device_settings_cached();
     (void)pt_should_block_sleep_spamming();
@@ -3634,6 +3700,9 @@ static void pt_installUniversalCompatibilityGuards(void) {
     pt_patchFirebaseInlineExits();
     pt_installRiskBannerHooks();
     pt_installJPushNotificationThrottleIfNeeded();
+#if TARGET_OS_MACCATALYST
+    pt_installWindowAppearanceReentrancyGuard();
+#endif
 
     dispatch_async(dispatch_get_main_queue(), ^{
         Class uiApp = objc_getClass("UIApplication");
