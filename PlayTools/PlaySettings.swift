@@ -156,6 +156,21 @@ let settings = PlaySettings.shared
     @objc lazy var mockLocationEnabled = settingsData.mockLocationEnabled
     @objc lazy var mockLocationLatitude = settingsData.mockLocationLatitude
     @objc lazy var mockLocationLongitude = settingsData.mockLocationLongitude
+
+    /// Exposes the subset of preferences needed by `AKPlugin` without re-reading or re-decoding the plist.
+    @objc public func akPluginSettingsDictionary() -> NSDictionary {
+        return [
+            "keymapping": settingsData.keymapping,
+            "hideTitleBar": settingsData.hideTitleBar,
+            "floatingWindow": settingsData.floatingWindow,
+            "resolution": settingsData.resolution,
+            "resizableAspectRatioType": settingsData.resizableAspectRatioType,
+            "resizableAspectRatioWidth": settingsData.resizableAspectRatioWidth,
+            "resizableAspectRatioHeight": settingsData.resizableAspectRatioHeight,
+            "layoutIdiom": settingsData.layoutIdiom,
+            "sdkShift": settingsData.sdkShift
+        ]
+    }
 }
 
 struct AppSettingsData: Codable {

@@ -402,6 +402,22 @@ class AKPlugin: NSObject, Plugin {
     }
 
     fileprivate static var akAppSettingsData: AKAppSettingsData? = {
+        if let settingsCls = (NSClassFromString("PlayTools.PlaySettings") ?? NSClassFromString("PlaySettings")) as? NSObject.Type,
+           let shared = settingsCls.perform(NSSelectorFromString("shared"))?.takeUnretainedValue() as? NSObject,
+           let dict = shared.perform(NSSelectorFromString("akPluginSettingsDictionary"))?.takeUnretainedValue() as? [String: Any] {
+            var data = AKAppSettingsData()
+            data.keymapping = (dict["keymapping"] as? NSNumber)?.boolValue
+            data.hideTitleBar = (dict["hideTitleBar"] as? NSNumber)?.boolValue
+            data.floatingWindow = (dict["floatingWindow"] as? NSNumber)?.boolValue
+            data.resolution = (dict["resolution"] as? NSNumber)?.intValue
+            data.resizableAspectRatioType = (dict["resizableAspectRatioType"] as? NSNumber)?.intValue
+            data.resizableAspectRatioWidth = (dict["resizableAspectRatioWidth"] as? NSNumber)?.intValue
+            data.resizableAspectRatioHeight = (dict["resizableAspectRatioHeight"] as? NSNumber)?.intValue
+            data.layoutIdiom = (dict["layoutIdiom"] as? NSNumber)?.intValue
+            data.sdkShift = (dict["sdkShift"] as? NSNumber)?.boolValue
+            return data
+        }
+
         let bundleIdentifier = Bundle.main.bundleIdentifier
             ?? (Bundle.main.infoDictionary?["CFBundleIdentifier"] as? String) ?? ""
         let settingsURL = URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")

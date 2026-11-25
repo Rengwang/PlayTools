@@ -14,7 +14,7 @@ class PlayInfo: NSObject {
             .urlForApplicationWithBundleIdentifier("io.playcover.PlayCover") != nil
     }
 
-    @objc static var isUnrealEngine: Bool {
+    @objc static let isUnrealEngine: Bool = {
         let appFolder = Bundle.main.bundleURL
         let ueFiles: [URL] = [
             appFolder.appendingPathComponent("ue4commandline.txt"),
@@ -25,7 +25,7 @@ class PlayInfo: NSObject {
             return true
         }
         return false
-    }
+    }()
 
     @objc static func installPowerStateHooksIfNeeded() {
         guard !powerStateHooksInstalled, PlaySettings.shared.spoofPowerState else {

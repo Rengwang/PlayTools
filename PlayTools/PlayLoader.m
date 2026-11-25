@@ -2675,11 +2675,15 @@ static const char * const pt_buExpressFailSels[] = {
 };
 
 static const char * const pt_gdtFailSels[] = { "splashAdFailToPresent:withError:" };
-static const char * const pt_gdtBoolNo[] = { "isAdValid" };
+static const char * const pt_gdtBoolNo[] = { "isAdValid", "loadSplashOrderBeforeTimeoutEnable" };
 static const char * const pt_gdtNoop1[] = { "preloadSplashOrderWithPlacementId:" };
-static const char * const pt_gdtVoid0[] = { "loadAd", "loadFullScreenAd" };
-static const char * const pt_gdtVoid1[] = { "loadAdAndShowInWindow:" };
-static const char * const pt_gdtVoid2[] = { "loadAdAndShowInWindow:withBottomView:" };
+static const char * const pt_gdtVoid0[] = { "loadAd", "loadFullScreenAd", "preDownLoadSplashData" };
+static const char * const pt_gdtVoid1[] = {
+    "loadAdAndShowInWindow:", "loadAdAndShowSplashWithCustomUIModel:"
+};
+static const char * const pt_gdtVoid2[] = {
+    "loadAdAndShowInWindow:withBottomView:", "showSplashWithOrder:withCustomUI:"
+};
 static const char * const pt_gdtVoid3[] = {
     "loadAdAndShowInWindow:withBottomView:skipView:",
     "loadAdAndShowFullScreenInWindow:withLogoImage:skipView:",
@@ -2799,6 +2803,17 @@ static const char * const pt_mtgVoid0[] = { "preload" };
 static const char * const pt_mtgVoid1[] = { "preloadWithBidToken:" };
 static const char * const pt_mtgVoid2[] = { "showInKeyWindow:customView:", "showBiddingADInKeyWindow:customView:" };
 
+static const char * const pt_dcUniFailSels[] = {
+    "splashAd:didLoadFailWithError:", "splashAdDidShowFailed:error:",
+    "handleLoadFailWithModel:withError:", "splashAdDidClose:"
+};
+static const char * const pt_dcUniBoolNo[] = { "getSplashEnable", "isSplashEnable", "splashIsVaild" };
+static const char * const pt_dcUniVoid1[] = { "loadAdData:", "loadAdWithSlotModel:" };
+
+static const char * const pt_miguBoolNo[] = { "shouldRequestServer", "isAdMaterialDataValid" };
+static const char * const pt_miguVoid0[] = { "showMiguLaunchAd", "startAdProcess" };
+static const char * const pt_miguVoid1[] = { "showThirdPlatformLaunchAd:" };
+
 #define PT_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 static PTSplashSDKSpec pt_splashSpecs[] = {
@@ -2858,6 +2873,15 @@ static PTSplashSDKSpec pt_splashSpecs[] = {
     { "MTGSplashAD", Nil, NULL, NULL, pt_mtgFailSels, PT_COUNT(pt_mtgFailSels), pt_mtgBoolNo, PT_COUNT(pt_mtgBoolNo), NULL, 0,
       NULL, 0, pt_mtgVoid0, PT_COUNT(pt_mtgVoid0), pt_mtgVoid1, PT_COUNT(pt_mtgVoid1),
       NULL, 0, pt_mtgVoid2, PT_COUNT(pt_mtgVoid2), NULL, 0 },
+    { "DCUniSplashAd", Nil, NULL, NULL, pt_dcUniFailSels, PT_COUNT(pt_dcUniFailSels), pt_dcUniBoolNo, PT_COUNT(pt_dcUniBoolNo), NULL, 0,
+      NULL, 0, NULL, 0, pt_dcUniVoid1, PT_COUNT(pt_dcUniVoid1),
+      NULL, 0, NULL, 0, NULL, 0 },
+    { "MGPolymerAdSDKLaunchAdRequestSerialization", Nil, NULL, NULL, NULL, 0, pt_miguBoolNo, PT_COUNT(pt_miguBoolNo), NULL, 0,
+      NULL, 0, pt_miguVoid0, PT_COUNT(pt_miguVoid0), pt_miguVoid1, PT_COUNT(pt_miguVoid1),
+      NULL, 0, NULL, 0, NULL, 0 },
+    { "MGPolymerAdSDKFastLaunchAdRequestSerialization", Nil, NULL, NULL, NULL, 0, pt_miguBoolNo, PT_COUNT(pt_miguBoolNo), NULL, 0,
+      NULL, 0, pt_miguVoid0, PT_COUNT(pt_miguVoid0), pt_miguVoid1, PT_COUNT(pt_miguVoid1),
+      NULL, 0, NULL, 0, NULL, 0 },
 };
 
 static NSError *pt_splashNoFillErrorForSpec(const PTSplashSDKSpec *spec) {
@@ -3048,6 +3072,35 @@ static BOOL pt_splashBoolNo1AndFail(id self, SEL _cmd, id a1) {
     return NO;
 }
 
+static BOOL pt_splashBoolNo3AndFail(id self, SEL _cmd, id a1, id a2, id a3) {
+    (void)_cmd;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    pt_splashDispatchSpecFailure(self);
+    return NO;
+}
+
+static void pt_dcUniShowInWindow(id self, SEL _cmd, id window, id bottomView, id delegate) {
+    (void)self;
+    (void)_cmd;
+    (void)window;
+    (void)bottomView;
+    if (!delegate) {
+        return;
+    }
+    __strong id strongDelegate = delegate;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SEL failSel = @selector(splashAdDidShowFailed:error:);
+        SEL closeSel = @selector(splashAdDidClose:);
+        if ([strongDelegate respondsToSelector:failSel]) {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(strongDelegate, failSel, nil, pt_splashNoFillError());
+        } else if ([strongDelegate respondsToSelector:closeSel]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(strongDelegate, closeSel, nil);
+        }
+    });
+}
+
 static void pt_splashLoadWindowViewTimeout(id self, SEL _cmd, id w, id v, NSInteger t) {
     (void)_cmd;
     (void)w;
@@ -3225,6 +3278,10 @@ static void pt_installSplashAdBlockerIfNeeded(void) {
         if (strcmp(spec->className, "MTGSplashAD") == 0) {
             hooked |= pt_replaceSplashMethod(cls, "loadAndShowInKeyWindow:customView:timeout:", 5, (IMP)pt_splashLoadWindowViewTimeout, NO);
             hooked |= pt_replaceSplashMethod(cls, "loadAndShowInKeyWindow:customView:bidToken:timeout:", 6, (IMP)pt_splashLoadWindowViewTokenTimeout, NO);
+        } else if (strcmp(spec->className, "GDTSplashAd") == 0) {
+            hooked |= pt_replaceSplashMethod(cls, "showSplashWithOrder:withCustomUI:inContainerView:", 5, (IMP)pt_splashBoolNo3AndFail, NO);
+        } else if (strcmp(spec->className, "DCUniSplashAd") == 0) {
+            hooked |= pt_replaceSplashMethod(cls, "showInWindow:withBottomView:andDelegate:", 5, (IMP)pt_dcUniShowInWindow, YES);
         }
         if (hooked) {
             hookedClasses++;
@@ -3268,6 +3325,13 @@ static void pt_installSplashAdBlockerIfNeeded(void) {
         hooked |= pt_replaceSplashMethod(atCls, "splashReadyForPlacementID:showConfig:caller:sendTK:", 6, (IMP)pt_atSplashReady4, NO);
         hooked |= pt_replaceSplashMethod(atCls, "splashReadyWithoutLogForPlacementID:sendTK:", 4, (IMP)pt_atSplashReadyWithoutLog2, NO);
         if (hooked) {
+            hookedClasses++;
+        }
+    }
+
+    Class qlLaunchCls = objc_getClass("QLAppLaunchMananger");
+    if (qlLaunchCls) {
+        if (pt_replaceSplashMethod(qlLaunchCls, "shouldShowSplashWhenAppStart", 2, (IMP)pt_splashBoolNO, NO)) {
             hookedClasses++;
         }
     }

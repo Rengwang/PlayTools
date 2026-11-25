@@ -21,7 +21,8 @@ enum UserPluginLoader {
         guard let frameworksURL = Bundle.main.privateFrameworksURL else { return [] }
         let userPluginsURL = frameworksURL.appendingPathComponent(userPluginsDirectoryName)
 
-        guard let names = try? FileManager.default.contentsOfDirectory(atPath: userPluginsURL.path) else {
+        guard FileManager.default.fileExists(atPath: userPluginsURL.path),
+              let names = try? FileManager.default.contentsOfDirectory(atPath: userPluginsURL.path) else {
             return []
         }
         return names
