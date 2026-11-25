@@ -6,7 +6,6 @@
 //
 
 import Foundation
-import Atomics
 
 // If the same key is mapped to multiple different tasks, distinguish by priority
 public enum ActionDispatchPriority: Int {
@@ -25,9 +24,9 @@ public class ActionDispatcher {
     static private let priorityCount = 3
     // You can't put more than 8 cameras or 8 joysticks in a keymap right?
     static private let mappingCountPerPriority = 8
-    static private let directionPadHandlers: [[ManagedAtomic<AtomicHandler>]] = Array(
+    static private let directionPadHandlers: [[PTLocked<AtomicHandler>]] = Array(
         (0..<priorityCount).map({_ in
-            (0..<mappingCountPerPriority).map({_ in ManagedAtomic<AtomicHandler>(.EMPTY)})
+            (0..<mappingCountPerPriority).map({_ in PTLocked<AtomicHandler>(.EMPTY)})
         })
     )
 
@@ -37,7 +36,7 @@ public class ActionDispatcher {
         buttonHandlers.removeAll(keepingCapacity: true)
         directionPadHandlers.forEach({ handlers in
             handlers.forEach({ handler in
-                handler.store(.EMPTY, ordering: .relaxed)
+                handler.store(.EMPTY)
             })
         })
     }
@@ -107,10 +106,10 @@ public class ActionDispatcher {
                                 handler: @escaping (CGFloat, CGFloat) -> Void,
                                 priority: ActionDispatchPriority = .DEFAULT) {
         let atomicHandler = directionPadHandlers[priority.rawValue].first(where: { handler in
-            handler.load(ordering: .relaxed).key == key
+            handler.load().key == key
         }) ??
         directionPadHandlers[priority.rawValue].first(where: { handler in
-            handler.load(ordering: .relaxed).key.isEmpty
+            handler.load().key.isEmpty
         })
 //        DispatchQueue.main.async {
 //            if screen.keyWindow == nil {
@@ -119,13 +118,13 @@ public class ActionDispatcher {
 //            Toast.showHint(title: "register",
 //               text: ["key: \(key), atomicHandler: \(String(describing: atomicHandler))"])
 //        }
-        atomicHandler?.store(AtomicHandler(key, handler), ordering: .releasing)
+        atomicHandler?.store(AtomicHandler(key, handler))
     }
 
     static public func unregister(key: String) {
         // Only draggable can be unregistered
         let atomicHandler = directionPadHandlers[ActionDispatchPriority.DRAGGABLE.rawValue].first(where: { handler in
-            handler.load(ordering: .relaxed).key == key
+            handler.load().key == key
         })
 //        DispatchQueue.main.async {
 //            if screen.keyWindow == nil {
@@ -134,7 +133,7 @@ public class ActionDispatcher {
 //            Toast.showHint(title: "unregister",
 //               text: ["key: \(key), atomicHandler: \(String(describing: atomicHandler))"])
 //        }
-        atomicHandler?.store(.EMPTY, ordering: .releasing)
+        atomicHandler?.store(.EMPTY)
     }
 
     // Frontend interfaces
@@ -174,7 +173,7 @@ public class ActionDispatcher {
     static public func getDispatchPriority(key: String) -> ActionDispatchPriority? {
         if let priority = directionPadHandlers.firstIndex(where: { handlers in
             handlers.contains(where: { handler in
-                handler.load(ordering: .acquiring).key == key
+                handler.load().key == key
             })
         }) {
 //            Toast.showHint(title: "\(key) priority", text: ["\(priority)"])
@@ -205,10 +204,10 @@ public class ActionDispatcher {
     static public func dispatch(key: String, valueX: CGFloat, valueY: CGFloat) -> Bool {
         for priority in 0..<priorityCount {
             if let handler = directionPadHandlers[priority].first(where: { handler in
-                handler.load(ordering: .acquiring).key == key
+                handler.load().key == key
             }) {
                 PlayInput.touchQueue.async(qos: .userInteractive, execute: {
-                    handler.load(ordering: .relaxed).handle(valueX, valueY)
+                    handler.load().handle(valueX, valueY)
                 })
                 return true
             }
@@ -217,7 +216,7 @@ public class ActionDispatcher {
     }
 }
 
-private final class AtomicHandler: AtomicReference {
+private final class AtomicHandler {
     static fileprivate let EMPTY = AtomicHandler("", {_, _ in })
     let key: String
     let handle: (CGFloat, CGFloat) -> Void

@@ -153,6 +153,10 @@ class AKPlugin: NSObject, Plugin {
 
     var isApplicationActive: Bool { NSApplication.shared.isActive }
 
+    var hasVisibleUnminiaturizedWindow: Bool {
+        NSApplication.shared.windows.contains { isMainAppWindow($0) && $0.isVisible && !$0.isMiniaturized }
+    }
+
     var cmdPressed: Bool = false
     var cursorHideLevel = 0
     func hideCursor() {

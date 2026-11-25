@@ -388,6 +388,16 @@ class PlayKeychainDB: NSObject {
         dbLock.signal()
     }
 
+    func releaseIdleResources() {
+        dbLock.wait()
+        if let db = persistentDB {
+            sqlite3_exec(db, "PRAGMA wal_checkpoint(PASSIVE);", nil, nil, nil)
+            sqlite3_db_release_memory(db)
+            resetConnectionLocked()
+        }
+        dbLock.signal()
+    }
+
     private func resetConnectionLocked() {
         if let sqliteDB = persistentDB {
             _ = sqlite3_close_v2(sqliteDB)

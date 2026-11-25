@@ -1,7 +1,37 @@
 import Foundation
 import UIKit
 import GameController
-import Atomics
+import os.lock
+
+/// Lightweight lock-protected box replacing `swift-atomics` (`ManagedAtomic`)
+/// so PlayTools avoids pulling in swift-atomics / SwiftNIO.
+final class PTLocked<Value> {
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var storage: Value
+
+    init(_ value: Value) {
+        lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        lock.initialize(to: os_unfair_lock())
+        storage = value
+    }
+
+    deinit {
+        lock.deinitialize(count: 1)
+        lock.deallocate()
+    }
+
+    func load() -> Value {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        return storage
+    }
+
+    func store(_ newValue: Value) {
+        os_unfair_lock_lock(lock)
+        storage = newValue
+        os_unfair_lock_unlock(lock)
+    }
+}
 
 // This class is a coordinator (and module entrance), coordinating other concrete classes
 
@@ -13,10 +43,10 @@ class PlayInput {
                                                autoreleaseFrequency: .workItem)
 
     private var displayLink: CADisplayLink?
-    private let appActive = ManagedAtomic(false)
+    private let appActive = PTLocked(false)
     private var isAppActive: Bool {
-        get { appActive.load(ordering: .acquiring) }
-        set { appActive.store(newValue, ordering: .releasing) }
+        get { appActive.load() }
+        set { appActive.store(newValue) }
     }
     private var initialized = false
 

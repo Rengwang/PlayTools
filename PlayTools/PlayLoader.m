@@ -137,14 +137,16 @@ static BOOL pt_should_block_sleep_spamming(void) {
     return val;
 }
 
-static int pt_uname(struct utsname *uts);
-static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1);
-static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
-static void *pt_dlsym(void *handle, const char *symbol);
-static CFDictionaryRef pt_CFNetworkCopySystemProxySettings(void);
-static CFArrayRef pt_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings);
-static int pt_getifaddrs(struct ifaddrs **ifap);
-static void pt_freeifaddrs(struct ifaddrs *ifa);
+#define PT_INTERPOSE_EXPORT __attribute__((visibility("default"), used))
+
+PT_INTERPOSE_EXPORT int pt_uname(struct utsname *uts);
+PT_INTERPOSE_EXPORT int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1);
+PT_INTERPOSE_EXPORT int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen);
+PT_INTERPOSE_EXPORT void *pt_dlsym(void *handle, const char *symbol);
+PT_INTERPOSE_EXPORT CFDictionaryRef pt_CFNetworkCopySystemProxySettings(void);
+PT_INTERPOSE_EXPORT CFArrayRef pt_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings);
+PT_INTERPOSE_EXPORT int pt_getifaddrs(struct ifaddrs **ifap);
+PT_INTERPOSE_EXPORT void pt_freeifaddrs(struct ifaddrs *ifa);
 
 typedef int (*pt_uname_fn)(struct utsname *);
 typedef int (*pt_sysctl_fn)(int *, u_int, void *, size_t *, void *, size_t);
@@ -154,8 +156,8 @@ typedef void *(*pt_dlsym_fn)(void *, const char *);
 typedef int (*pt_getifaddrs_fn)(struct ifaddrs **);
 typedef void (*pt_freeifaddrs_fn)(struct ifaddrs *);
 typedef bool (*pt_availability_version_check_fn)(uint32_t, const pt_build_version_t []);
-static uint32_t pt_active_platform(void);
-static bool pt_availability_version_check(uint32_t count, const pt_build_version_t versions[]);
+PT_INTERPOSE_EXPORT uint32_t pt_active_platform(void);
+PT_INTERPOSE_EXPORT bool pt_availability_version_check(uint32_t count, const pt_build_version_t versions[]);
 
 // Declare interposes before wrapper bodies so every wrapper can call the
 // dyld-bound original pointer directly from __DATA_CONST,__interpose via
@@ -171,6 +173,14 @@ DYLD_INTERPOSE(pt_CFNetworkCopyProxiesForURL, CFNetworkCopyProxiesForURL)
 DYLD_INTERPOSE(pt_getifaddrs, getifaddrs)
 DYLD_INTERPOSE(pt_freeifaddrs, freeifaddrs)
 DYLD_INTERPOSE(pt_availability_version_check, _availability_version_check)
+
+#if TARGET_OS_MACCATALYST
+typedef int (*pt_atexit_fn)(void (*)(void));
+typedef const struct mach_header *(*pt_dyld_image_header_fn)(const void *);
+extern int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
+PT_INTERPOSE_EXPORT int pt_atexit(void (*func)(void));
+DYLD_INTERPOSE(pt_atexit, atexit)
+#endif
 
 #define PT_MARKETPLACEKIT_PATH "/System/Library/Frameworks/MarketplaceKit.framework/MarketplaceKit"
 
@@ -217,12 +227,14 @@ static bool pt_marketplacekit_loaded(void) {
         if (handle) {
             dlclose(handle);
             loaded = true;
+        } else if (DYLD_INTERPOSE_ORIG(pt_dlsym_fn, dlsym)(RTLD_DEFAULT, "$s14MarketplaceKit14AppDistributorOMn") != NULL) {
+            loaded = true;
         }
     });
     return loaded;
 }
 
-static bool pt_availability_version_check(uint32_t count, const pt_build_version_t versions[]) {
+PT_INTERPOSE_EXPORT bool pt_availability_version_check(uint32_t count, const pt_build_version_t versions[]) {
     // MarketplaceKit's AppDistributor was introduced in iOS 17.4. Catalyst can
     // report that version as available even when the weak framework is absent.
     // Scope the fallback from upstream PlayTools #238 to that specific query.
@@ -237,28 +249,88 @@ static bool pt_availability_version_check(uint32_t count, const pt_build_version
     return DYLD_INTERPOSE_ORIG(pt_availability_version_check_fn, _availability_version_check)(count, versions);
 }
 
-static void *pt_dlsym(void *handle, const char *symbol) {
+PT_INTERPOSE_EXPORT void *pt_dlsym(void *handle, const char *symbol) {
     pt_dlsym_fn orig_dlsym = DYLD_INTERPOSE_ORIG(pt_dlsym_fn, dlsym);
     static __thread BOOL pt_in_gles_dlsym = NO;
-    if (!pt_in_gles_dlsym && handle == RTLD_DEFAULT && symbol != NULL &&
+    if (!pt_in_gles_dlsym && symbol != NULL &&
         symbol[0] == 'g' && symbol[1] == 'l' && symbol[2] >= 'A' && symbol[2] <= 'Z') {
-        pt_in_gles_dlsym = YES;
-        static void *glesHandle = NULL;
-        static dispatch_once_t onceToken;
-        dispatch_once(&onceToken, ^{
-            glesHandle = dlopen("/System/iOSSupport/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY | RTLD_LOCAL);
-        });
-        void *sym = NULL;
-        if (glesHandle != NULL) {
-            sym = orig_dlsym(glesHandle, symbol);
+        BOOL shouldRedirect = (handle == RTLD_DEFAULT);
+        if (!shouldRedirect &&
+            handle != NULL &&
+            handle != RTLD_NEXT &&
+            handle != RTLD_SELF &&
+            handle != RTLD_MAIN_ONLY) {
+            static _Atomic(uintptr_t) pt_desktopGLHandle = 0;
+            uintptr_t handleVal = (uintptr_t)handle;
+            uintptr_t cached = atomic_load_explicit(&pt_desktopGLHandle, memory_order_relaxed);
+            if (handleVal == cached) {
+                shouldRedirect = YES;
+            } else {
+                pt_in_gles_dlsym = YES;
+                // Desktop libGL.dylib exports immediate-mode glBegin, while iOS/Catalyst OpenGLES.framework does not.
+                void *glBeginSym = orig_dlsym(handle, "glBegin");
+                pt_in_gles_dlsym = NO;
+                if (glBeginSym != NULL) {
+                    atomic_store_explicit(&pt_desktopGLHandle, handleVal, memory_order_relaxed);
+                    shouldRedirect = YES;
+                }
+            }
         }
-        pt_in_gles_dlsym = NO;
-        if (sym != NULL) {
-            return sym;
+        if (shouldRedirect) {
+            pt_in_gles_dlsym = YES;
+            static void *glesHandle = NULL;
+            static dispatch_once_t onceToken;
+            dispatch_once(&onceToken, ^{
+                glesHandle = dlopen("/System/iOSSupport/System/Library/Frameworks/OpenGLES.framework/OpenGLES", RTLD_LAZY | RTLD_LOCAL);
+            });
+            void *sym = NULL;
+            if (glesHandle != NULL) {
+                sym = orig_dlsym(glesHandle, symbol);
+            }
+            pt_in_gles_dlsym = NO;
+            if (sym != NULL) {
+                return sym;
+            }
         }
     }
     return orig_dlsym(handle, symbol);
 }
+
+#if TARGET_OS_MACCATALYST
+static void pt_atexit_trampoline(void *arg) {
+    void (*fn)(void) = (void (*)(void))arg;
+    if (fn) {
+        fn();
+    }
+}
+
+/// Fast `atexit` interpose for Mac Catalyst.
+/// Apple's `libsystem_c` `atexit(fn)` calls `dladdr(fn, &info)` solely to obtain
+/// `info.dli_fbase`, forcing `dyld` to linearly scan millions of `nlist` symbols
+/// (for example in Unreal-based apps like AnTuTu Benchmark) on every C++ static
+/// initializer. Resolving the Mach-O header via `dyld_image_header_containing_address`
+/// and delegating directly to `__cxa_atexit` preserves exact `atexit` semantics in O(images).
+PT_INTERPOSE_EXPORT int pt_atexit(void (*func)(void)) {
+    if (!func) {
+        return DYLD_INTERPOSE_ORIG(pt_atexit_fn, atexit)(func);
+    }
+    static pt_dyld_image_header_fn header_fn = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        const char *disable = getenv("PLAYTOOLS_DISABLE_FAST_ATEXIT");
+        if (disable && disable[0] == '1' && disable[1] == '\0') {
+            return;
+        }
+        pt_dlsym_fn orig_dlsym = DYLD_INTERPOSE_ORIG(pt_dlsym_fn, dlsym);
+        header_fn = (pt_dyld_image_header_fn)orig_dlsym(RTLD_DEFAULT, "dyld_image_header_containing_address");
+    });
+    if (!header_fn) {
+        return DYLD_INTERPOSE_ORIG(pt_atexit_fn, atexit)(func);
+    }
+    void *dso_handle = (void *)header_fn((const void *)func);
+    return __cxa_atexit(pt_atexit_trampoline, (void *)func, dso_handle);
+}
+#endif
 
 // Hand Catalyst apps the iOS view of the host network: un-VPN'd iOS devices do
 // not expose macOS HTTP/SOCKS system proxies or desktop tunnel interfaces
@@ -277,12 +349,12 @@ static BOOL shouldHideInterface(const char *name, size_t maxLen) {
            strncmp(buf, "gpd", 3) == 0;
 }
 
-static CFDictionaryRef pt_CFNetworkCopySystemProxySettings(void) {
+PT_INTERPOSE_EXPORT CFDictionaryRef pt_CFNetworkCopySystemProxySettings(void) {
     return CFDictionaryCreate(kCFAllocatorDefault, NULL, NULL, 0,
                               &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 }
 
-static CFArrayRef pt_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
+PT_INTERPOSE_EXPORT CFArrayRef pt_CFNetworkCopyProxiesForURL(CFURLRef url, CFDictionaryRef proxySettings) {
     (void)url;
     (void)proxySettings;
     const void *keys[] = { kCFProxyTypeKey };
@@ -330,7 +402,7 @@ static struct ifaddrs *consumeRealIfaddrsHead(struct ifaddrs *returnedHead) {
     return realHead;
 }
 
-static int pt_getifaddrs(struct ifaddrs **ifap) {
+PT_INTERPOSE_EXPORT int pt_getifaddrs(struct ifaddrs **ifap) {
     int r = DYLD_INTERPOSE_ORIG(pt_getifaddrs_fn, getifaddrs)(ifap);
     if (r != 0 || ifap == NULL || *ifap == NULL) return r;
 
@@ -361,20 +433,20 @@ static int pt_getifaddrs(struct ifaddrs **ifap) {
     return r;
 }
 
-static void pt_freeifaddrs(struct ifaddrs *ifa) {
+PT_INTERPOSE_EXPORT void pt_freeifaddrs(struct ifaddrs *ifa) {
     if (!ifa) return;
     struct ifaddrs *realHead = consumeRealIfaddrsHead(ifa);
     DYLD_INTERPOSE_ORIG(pt_freeifaddrs_fn, freeifaddrs)(realHead);
 }
 
-static uint32_t pt_active_platform(void) {
+PT_INTERPOSE_EXPORT uint32_t pt_active_platform(void) {
     if (atomic_load_explicit(&pt_use_native_platform, memory_order_relaxed)) {
         return DYLD_INTERPOSE_ORIG(pt_active_platform_fn, dyld_get_active_platform)();
     }
     return PLATFORM_IOS;
 }
 // Change the machine output by uname to match expected output on iOS
-static int pt_uname(struct utsname *uts) {
+PT_INTERPOSE_EXPORT int pt_uname(struct utsname *uts) {
     int r = DYLD_INTERPOSE_ORIG(pt_uname_fn, uname)(uts);
     if (r != 0 || uts == NULL) {
         return r;
@@ -388,7 +460,7 @@ static int pt_uname(struct utsname *uts) {
 
 // Update output of sysctl for key values hw.machine, hw.product and hw.target to match iOS output
 // This spoofs the device type to apps allowing us to report as any iOS device
-static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1) {
+PT_INTERPOSE_EXPORT int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0, size_t arg1) {
     if (name != NULL && types >= 2 && size != NULL && name[0] == CTL_HW) {
         if (name[1] == HW_MACHINE || name[1] == HW_PRODUCT) {
             pt_ensure_device_settings_cached();
@@ -453,7 +525,7 @@ static int pt_sysctl(int *name, u_int types, void *buf, size_t *size, void *arg0
     return r;
 }
 
-static int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
+PT_INTERPOSE_EXPORT int pt_sysctlbyname(const char *name, void *oldp, size_t *oldlenp, void *newp, size_t newlen) {
     if (name != NULL && oldlenp != NULL) {
         if ((strcmp(name, "hw.machine") == 0) || (strcmp(name, "hw.product") == 0) || (strcmp(name, "hw.model") == 0)) {
             pt_ensure_device_settings_cached();
@@ -513,12 +585,12 @@ typedef OSStatus (*pt_SecItemDelete_fn)(CFDictionaryRef);
 typedef SecKeyRef (*pt_SecKeyCreateRandomKey_fn)(CFDictionaryRef, CFErrorRef *);
 typedef OSStatus (*pt_SecKeyGeneratePair_fn)(CFDictionaryRef, SecKeyRef *, SecKeyRef *);
 
-static OSStatus pt_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result);
-static OSStatus pt_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result);
-static OSStatus pt_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
-static OSStatus pt_SecItemDelete(CFDictionaryRef query);
-static SecKeyRef pt_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *error);
-static OSStatus pt_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey, SecKeyRef *privateKey);
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result);
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result);
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate);
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemDelete(CFDictionaryRef query);
+PT_INTERPOSE_EXPORT SecKeyRef pt_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *error);
+PT_INTERPOSE_EXPORT OSStatus pt_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey, SecKeyRef *privateKey);
 
 DYLD_INTERPOSE(pt_SecItemCopyMatching, SecItemCopyMatching)
 DYLD_INTERPOSE(pt_SecItemAdd, SecItemAdd)
@@ -528,7 +600,7 @@ DYLD_INTERPOSE(pt_SecKeyCreateRandomKey, SecKeyCreateRandomKey)
 DYLD_INTERPOSE(pt_SecKeyGeneratePair, SecKeyGeneratePair)
 
 // Use the implementations from PlayKeychain
-static OSStatus pt_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     OSStatus retval;
     if ([[PlaySettings shared] playChain]) {
         retval = [PlayKeychain copyMatching:(__bridge NSDictionary * _Nonnull)(query) result:result];
@@ -544,7 +616,7 @@ static OSStatus pt_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
     return retval;
 }
 
-static OSStatus pt_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     OSStatus retval;
     if ([[PlaySettings shared] playChain]) {
         retval = [PlayKeychain add:(__bridge NSDictionary * _Nonnull)(attributes) result:result];
@@ -560,7 +632,7 @@ static OSStatus pt_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result) {
     return retval;
 }
 
-static OSStatus pt_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate) {
     OSStatus retval;
     if ([[PlaySettings shared] playChain]) {
         retval = [PlayKeychain update:(__bridge NSDictionary * _Nonnull)(query) attributesToUpdate:(__bridge NSDictionary * _Nonnull)(attributesToUpdate)];
@@ -577,7 +649,7 @@ static OSStatus pt_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attribut
 
 }
 
-static OSStatus pt_SecItemDelete(CFDictionaryRef query) {
+PT_INTERPOSE_EXPORT OSStatus pt_SecItemDelete(CFDictionaryRef query) {
     OSStatus retval;
     if ([[PlaySettings shared] playChain]) {
         retval = [PlayKeychain delete:(__bridge NSDictionary * _Nonnull)(query)];
@@ -590,7 +662,7 @@ static OSStatus pt_SecItemDelete(CFDictionaryRef query) {
     return retval;
 }
 
-static SecKeyRef pt_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *error) {
+PT_INTERPOSE_EXPORT SecKeyRef pt_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef *error) {
     SecKeyRef result;
     if ([[PlaySettings shared] playChain]) {
         result = [PlayKeychain keyCreateRandomKey:(__bridge NSDictionary * _Nonnull)(parameters) error:error];
@@ -607,7 +679,7 @@ static SecKeyRef pt_SecKeyCreateRandomKey(CFDictionaryRef parameters, CFErrorRef
 }
 
 // Deprecated, but some apps might still use it.
-static OSStatus pt_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey, SecKeyRef *privateKey) {
+PT_INTERPOSE_EXPORT OSStatus pt_SecKeyGeneratePair(CFDictionaryRef parameters, SecKeyRef *publicKey, SecKeyRef *privateKey) {
     OSStatus retval;
     if ([[PlaySettings shared] playChain]) {
         retval = [PlayKeychain keyGeneratePair:(__bridge NSDictionary * _Nonnull)(parameters) publicKey:(void *)publicKey privateKey:(void *)privateKey];
@@ -658,12 +730,12 @@ typedef int (*pt_rename_fn)(char const* restrict, char const* restrict);
 typedef int (*pt_unlink_fn)(char const*);
 typedef int (*pt_usleep_fn)(useconds_t);
 
-static int pt_open(char const* restrict filename, int oflag, ...);
-static int pt_stat(char const* restrict path, struct stat* restrict buf);
-static int pt_access(char const* path, int mode);
-static int pt_rename(char const* restrict old_name, char const* restrict new_name);
-static int pt_unlink(char const* path);
-static int pt_usleep(useconds_t time);
+PT_INTERPOSE_EXPORT int pt_open(char const* restrict filename, int oflag, ...);
+PT_INTERPOSE_EXPORT int pt_stat(char const* restrict path, struct stat* restrict buf);
+PT_INTERPOSE_EXPORT int pt_access(char const* path, int mode);
+PT_INTERPOSE_EXPORT int pt_rename(char const* restrict old_name, char const* restrict new_name);
+PT_INTERPOSE_EXPORT int pt_unlink(char const* path);
+PT_INTERPOSE_EXPORT int pt_usleep(useconds_t time);
 
 DYLD_INTERPOSE(pt_open, open)
 DYLD_INTERPOSE(pt_stat, stat)
@@ -672,7 +744,7 @@ DYLD_INTERPOSE(pt_rename, rename)
 DYLD_INTERPOSE(pt_unlink, unlink)
 DYLD_INTERPOSE(pt_usleep, usleep)
 
-static int pt_open(char const* restrict filename, int oflag, ... ) {
+PT_INTERPOSE_EXPORT int pt_open(char const* restrict filename, int oflag, ... ) {
     filename = ue_fix_filename(filename);
     pt_open_fn orig_fn = DYLD_INTERPOSE_ORIG(pt_open_fn, open);
 
@@ -689,19 +761,19 @@ static int pt_open(char const* restrict filename, int oflag, ... ) {
     return orig_fn(filename, oflag);
 }
 
-static int pt_stat(char const* restrict path, struct stat* restrict buf) {
+PT_INTERPOSE_EXPORT int pt_stat(char const* restrict path, struct stat* restrict buf) {
     return DYLD_INTERPOSE_ORIG(pt_stat_fn, stat)(ue_fix_filename(path), buf);
 }
 
-static int pt_access(char const* path, int mode) {
+PT_INTERPOSE_EXPORT int pt_access(char const* path, int mode) {
     return DYLD_INTERPOSE_ORIG(pt_access_fn, access)(ue_fix_filename(path), mode);
 }
 
-static int pt_rename(char const* restrict old_name, char const* restrict new_name) {
+PT_INTERPOSE_EXPORT int pt_rename(char const* restrict old_name, char const* restrict new_name) {
     return DYLD_INTERPOSE_ORIG(pt_rename_fn, rename)(ue_fix_filename(old_name), ue_fix_filename(new_name));
 }
 
-static int pt_unlink(char const* path) {
+PT_INTERPOSE_EXPORT int pt_unlink(char const* path) {
     return DYLD_INTERPOSE_ORIG(pt_unlink_fn, unlink)(ue_fix_filename(path));
 }
 
@@ -710,7 +782,7 @@ static NSMutableDictionary *last_sleep_attempts = nil;
 static dispatch_once_t thread_sleep_once;
 static NSLock *thread_sleep_lock = nil;
 
-static int pt_usleep(useconds_t time) {
+PT_INTERPOSE_EXPORT int pt_usleep(useconds_t time) {
     if (pt_should_block_sleep_spamming()) {
         dispatch_once(&thread_sleep_once, ^{
             thread_sleep_counters = [NSMutableDictionary dictionary];
@@ -993,16 +1065,19 @@ static void pt_applyUIScaleFactor(void) {
     }
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     if (uiScale >= 0.76 && uiScale <= 0.78) {
-        [defaults removeObjectForKey:@"iOSMacScaleFactor"];
-        [defaults removeObjectForKey:@"UINSLastUsedWindowScaleFactor"];
-    } else if (uiScale >= 0.5 && uiScale <= 3.0) {
-        [defaults setDouble:uiScale forKey:@"iOSMacScaleFactor"];
-        [defaults removeObjectForKey:@"UINSLastUsedWindowScaleFactor"];
+        if ([defaults objectForKey:@"iOSMacScaleFactor"] != nil) {
+            [defaults removeObjectForKey:@"iOSMacScaleFactor"];
+        }
     } else {
-        [defaults setDouble:1.0 forKey:@"iOSMacScaleFactor"];
+        double targetScale = (uiScale >= 0.5 && uiScale <= 3.0) ? uiScale : 1.0;
+        id existing = [defaults objectForKey:@"iOSMacScaleFactor"];
+        if (![existing isKindOfClass:[NSNumber class]] || fabs([(NSNumber *)existing doubleValue] - targetScale) > 0.0001) {
+            [defaults setDouble:targetScale forKey:@"iOSMacScaleFactor"];
+        }
+    }
+    if ([defaults objectForKey:@"UINSLastUsedWindowScaleFactor"] != nil) {
         [defaults removeObjectForKey:@"UINSLastUsedWindowScaleFactor"];
     }
-    [defaults synchronize];
 }
 
 static void pt_installTerminationTimeoutHooks(void);
@@ -1339,8 +1414,19 @@ static UIViewController *pt_attachedStartupPresenter(UIViewController *presenter
         UIWindow *window = candidate.viewIfLoaded.window;
         UIWindowScene *scene = window.windowScene;
         if (pt_isAppWindow(window) && !window.hidden && window.alpha > 0.01 &&
-            scene.activationState == UISceneActivationStateForegroundActive &&
+            (scene.activationState == UISceneActivationStateForegroundActive ||
+             scene.activationState == UISceneActivationStateForegroundInactive) &&
             [scene.session.role isEqualToString:UIWindowSceneSessionRoleApplication]) {
+            return candidate;
+        }
+    }
+    return nil;
+}
+
+static UIViewController *pt_visibleOrphanWindowPresenter(UIViewController *presenter) {
+    for (UIViewController *candidate = presenter; candidate; candidate = candidate.parentViewController) {
+        UIWindow *window = candidate.viewIfLoaded.window;
+        if (pt_isAppWindow(window) && !window.hidden && window.alpha > 0.01 && window.windowScene == nil) {
             return candidate;
         }
     }
@@ -1362,6 +1448,10 @@ static void pt_waitForStartupPresenter(UIViewController *presenter, SEL command,
             pt_origPresentViewController(attached, command, destination, animated, completion);
         } else {
             objc_setAssociatedObject(destination, &pt_deferredPresentationKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (source && !destination.presentingViewController &&
+                source.viewIfLoaded.window != nil && !source.presentedViewController) {
+                pt_origPresentViewController(source, command, destination, animated, completion);
+            }
         }
     });
 }
@@ -1372,6 +1462,14 @@ static void pt_presentViewControllerAtStartup(UIViewController *self, SEL comman
     if (NSThread.isMainThread && destination && now < pt_startupPresentationDeadline) {
         if (objc_getAssociatedObject(destination, &pt_deferredPresentationKey)) { return; }
         if (!destination.presentingViewController && !pt_attachedStartupPresenter(self)) {
+            if (pt_visibleOrphanWindowPresenter(self)) {
+                // Dedicated overlay UIWindows created before UISceneWillConnectNotification expect synchronous
+                // fullscreen modal attachment so bare host VCs do not fire viewDidAppear: prematurely.
+                pt_origPresentViewController(self, command, destination, animated, completion);
+                if (destination.presentingViewController || self.presentedViewController) {
+                    return;
+                }
+            }
             // The app can request a modal before Catalyst attaches its first scene window.
             objc_setAssociatedObject(destination, &pt_deferredPresentationKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             pt_waitForStartupPresenter(self, command, destination, animated, completion, now + 3.5);
@@ -1445,7 +1543,7 @@ static NSURL *(*pt_origContainerURLForGroupIdentifier)(id, SEL, NSString *) = NU
 static BOOL pt_appGroupHookInstalled = NO;
 
 static BOOL pt_ensureWritableGroupDirectory(NSFileManager *manager, NSURL *url) {
-    if (!url.isFileURL || url.path.length == 0) {
+    if (![url isKindOfClass:[NSURL class]] || !url.isFileURL || url.path.length == 0) {
         return NO;
     }
 
@@ -1460,7 +1558,7 @@ static BOOL pt_ensureWritableGroupDirectory(NSFileManager *manager, NSURL *url) 
 
 static NSURL *pt_containerURLForGroupIdentifier(NSFileManager *self, SEL _cmd, NSString *groupIdentifier) {
     NSURL *origURL = pt_origContainerURLForGroupIdentifier ? pt_origContainerURLForGroupIdentifier(self, _cmd, groupIdentifier) : nil;
-    if (groupIdentifier.length == 0 || pt_ensureWritableGroupDirectory(self, origURL)) {
+    if (![groupIdentifier isKindOfClass:[NSString class]] || groupIdentifier.length == 0 || pt_ensureWritableGroupDirectory(self, origURL)) {
         return origURL;
     }
 
@@ -1582,8 +1680,32 @@ static void pt_installTerminationWatchdog(void) {
     }];
 }
 
+static _Atomic(bool) pt_playScreenScaledMode = false;
+
+void pt_setPlayScreenScaledMode(BOOL isScaled) {
+    atomic_store_explicit(&pt_playScreenScaledMode, isScaled ? true : false, memory_order_relaxed);
+}
+
+BOOL pt_isPlayScreenScaledMode(void) {
+    return atomic_load_explicit(&pt_playScreenScaledMode, memory_order_relaxed) ? YES : NO;
+}
+
 static void (*pt_origVBLogTestedFaults)(id, SEL, const void *) = NULL;
 static BOOL pt_vbFaultGuardInstalled = NO;
+static id pt_vbBundleObserver = nil;
+static id pt_vbLaunchObserver = nil;
+
+static void pt_removeViewBridgeObservers(void) {
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    if (pt_vbBundleObserver) {
+        [nc removeObserver:pt_vbBundleObserver];
+        pt_vbBundleObserver = nil;
+    }
+    if (pt_vbLaunchObserver) {
+        [nc removeObserver:pt_vbLaunchObserver];
+        pt_vbLaunchObserver = nil;
+    }
+}
 
 static void pt_vbLogTestedFaults(id self, SEL _cmd, const void *timer) {
     // Some weak timer proxies call performSelector: without forwarding the timer.
@@ -1602,6 +1724,7 @@ static void pt_vbLogTestedFaults(id self, SEL _cmd, const void *timer) {
 
 static void pt_tryInstallViewBridgeFaultGuardNow(void) {
     if (pt_vbFaultGuardInstalled) {
+        pt_removeViewBridgeObservers();
         return;
     }
     Class cls = objc_getClass("NSVBNamedFault");
@@ -1615,6 +1738,7 @@ static void pt_tryInstallViewBridgeFaultGuardNow(void) {
             class_replaceMethod(meta, sel, (IMP)pt_vbLogTestedFaults, method_getTypeEncoding(m));
         }
         pt_vbFaultGuardInstalled = YES;
+        pt_removeViewBridgeObservers();
     }
 }
 
@@ -1622,17 +1746,21 @@ static void pt_installViewBridgeFaultGuard(void) {
     pt_tryInstallViewBridgeFaultGuardNow();
     if (!pt_vbFaultGuardInstalled) {
         NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
-        [nc addObserverForName:NSBundleDidLoadNotification
-                        object:nil
-                         queue:nil
-                    usingBlock:^(NSNotification * _Nonnull note) {
+        pt_vbBundleObserver = [nc addObserverForName:NSBundleDidLoadNotification
+                                              object:nil
+                                               queue:nil
+                                          usingBlock:^(NSNotification * _Nonnull note) {
             pt_tryInstallViewBridgeFaultGuardNow();
         }];
-        [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
-                        object:nil
-                         queue:nil
-                    usingBlock:^(NSNotification * _Nonnull note) {
+        pt_vbLaunchObserver = [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                              object:nil
+                                               queue:nil
+                                          usingBlock:^(NSNotification * _Nonnull note) {
             pt_tryInstallViewBridgeFaultGuardNow();
+            if (pt_vbLaunchObserver) {
+                [[NSNotificationCenter defaultCenter] removeObserver:pt_vbLaunchObserver];
+                pt_vbLaunchObserver = nil;
+            }
         }];
     }
 }
@@ -1743,6 +1871,15 @@ static const void *kPTAppliedGlassEffectKey = &kPTAppliedGlassEffectKey;
 static const void *kPTAppliedGlassOverlayKey = &kPTAppliedGlassOverlayKey;
 static const void *kPTAppliedGlassCornersKey = &kPTAppliedGlassCornersKey;
 static const void *kPTAppliedGlassBorderKey = &kPTAppliedGlassBorderKey;
+static const void *kPTAppliedGlassStateKey = &kPTAppliedGlassStateKey;
+
+typedef struct {
+    CGFloat w;
+    CGFloat h;
+    CGFloat maxR;
+    CACornerMask mask;
+    BOOL isDark;
+} PTGlassLayoutState;
 
 static UIBlurEffect *pt_fallbackBlurEffectForGlassEffect(id glassEffect,
                                                           UITraitCollection *traitCollection,
@@ -1919,6 +2056,7 @@ static void pt_removeGlassDecorationLayers(UIVisualEffectView *view) {
         objc_setAssociatedObject(view, kPTAppliedGlassBorderKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
     objc_setAssociatedObject(view, kPTAppliedGlassCornersKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(view, kPTAppliedGlassStateKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     [CATransaction commit];
 }
 
@@ -1942,6 +2080,22 @@ static void pt_updateGlassGeometryAndRim(UIVisualEffectView *view) {
     if (br > 0.5) { mask |= kCALayerMaxXMaxYCorner; }
 
     BOOL isDark = (view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    NSValue *prevVal = objc_getAssociatedObject(view, kPTAppliedGlassStateKey);
+    if (prevVal) {
+        PTGlassLayoutState prev;
+        [prevVal getValue:&prev];
+        if (fabs(prev.w - bounds.size.width) <= 0.1 &&
+            fabs(prev.h - bounds.size.height) <= 0.1 &&
+            fabs(prev.maxR - maxR) <= 0.1 &&
+            prev.mask == mask &&
+            prev.isDark == isDark) {
+            return;
+        }
+    }
+    PTGlassLayoutState current = { bounds.size.width, bounds.size.height, maxR, mask, isDark };
+    objc_setAssociatedObject(view, kPTAppliedGlassStateKey,
+                             [NSValue valueWithBytes:&current objCType:@encode(PTGlassLayoutState)],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -1969,17 +2123,22 @@ static id pt_visualEffectInitWithEffect(UIVisualEffectView *self, SEL _cmd, id e
         return pt_origVisualEffectInitWithEffect ? pt_origVisualEffectInitWithEffect(self, _cmd, effect) : nil;
     }
     UIColor *overlay = nil;
-    UIBlurEffect *fallback = pt_fallbackBlurEffectForGlassEffect(effect, nil, &overlay);
+    UITraitCollection *currentTraits = [UITraitCollection currentTraitCollection];
+    UIBlurEffect *fallback = pt_fallbackBlurEffectForGlassEffect(effect, currentTraits, &overlay);
     id instance = pt_origVisualEffectInitWithEffect ? pt_origVisualEffectInitWithEffect(self, _cmd, fallback) : nil;
     if (instance) {
         UIVisualEffectView *effectView = (UIVisualEffectView *)instance;
         objc_setAssociatedObject(effectView, kPTAppliedGlassEffectKey, effect, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        UIColor *resolvedOverlay = nil;
-        UIBlurEffect *resolvedFallback = pt_fallbackBlurEffectForGlassEffect(effect, effectView.traitCollection, &resolvedOverlay);
-        if (pt_origVisualEffectSetEffect) {
-            pt_origVisualEffectSetEffect(effectView, @selector(setEffect:), resolvedFallback);
+        UIColor *effectiveOverlay = overlay;
+        if (effectView.traitCollection.userInterfaceStyle != currentTraits.userInterfaceStyle) {
+            UIColor *resolvedOverlay = nil;
+            UIBlurEffect *resolvedFallback = pt_fallbackBlurEffectForGlassEffect(effect, effectView.traitCollection, &resolvedOverlay);
+            if (pt_origVisualEffectSetEffect) {
+                pt_origVisualEffectSetEffect(effectView, @selector(setEffect:), resolvedFallback);
+            }
+            effectiveOverlay = resolvedOverlay ?: overlay;
         }
-        pt_applyGlassFallbackAppearance(effectView, resolvedOverlay ?: overlay);
+        pt_applyGlassFallbackAppearance(effectView, effectiveOverlay);
         pt_updateGlassGeometryAndRim(effectView);
     }
     return instance;
@@ -2121,6 +2280,16 @@ static void (*pt_origTabBarLayoutSubviews)(id, SEL) = NULL;
 static void (*pt_origTabBarTraitCollectionDidChange)(id, SEL, UITraitCollection *) = NULL;
 static BOOL pt_floatingTabBarGuardInstalled = NO;
 static const void *kPTFloatingTabBarStyledKey = &kPTFloatingTabBarStyledKey;
+static const void *kPTFloatingTabBarStateKey = &kPTFloatingTabBarStateKey;
+
+typedef struct {
+    CGFloat w;
+    CGFloat h;
+    CGFloat winW;
+    CGFloat winH;
+    BOOL isFloating;
+    BOOL isDark;
+} PTTabBarCapsuleState;
 
 static void pt_updateFloatingTabBarCapsule(UITabBar *tabBar) {
     if (!tabBar.window) {
@@ -2137,6 +2306,27 @@ static void pt_updateFloatingTabBarCapsule(UITabBar *tabBar) {
     CGFloat leftGap = CGRectGetMinX(rectInWindow) - CGRectGetMinX(winBounds);
     CGFloat rightGap = CGRectGetMaxX(winBounds) - CGRectGetMaxX(rectInWindow);
     BOOL isFloating = leftGap >= 6.0 && rightGap >= 6.0;
+    BOOL isDark = (tabBar.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+
+    NSValue *prevVal = objc_getAssociatedObject(tabBar, kPTFloatingTabBarStateKey);
+    if (prevVal) {
+        PTTabBarCapsuleState prev;
+        [prevVal getValue:&prev];
+        if (fabs(prev.w - width) <= 0.1 &&
+            fabs(prev.h - height) <= 0.1 &&
+            fabs(prev.winW - CGRectGetWidth(winBounds)) <= 0.1 &&
+            fabs(prev.winH - CGRectGetHeight(winBounds)) <= 0.1 &&
+            prev.isFloating == isFloating &&
+            prev.isDark == isDark) {
+            return;
+        }
+    }
+    PTTabBarCapsuleState current = {
+        width, height, CGRectGetWidth(winBounds), CGRectGetHeight(winBounds), isFloating, isDark
+    };
+    objc_setAssociatedObject(tabBar, kPTFloatingTabBarStateKey,
+                             [NSValue valueWithBytes:&current objCType:@encode(PTTabBarCapsuleState)],
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
@@ -2158,7 +2348,6 @@ static void pt_updateFloatingTabBarCapsule(UITabBar *tabBar) {
     tabBar.layer.cornerCurve = kCACornerCurveContinuous;
     tabBar.clipsToBounds = YES;
 
-    BOOL isDark = (tabBar.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     tabBar.layer.borderWidth = 0.75;
     tabBar.layer.borderColor = (isDark
         ? [UIColor colorWithWhite:1.0 alpha:0.16]
@@ -2235,19 +2424,892 @@ static void pt_installFloatingTabBarCapsuleGuard(void) {
     }
 }
 
+#if TARGET_OS_MACCATALYST
+@interface PTUnsupportedNIDeviceCapability : NSObject
+@property (nonatomic, readonly) BOOL supportsPreciseDistanceMeasurement;
+@property (nonatomic, readonly) BOOL supportsDirectionMeasurement;
+@property (nonatomic, readonly) BOOL supportsCameraAssistance;
+@property (nonatomic, readonly) BOOL supportsExtendedDistanceMeasurement;
+@property (nonatomic, readonly) BOOL supportsDLTDOAMeasurement;
+@property (nonatomic, readonly) BOOL supportsBluetoothChannelSounding;
+@end
+
+@implementation PTUnsupportedNIDeviceCapability
+- (BOOL)supportsPreciseDistanceMeasurement { return NO; }
+- (BOOL)supportsDirectionMeasurement { return NO; }
+- (BOOL)supportsCameraAssistance { return NO; }
+- (BOOL)supportsExtendedDistanceMeasurement { return NO; }
+- (BOOL)supportsDLTDOAMeasurement { return NO; }
+- (BOOL)supportsBluetoothChannelSounding { return NO; }
+@end
+
+static BOOL pt_nearbyInteractionHooksInstalled = NO;
+static id pt_nearbyInteractionBundleObserver = nil;
+
+static BOOL pt_niSessionIsSupported(id self, SEL _cmd) {
+    return NO;
+}
+
+static id pt_niSessionDeviceCapabilities(id self, SEL _cmd) {
+    static PTUnsupportedNIDeviceCapability *shared = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        shared = [[PTUnsupportedNIDeviceCapability alloc] init];
+    });
+    return shared;
+}
+
+static void pt_tryInstallNearbyInteractionGuardNow(void) {
+    if (pt_nearbyInteractionHooksInstalled) {
+        if (pt_nearbyInteractionBundleObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:pt_nearbyInteractionBundleObserver];
+            pt_nearbyInteractionBundleObserver = nil;
+        }
+        return;
+    }
+    Class niSession = objc_getClass("NISession");
+    if (!niSession) {
+        return;
+    }
+    Class niMeta = object_getClass(niSession);
+    if (!niMeta) {
+        return;
+    }
+    SEL supportedSel = sel_registerName("isSupported");
+    Method supportedM = class_getClassMethod(niSession, supportedSel);
+    if (supportedM) {
+        class_replaceMethod(niMeta, supportedSel, (IMP)pt_niSessionIsSupported,
+                            method_getTypeEncoding(supportedM));
+    }
+    SEL capSel = sel_registerName("deviceCapabilities");
+    Method capM = class_getClassMethod(niSession, capSel);
+    if (capM) {
+        class_replaceMethod(niMeta, capSel, (IMP)pt_niSessionDeviceCapabilities,
+                            method_getTypeEncoding(capM));
+    }
+    pt_nearbyInteractionHooksInstalled = YES;
+    if (pt_nearbyInteractionBundleObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:pt_nearbyInteractionBundleObserver];
+        pt_nearbyInteractionBundleObserver = nil;
+    }
+}
+
+/// Mac Catalyst does not support UWB NearbyInteraction, but `+[NISession isSupported]`
+/// synchronously waits on a 10-second XPC semaphore before returning NO. Short-circuit
+/// both `isSupported` and `deviceCapabilities` so apps linking NearbyInteraction start immediately.
+static void pt_installNearbyInteractionGuard(void) {
+    pt_tryInstallNearbyInteractionGuardNow();
+    if (!pt_nearbyInteractionHooksInstalled) {
+        pt_nearbyInteractionBundleObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSBundleDidLoadNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification * _Nonnull note) {
+            pt_tryInstallNearbyInteractionGuardNow();
+        }];
+    }
+}
+
+#pragma mark - Generic Third-Party Splash Ad SDK Blocker
+
+typedef struct {
+    const char *className;
+    Class resolvedClass;
+    const char *errorClassName;
+    const char *fallbackErrorClassName;
+    const char * const *failSels;
+    size_t failSelCount;
+    const char * const *boolNoSels;
+    size_t boolNoSelCount;
+    const char * const *boolNo1FailSels;
+    size_t boolNo1FailSelCount;
+    const char * const *noop1Sels;
+    size_t noop1SelCount;
+    const char * const *void0Sels;
+    size_t void0SelCount;
+    const char * const *void1Sels;
+    size_t void1SelCount;
+    const char * const *void1Bool1Sels;
+    size_t void1Bool1SelCount;
+    const char * const *void2Sels;
+    size_t void2SelCount;
+    const char * const *void3Sels;
+    size_t void3SelCount;
+} PTSplashSDKSpec;
+
+static const char * const pt_csjFailSels[] = {
+    "splashAdLoadFail:error:", "splashAd:didFailWithError:", "splashAdDidShowFailed:error:"
+};
+static const char * const pt_csjVoid0[] = { "loadAdData" };
+static const char * const pt_csjVoid1[] = { "showSplashViewInRootViewController:" };
+
+static const char * const pt_abuFailSels[] = {
+    "splashAdLoadFail:error:", "splashAdDidShowFailed:error:", "splashAdRenderFail:error:"
+};
+static const char * const pt_abuVoid0[] = { "loadAd", "showAd" };
+
+static const char * const pt_buViewFailSels[] = { "splashAd:didFailWithError:" };
+static const char * const pt_buExpressFailSels[] = {
+    "nativeExpressSplashView:didFailWithError:", "splashAd:didFailWithError:"
+};
+
+static const char * const pt_gdtFailSels[] = { "splashAdFailToPresent:withError:" };
+static const char * const pt_gdtBoolNo[] = { "isAdValid" };
+static const char * const pt_gdtNoop1[] = { "preloadSplashOrderWithPlacementId:" };
+static const char * const pt_gdtVoid0[] = { "loadAd", "loadFullScreenAd" };
+static const char * const pt_gdtVoid1[] = { "loadAdAndShowInWindow:" };
+static const char * const pt_gdtVoid2[] = { "loadAdAndShowInWindow:withBottomView:" };
+static const char * const pt_gdtVoid3[] = {
+    "loadAdAndShowInWindow:withBottomView:skipView:",
+    "loadAdAndShowFullScreenInWindow:withLogoImage:skipView:",
+    "showAdInWindow:withBottomView:skipView:",
+    "showFullScreenAdInWindow:withLogoImage:skipView:",
+    "showAdInWindow:adProviderView:skipView:"
+};
+
+static const char * const pt_baiduFailSels[] = {
+    "splashlFailPresentScreen:withError:", "splashFailPresentScreen:withError:", "splashDidFailWithError:"
+};
+static const char * const pt_baiduBoolNo[] = { "isReady" };
+static const char * const pt_baiduVoid0[] = { "load" };
+static const char * const pt_baiduVoid1[] = {
+    "loadAndDisplayUsingKeyWindow:", "loadAndDisplayUsingContainerView:",
+    "loadBiddingAd:", "showInContainerView:", "showSplashViewInViewController:"
+};
+static const char * const pt_baiduVoid1Bool1[] = { "loadAdWithContainerView:showAd:" };
+
+static const char * const pt_ksFailSels[] = {
+    "ksad_splashAd:didFailWithError:", "splashAd:didFailWithError:"
+};
+static const char * const pt_ksVoid0[] = { "loadAdData" };
+static const char * const pt_ksVoid1[] = {
+    "loadAdDataWithResponse:", "loadAdDataWithResponseV2:", "showInView:"
+};
+
+static const char * const pt_msFailSels[] = {
+    "msSplashLoadedFail:withError:", "msSplashError:withError:"
+};
+static const char * const pt_msBoolNo[] = { "isAdValid" };
+static const char * const pt_msVoid0[] = { "showSplashAd" };
+static const char * const pt_msVoid1[] = { "loadSplashAd:", "loadAndShowSplashAd:", "showSplashAdInWindow:" };
+static const char * const pt_msVoid2[] = { "loadSplashAdWithPid:adParam:" };
+static const char * const pt_msVoid3[] = { "loadAndShowSplashAdWithPid:adParam:inWindow:" };
+
+static const char * const pt_beiziFailSels[] = {
+    "BeiZi_splash:didFailToLoadAdWithError:", "beizi_splashDidFailWithError:", "BeiZi_publicDidFailWithError:"
+};
+static const char * const pt_beiziBoolNo[] = { "isValid" };
+static const char * const pt_beiziVoid0[] = { "BeiZi_loadSplashAd" };
+static const char * const pt_beiziVoid1[] = { "BeiZi_loadSplashAdWithToken:", "BeiZi_showSplashAdWithWindow:" };
+
+static const char * const pt_jadFailSels[] = {
+    "jadSplashViewDidLoadFailure:error:", "jadSplashViewDidRenderFailure:error:", "jadSplashView:didFailWithError:"
+};
+static const char * const pt_jadVoid0[] = { "loadAdData", "preloadAdData" };
+
+static const char * const pt_windFailSels[] = {
+    "onSplashAdLoadFail:error:", "splashAdDidFailToLoad:error:"
+};
+static const char * const pt_windBoolNo[] = { "isAdReady" };
+static const char * const pt_windVoid0[] = { "loadAdData", "loadAndShow" };
+static const char * const pt_windVoid1[] = { "loadAdAndShowSplashAdWithWindow:" };
+
+static const char * const pt_abusFailSels[] = {
+    "splashAd:didLoadFailWithError:", "splashAdLoadFail:error:", "splashAd:didFailWithError:", "splashAdDidShowFailed:error:"
+};
+static const char * const pt_abusBoolNo[] = { "isReady" };
+static const char * const pt_abusBoolNo1Fail[] = { "showInWindow:", "showInWindowWithBlock:" };
+static const char * const pt_abusVoid0[] = { "loadAdData", "loadAd" };
+
+static const char * const pt_ampsFailSels[] = { "ampsSplashAdLoadFail:error:", "ampsSplashAdShowFail:error:" };
+static const char * const pt_ampsBoolNo[] = { "isReadyAd" };
+static const char * const pt_ampsVoid0[] = { "loadSplashAd", "preloadAd" };
+static const char * const pt_ampsVoid1[] = { "showSplashViewInWindow:" };
+
+static const char * const pt_adprofFailSels[] = {
+    "splashAd:didFailWithError:", "splashAdLoadFail:error:", "splashAdDidFailToLoad:error:", "splashAdFailWithError:"
+};
+static const char * const pt_adprofVoid0[] = { "loadAd" };
+static const char * const pt_adprofVoid1[] = { "loadAdWithToken:" };
+static const char * const pt_adprofVoid2[] = { "showAdToWindow:bottomView:" };
+
+static const char * const pt_ubixFailSels[] = { "ubixSplashAdFailedToLoad:withError:", "ubixSplashAdFailedToShow:withError:" };
+static const char * const pt_ubixBoolNo[] = { "isValid", "_isReady" };
+static const char * const pt_ubixVoid0[] = { "loadAd" };
+static const char * const pt_ubixVoid1[] = { "loadBiddingAd:" };
+static const char * const pt_ubixVoid2[] = { "showAdToWindow:bottomView:" };
+
+static const char * const pt_fancyFailSels[] = {
+    "fancy_splashAd:didFailWithError:", "fancy_splashAdVisibleFail:error:", "splashAd:didFailWithError:"
+};
+static const char * const pt_fancyBoolNo[] = { "isReady", "isValidImp" };
+static const char * const pt_fancyVoid0[] = { "loadAd" };
+static const char * const pt_fancyVoid2[] = { "showAdFromRootViewController:bottomView:" };
+
+static const char * const pt_ptgFailSels[] = {
+    "ptg_splashAd:didFailWithError:", "ptg_splashAdVisibleError:error:", "splashAd:didFailWithError:"
+};
+static const char * const pt_ptgBoolNo[] = { "isReady" };
+static const char * const pt_ptgVoid0[] = { "loadAd" };
+static const char * const pt_ptgVoid1[] = { "loadAdWithAdm:", "showAdWithViewController:" };
+static const char * const pt_ptgVoid2[] = { "showAdWithViewController:bottomView:" };
+
+static const char * const pt_qumengFailSels[] = {
+    "qumeng_splashAdLoadFail:error:", "qumeng_splashAdShowFail:error:", "qumeng_splashAdRenderFail:error:"
+};
+static const char * const pt_qumengBoolNo[] = { "isValid" };
+static const char * const pt_qumengVoid0[] = { "loadAdData" };
+static const char * const pt_qumengVoid1[] = { "showSplashWindow:", "showSplashViewController:" };
+static const char * const pt_qumengVoid2[] = { "showSplashWindow:withBottomView:", "showSplashViewController:withBottomView:" };
+static const char * const pt_qumengVoid3[] = { "showSplashAdWithController:bottomView:inWindow:" };
+
+static const char * const pt_bezfFailSels[] = {
+    "bezf_splashAd:didFailWithError:", "bezf_splashAdVisibleFail:error:", "splashAd:didFailWithError:"
+};
+static const char * const pt_bezfBoolNo[] = { "isReady", "isValidImp" };
+static const char * const pt_bezfVoid0[] = { "loadAd" };
+static const char * const pt_bezfVoid2[] = { "showAdFromRootViewController:bottomView:" };
+
+static const char * const pt_mtgFailSels[] = {
+    "splashADLoadFail:error:", "splashADPreloadFail:error:", "splashADShowFail:error:"
+};
+static const char * const pt_mtgBoolNo[] = { "isADReadyToShow", "isBiddingADReadyToShow" };
+static const char * const pt_mtgVoid0[] = { "preload" };
+static const char * const pt_mtgVoid1[] = { "preloadWithBidToken:" };
+static const char * const pt_mtgVoid2[] = { "showInKeyWindow:customView:", "showBiddingADInKeyWindow:customView:" };
+
+#define PT_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
+
+static PTSplashSDKSpec pt_splashSpecs[] = {
+    { "CSJSplashAd", Nil, "CSJAdError", "BUAdError", pt_csjFailSels, PT_COUNT(pt_csjFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_csjVoid0, PT_COUNT(pt_csjVoid0), pt_csjVoid1, PT_COUNT(pt_csjVoid1), NULL, 0, NULL, 0, NULL, 0 },
+    { "BUSplashAd", Nil, "BUAdError", "CSJAdError", pt_csjFailSels, PT_COUNT(pt_csjFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_csjVoid0, PT_COUNT(pt_csjVoid0), pt_csjVoid1, PT_COUNT(pt_csjVoid1), NULL, 0, NULL, 0, NULL, 0 },
+    { "BUSplashAdView", Nil, "BUAdError", "CSJAdError", pt_buViewFailSels, PT_COUNT(pt_buViewFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_csjVoid0, PT_COUNT(pt_csjVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
+    { "BUNativeExpressSplashView", Nil, "BUAdError", "CSJAdError", pt_buExpressFailSels, PT_COUNT(pt_buExpressFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_csjVoid0, PT_COUNT(pt_csjVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
+    { "ABUVisualSplashAdManager", Nil, "BUAdError", "CSJAdError", pt_abuFailSels, PT_COUNT(pt_abuFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_abuVoid0, PT_COUNT(pt_abuVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
+    { "ABUSplashAd", Nil, "BUAdError", "CSJAdError", pt_abusFailSels, PT_COUNT(pt_abusFailSels),
+      pt_abusBoolNo, PT_COUNT(pt_abusBoolNo), pt_abusBoolNo1Fail, PT_COUNT(pt_abusBoolNo1Fail), NULL, 0,
+      pt_abusVoid0, PT_COUNT(pt_abusVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
+    { "GDTSplashAd", Nil, NULL, NULL, pt_gdtFailSels, PT_COUNT(pt_gdtFailSels), pt_gdtBoolNo, PT_COUNT(pt_gdtBoolNo), NULL, 0,
+      pt_gdtNoop1, PT_COUNT(pt_gdtNoop1), pt_gdtVoid0, PT_COUNT(pt_gdtVoid0), pt_gdtVoid1, PT_COUNT(pt_gdtVoid1),
+      NULL, 0, pt_gdtVoid2, PT_COUNT(pt_gdtVoid2), pt_gdtVoid3, PT_COUNT(pt_gdtVoid3) },
+    { "BaiduMobAdSplash", Nil, NULL, NULL, pt_baiduFailSels, PT_COUNT(pt_baiduFailSels), pt_baiduBoolNo, PT_COUNT(pt_baiduBoolNo), NULL, 0,
+      NULL, 0, pt_baiduVoid0, PT_COUNT(pt_baiduVoid0), pt_baiduVoid1, PT_COUNT(pt_baiduVoid1),
+      pt_baiduVoid1Bool1, PT_COUNT(pt_baiduVoid1Bool1), NULL, 0, NULL, 0 },
+    { "KSSplashAdView", Nil, NULL, NULL, pt_ksFailSels, PT_COUNT(pt_ksFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_ksVoid0, PT_COUNT(pt_ksVoid0), pt_ksVoid1, PT_COUNT(pt_ksVoid1), NULL, 0, NULL, 0, NULL, 0 },
+    { "MSSplashAd", Nil, NULL, NULL, pt_msFailSels, PT_COUNT(pt_msFailSels), pt_msBoolNo, PT_COUNT(pt_msBoolNo), NULL, 0,
+      NULL, 0, pt_msVoid0, PT_COUNT(pt_msVoid0), pt_msVoid1, PT_COUNT(pt_msVoid1),
+      NULL, 0, pt_msVoid2, PT_COUNT(pt_msVoid2), pt_msVoid3, PT_COUNT(pt_msVoid3) },
+    { "BeiZiSplash", Nil, NULL, NULL, pt_beiziFailSels, PT_COUNT(pt_beiziFailSels), pt_beiziBoolNo, PT_COUNT(pt_beiziBoolNo), NULL, 0,
+      NULL, 0, pt_beiziVoid0, PT_COUNT(pt_beiziVoid0), pt_beiziVoid1, PT_COUNT(pt_beiziVoid1),
+      NULL, 0, NULL, 0, NULL, 0 },
+    { "JADSplashView", Nil, NULL, NULL, pt_jadFailSels, PT_COUNT(pt_jadFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_jadVoid0, PT_COUNT(pt_jadVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
+    { "WindSplashAd", Nil, NULL, NULL, pt_windFailSels, PT_COUNT(pt_windFailSels), pt_windBoolNo, PT_COUNT(pt_windBoolNo), NULL, 0,
+      NULL, 0, pt_windVoid0, PT_COUNT(pt_windVoid0), pt_windVoid1, PT_COUNT(pt_windVoid1),
+      NULL, 0, NULL, 0, NULL, 0 },
+    { "WindMillSplashAd", Nil, NULL, NULL, pt_windFailSels, PT_COUNT(pt_windFailSels), pt_windBoolNo, PT_COUNT(pt_windBoolNo), NULL, 0,
+      NULL, 0, pt_windVoid0, PT_COUNT(pt_windVoid0), pt_windVoid1, PT_COUNT(pt_windVoid1),
+      NULL, 0, NULL, 0, NULL, 0 },
+    { "AMPSSplashAd", Nil, NULL, NULL, pt_ampsFailSels, PT_COUNT(pt_ampsFailSels), pt_ampsBoolNo, PT_COUNT(pt_ampsBoolNo), NULL, 0,
+      NULL, 0, pt_ampsVoid0, PT_COUNT(pt_ampsVoid0), pt_ampsVoid1, PT_COUNT(pt_ampsVoid1), NULL, 0, NULL, 0, NULL, 0 },
+    { "AdProfSplashAd", Nil, NULL, NULL, pt_adprofFailSels, PT_COUNT(pt_adprofFailSels), NULL, 0, NULL, 0,
+      NULL, 0, pt_adprofVoid0, PT_COUNT(pt_adprofVoid0), pt_adprofVoid1, PT_COUNT(pt_adprofVoid1),
+      NULL, 0, pt_adprofVoid2, PT_COUNT(pt_adprofVoid2), NULL, 0 },
+    { "UBiXSplashAd", Nil, NULL, NULL, pt_ubixFailSels, PT_COUNT(pt_ubixFailSels), pt_ubixBoolNo, PT_COUNT(pt_ubixBoolNo), NULL, 0,
+      NULL, 0, pt_ubixVoid0, PT_COUNT(pt_ubixVoid0), pt_ubixVoid1, PT_COUNT(pt_ubixVoid1),
+      NULL, 0, pt_ubixVoid2, PT_COUNT(pt_ubixVoid2), NULL, 0 },
+    { "FancySplashAd", Nil, NULL, NULL, pt_fancyFailSels, PT_COUNT(pt_fancyFailSels), pt_fancyBoolNo, PT_COUNT(pt_fancyBoolNo), NULL, 0,
+      NULL, 0, pt_fancyVoid0, PT_COUNT(pt_fancyVoid0), NULL, 0, NULL, 0, pt_fancyVoid2, PT_COUNT(pt_fancyVoid2), NULL, 0 },
+    { "PTGSplashAd", Nil, NULL, NULL, pt_ptgFailSels, PT_COUNT(pt_ptgFailSels), pt_ptgBoolNo, PT_COUNT(pt_ptgBoolNo), NULL, 0,
+      NULL, 0, pt_ptgVoid0, PT_COUNT(pt_ptgVoid0), pt_ptgVoid1, PT_COUNT(pt_ptgVoid1),
+      NULL, 0, pt_ptgVoid2, PT_COUNT(pt_ptgVoid2), NULL, 0 },
+    { "QuMengSplashAd", Nil, NULL, NULL, pt_qumengFailSels, PT_COUNT(pt_qumengFailSels), pt_qumengBoolNo, PT_COUNT(pt_qumengBoolNo), NULL, 0,
+      NULL, 0, pt_qumengVoid0, PT_COUNT(pt_qumengVoid0), pt_qumengVoid1, PT_COUNT(pt_qumengVoid1),
+      NULL, 0, pt_qumengVoid2, PT_COUNT(pt_qumengVoid2), pt_qumengVoid3, PT_COUNT(pt_qumengVoid3) },
+    { "BEZFSplashAd", Nil, NULL, NULL, pt_bezfFailSels, PT_COUNT(pt_bezfFailSels), pt_bezfBoolNo, PT_COUNT(pt_bezfBoolNo), NULL, 0,
+      NULL, 0, pt_bezfVoid0, PT_COUNT(pt_bezfVoid0), NULL, 0, NULL, 0, pt_bezfVoid2, PT_COUNT(pt_bezfVoid2), NULL, 0 },
+    { "MTGSplashAD", Nil, NULL, NULL, pt_mtgFailSels, PT_COUNT(pt_mtgFailSels), pt_mtgBoolNo, PT_COUNT(pt_mtgBoolNo), NULL, 0,
+      NULL, 0, pt_mtgVoid0, PT_COUNT(pt_mtgVoid0), pt_mtgVoid1, PT_COUNT(pt_mtgVoid1),
+      NULL, 0, pt_mtgVoid2, PT_COUNT(pt_mtgVoid2), NULL, 0 },
+};
+
+static NSError *pt_splashNoFillErrorForSpec(const PTSplashSDKSpec *spec) {
+    Class errCls = [NSError class];
+    if (spec) {
+        const char *candidates[2] = { spec->errorClassName, spec->fallbackErrorClassName };
+        for (int i = 0; i < 2; i++) {
+            if (!candidates[i]) {
+                continue;
+            }
+            Class candidate = objc_getClass(candidates[i]);
+            if (candidate && [candidate isSubclassOfClass:[NSError class]]) {
+                errCls = candidate;
+                break;
+            }
+        }
+    }
+    NSError *err = [errCls errorWithDomain:@"com.playtools.splashblock"
+                                      code:20001
+                                  userInfo:@{NSLocalizedDescriptionKey: @"No splash ad available"}];
+    SEL setErrCodeSel = sel_registerName("setErrorCode:");
+    if (err && [err respondsToSelector:setErrCodeSel]) {
+        Method m = class_getInstanceMethod(object_getClass(err), setErrCodeSel);
+        if (m && method_getNumberOfArguments(m) == 3) {
+            char argType[16] = {0};
+            method_getArgumentType(m, 2, argType, sizeof(argType));
+            if (argType[0] == 'q' || argType[0] == 'Q' || argType[0] == 'i' || argType[0] == 'I') {
+                ((void (*)(id, SEL, NSInteger))objc_msgSend)(err, setErrCodeSel, 20001);
+            }
+        }
+    }
+    return err;
+}
+
+static NSError *pt_splashNoFillError(void) {
+    return pt_splashNoFillErrorForSpec(NULL);
+}
+
+static id pt_splashDelegateForObject(id obj) {
+    if (!obj) {
+        return nil;
+    }
+    SEL delSel = @selector(delegate);
+    if (![obj respondsToSelector:delSel]) {
+        return nil;
+    }
+    Method m = class_getInstanceMethod(object_getClass(obj), delSel);
+    if (!m) {
+        return nil;
+    }
+    char retType[16] = {0};
+    method_getReturnType(m, retType, sizeof(retType));
+    if (retType[0] != '@') {
+        return nil;
+    }
+    return ((id (*)(id, SEL))objc_msgSend)(obj, delSel);
+}
+
+static const PTSplashSDKSpec *pt_splashSpecForObject(id obj) {
+    if (!obj) {
+        return NULL;
+    }
+    size_t count = PT_COUNT(pt_splashSpecs);
+    for (size_t i = 0; i < count; i++) {
+        if (pt_splashSpecs[i].resolvedClass && [obj isMemberOfClass:pt_splashSpecs[i].resolvedClass]) {
+            return &pt_splashSpecs[i];
+        }
+    }
+    for (size_t i = 0; i < count; i++) {
+        if (pt_splashSpecs[i].resolvedClass && [obj isKindOfClass:pt_splashSpecs[i].resolvedClass]) {
+            return &pt_splashSpecs[i];
+        }
+    }
+    return NULL;
+}
+
+static void pt_notifySplashDelegateFailure(id ad, const PTSplashSDKSpec *spec) {
+    if (!ad || !spec || !spec->failSels || spec->failSelCount == 0) {
+        return;
+    }
+    const char * const *selNames = spec->failSels;
+    size_t selCount = spec->failSelCount;
+    __strong id strongAd = ad;
+    __weak id weakInitialDelegate = pt_splashDelegateForObject(strongAd);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = pt_splashDelegateForObject(strongAd) ?: weakInitialDelegate;
+        if (!delegate) {
+            return;
+        }
+        Class delClass = object_getClass(delegate);
+        for (size_t i = 0; i < selCount; i++) {
+            const char *selName = selNames[i];
+            SEL sel = sel_registerName(selName);
+            if (![delegate respondsToSelector:sel]) {
+                continue;
+            }
+            Method m = class_getInstanceMethod(delClass, sel);
+            if (!m) {
+                continue;
+            }
+            unsigned int nargs = method_getNumberOfArguments(m);
+            @try {
+                if (nargs == 4) {
+                    char argType[16] = {0};
+                    method_getArgumentType(m, 3, argType, sizeof(argType));
+                    if (argType[0] == 'i' || argType[0] == 'I' || argType[0] == 'q' || argType[0] == 'Q') {
+                        ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(delegate, sel, strongAd, 0);
+                    } else {
+                        ((void (*)(id, SEL, id, id))objc_msgSend)(delegate, sel, strongAd, pt_splashNoFillErrorForSpec(spec));
+                    }
+                    break;
+                } else if (nargs == 3) {
+                    char argType[16] = {0};
+                    method_getArgumentType(m, 2, argType, sizeof(argType));
+                    if (argType[0] == '@') {
+                        id arg = (strstr(selName, "Error:") || strstr(selName, "error:"))
+                            ? (id)pt_splashNoFillErrorForSpec(spec)
+                            : strongAd;
+                        ((void (*)(id, SEL, id))objc_msgSend)(delegate, sel, arg);
+                    }
+                    break;
+                }
+            } @catch (NSException *ex) {
+                NSLog(@"[PlayTools] Splash delegate callback exception (%@): %@", NSStringFromSelector(sel), ex);
+                break;
+            }
+        }
+    });
+}
+
+static void pt_splashDispatchSpecFailure(id self) {
+    const PTSplashSDKSpec *spec = pt_splashSpecForObject(self);
+    if (spec) {
+        pt_notifySplashDelegateFailure(self, spec);
+    }
+}
+
+static void pt_splashLoadVoid0(id self, SEL _cmd) {
+    (void)_cmd;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashLoadVoid1(id self, SEL _cmd, id a1) {
+    (void)_cmd;
+    (void)a1;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashLoadVoid1Bool1(id self, SEL _cmd, id a1, BOOL a2) {
+    (void)_cmd;
+    (void)a1;
+    (void)a2;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashLoadVoid2(id self, SEL _cmd, id a1, id a2) {
+    (void)_cmd;
+    (void)a1;
+    (void)a2;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashLoadVoid3(id self, SEL _cmd, id a1, id a2, id a3) {
+    (void)_cmd;
+    (void)a1;
+    (void)a2;
+    (void)a3;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static BOOL pt_splashBoolNO(id self, SEL _cmd) {
+    (void)self;
+    (void)_cmd;
+    return NO;
+}
+
+static BOOL pt_splashBoolNo1(id self, SEL _cmd, id a1) {
+    (void)self;
+    (void)_cmd;
+    (void)a1;
+    return NO;
+}
+
+static BOOL pt_splashBoolNo1AndFail(id self, SEL _cmd, id a1) {
+    (void)_cmd;
+    (void)a1;
+    pt_splashDispatchSpecFailure(self);
+    return NO;
+}
+
+static void pt_splashLoadWindowViewTimeout(id self, SEL _cmd, id w, id v, NSInteger t) {
+    (void)_cmd;
+    (void)w;
+    (void)v;
+    (void)t;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashLoadWindowViewTokenTimeout(id self, SEL _cmd, id w, id v, id tok, NSInteger t) {
+    (void)_cmd;
+    (void)w;
+    (void)v;
+    (void)tok;
+    (void)t;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashNoop1(id self, SEL _cmd, id a1) {
+    (void)self;
+    (void)_cmd;
+    (void)a1;
+}
+
+static void pt_gadLoadWithAdUnitID(id self, SEL _cmd, id adUnitID, id request, void (^completionHandler)(id _Nullable, NSError * _Nullable)) {
+    (void)self;
+    (void)_cmd;
+    (void)adUnitID;
+    (void)request;
+    if (completionHandler) {
+        void (^copied)(id _Nullable, NSError * _Nullable) = [completionHandler copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            copied(nil, pt_splashNoFillError());
+        });
+    }
+}
+
+static void pt_gadLoadWithAdResponseString(id self, SEL _cmd, id adResponse, void (^completionHandler)(id _Nullable, NSError * _Nullable)) {
+    (void)self;
+    (void)_cmd;
+    (void)adResponse;
+    if (completionHandler) {
+        void (^copied)(id _Nullable, NSError * _Nullable) = [completionHandler copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            copied(nil, pt_splashNoFillError());
+        });
+    }
+}
+
+static BOOL pt_gadIsPreloadedAdAvailable(id self, SEL _cmd, id adUnitID) {
+    (void)self;
+    (void)_cmd;
+    (void)adUnitID;
+    return NO;
+}
+
+static void pt_notifyAnyThinkLoadFail(id delegate, id placementID) {
+    if (!delegate) {
+        return;
+    }
+    __strong id strongDelegate = delegate;
+    id pidCopy = [placementID copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SEL failSel = @selector(didFailToLoadADWithPlacementID:error:);
+        if ([strongDelegate respondsToSelector:failSel]) {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(strongDelegate, failSel, pidCopy, pt_splashNoFillError());
+        }
+    });
+}
+
+static void pt_atLoadSplash4(id self, SEL _cmd, id placementID, id extra, id delegate, id containerView) {
+    (void)self;
+    (void)_cmd;
+    (void)extra;
+    (void)containerView;
+    pt_notifyAnyThinkLoadFail(delegate, placementID);
+}
+
+static void pt_atLoadSplash6(id self, SEL _cmd, id placementID, id extra, id tkExtra, id adxFloorPrice, id delegate, id containerView) {
+    (void)self;
+    (void)_cmd;
+    (void)extra;
+    (void)tkExtra;
+    (void)adxFloorPrice;
+    (void)containerView;
+    pt_notifyAnyThinkLoadFail(delegate, placementID);
+}
+
+static BOOL pt_atSplashReady1(id self, SEL _cmd, id placementID) {
+    (void)self;
+    (void)_cmd;
+    (void)placementID;
+    return NO;
+}
+
+static id pt_atSplashReady4(id self, SEL _cmd, id placementID, id showConfig, NSInteger caller, BOOL sendTK) {
+    (void)self;
+    (void)_cmd;
+    (void)placementID;
+    (void)showConfig;
+    (void)caller;
+    (void)sendTK;
+    return nil;
+}
+
+static BOOL pt_atSplashReadyWithoutLog2(id self, SEL _cmd, id placementID, BOOL sendTK) {
+    (void)self;
+    (void)_cmd;
+    (void)placementID;
+    (void)sendTK;
+    return NO;
+}
+
+static BOOL pt_replaceSplashMethod(Class cls, const char *selName, unsigned int expectedArgs, IMP replacement, BOOL isClassMethod) {
+    if (!cls || !selName || !replacement) {
+        return NO;
+    }
+    SEL sel = sel_registerName(selName);
+    if (class_getInstanceMethod([NSObject class], sel) != NULL ||
+        class_getInstanceMethod([UIView class], sel) != NULL) {
+        return NO;
+    }
+    Method m = isClassMethod ? class_getClassMethod(cls, sel) : class_getInstanceMethod(cls, sel);
+    if (!m || method_getNumberOfArguments(m) != expectedArgs || method_getImplementation(m) == replacement) {
+        return NO;
+    }
+    Class targetClass = isClassMethod ? object_getClass(cls) : cls;
+    if (!targetClass) {
+        return NO;
+    }
+    class_replaceMethod(targetClass, sel, replacement, method_getTypeEncoding(m));
+    return YES;
+}
+
+static BOOL pt_replaceSplashMethodList(Class cls, const char * const *sels, size_t count, unsigned int args, IMP replacement) {
+    BOOL any = NO;
+    for (size_t i = 0; i < count; i++) {
+        if (pt_replaceSplashMethod(cls, sels[i], args, replacement, NO)) {
+            any = YES;
+        }
+    }
+    return any;
+}
+
+static BOOL pt_splashAdBlockerInstalled = NO;
+
+static void pt_installSplashAdBlockerIfNeeded(void) {
+    if (pt_splashAdBlockerInstalled) {
+        return;
+    }
+    pt_splashAdBlockerInstalled = YES;
+
+    const char *disable = getenv("PLAYTOOLS_DISABLE_SPLASH_AD_BLOCK");
+    if ((disable && disable[0] == '1' && disable[1] == '\0') || ![[PlaySettings shared] blockSplashAds]) {
+        return;
+    }
+
+    NSUInteger hookedClasses = 0;
+    size_t count = PT_COUNT(pt_splashSpecs);
+    for (size_t i = 0; i < count; i++) {
+        PTSplashSDKSpec *spec = &pt_splashSpecs[i];
+        Class cls = objc_getClass(spec->className);
+        if (!cls) {
+            continue;
+        }
+        spec->resolvedClass = cls;
+        BOOL hooked = NO;
+        hooked |= pt_replaceSplashMethodList(cls, spec->boolNoSels, spec->boolNoSelCount, 2, (IMP)pt_splashBoolNO);
+        hooked |= pt_replaceSplashMethodList(cls, spec->boolNo1FailSels, spec->boolNo1FailSelCount, 3, (IMP)pt_splashBoolNo1AndFail);
+        hooked |= pt_replaceSplashMethodList(cls, spec->noop1Sels, spec->noop1SelCount, 3, (IMP)pt_splashNoop1);
+        hooked |= pt_replaceSplashMethodList(cls, spec->void0Sels, spec->void0SelCount, 2, (IMP)pt_splashLoadVoid0);
+        hooked |= pt_replaceSplashMethodList(cls, spec->void1Sels, spec->void1SelCount, 3, (IMP)pt_splashLoadVoid1);
+        hooked |= pt_replaceSplashMethodList(cls, spec->void1Bool1Sels, spec->void1Bool1SelCount, 4, (IMP)pt_splashLoadVoid1Bool1);
+        hooked |= pt_replaceSplashMethodList(cls, spec->void2Sels, spec->void2SelCount, 4, (IMP)pt_splashLoadVoid2);
+        hooked |= pt_replaceSplashMethodList(cls, spec->void3Sels, spec->void3SelCount, 5, (IMP)pt_splashLoadVoid3);
+        if (strcmp(spec->className, "MTGSplashAD") == 0) {
+            hooked |= pt_replaceSplashMethod(cls, "loadAndShowInKeyWindow:customView:timeout:", 5, (IMP)pt_splashLoadWindowViewTimeout, NO);
+            hooked |= pt_replaceSplashMethod(cls, "loadAndShowInKeyWindow:customView:bidToken:timeout:", 6, (IMP)pt_splashLoadWindowViewTokenTimeout, NO);
+        }
+        if (hooked) {
+            hookedClasses++;
+        }
+    }
+
+    Class pagCls = objc_getClass("PAGLAppOpenAd");
+    if (pagCls) {
+        if (pt_replaceSplashMethod(pagCls, "loadAdWithSlotID:request:completionHandler:", 5, (IMP)pt_gadLoadWithAdUnitID, YES)) {
+            hookedClasses++;
+        }
+    }
+
+    Class bdaCls = objc_getClass("BDASplashManager");
+    if (bdaCls) {
+        BOOL hooked = NO;
+        hooked |= pt_replaceSplashMethod(bdaCls, "hasPreloadOrRealtimeModel", 2, (IMP)pt_splashBoolNO, YES);
+        hooked |= pt_replaceSplashMethod(bdaCls, "shouldShowSplashAccordingToUDPAndPreloadData:", 3, (IMP)pt_splashBoolNo1, NO);
+        if (hooked) {
+            hookedClasses++;
+        }
+    }
+
+    Class gadCls = objc_getClass("GADAppOpenAd");
+    if (gadCls) {
+        BOOL hooked = NO;
+        hooked |= pt_replaceSplashMethod(gadCls, "loadWithAdUnitID:request:completionHandler:", 5, (IMP)pt_gadLoadWithAdUnitID, YES);
+        hooked |= pt_replaceSplashMethod(gadCls, "loadWithAdResponseString:completionHandler:", 4, (IMP)pt_gadLoadWithAdResponseString, YES);
+        hooked |= pt_replaceSplashMethod(gadCls, "isPreloadedAdAvailable:", 3, (IMP)pt_gadIsPreloadedAdAvailable, YES);
+        if (hooked) {
+            hookedClasses++;
+        }
+    }
+
+    Class atCls = objc_getClass("ATAdManager");
+    if (atCls) {
+        BOOL hooked = NO;
+        hooked |= pt_replaceSplashMethod(atCls, "loadADWithPlacementID:extra:delegate:containerView:", 6, (IMP)pt_atLoadSplash4, NO);
+        hooked |= pt_replaceSplashMethod(atCls, "loadADWithPlacementID:extra:tkExtra:adxFloorPrice:delegate:containerView:", 8, (IMP)pt_atLoadSplash6, NO);
+        hooked |= pt_replaceSplashMethod(atCls, "splashReadyForPlacementID:", 3, (IMP)pt_atSplashReady1, NO);
+        hooked |= pt_replaceSplashMethod(atCls, "splashReadyForPlacementID:showConfig:caller:sendTK:", 6, (IMP)pt_atSplashReady4, NO);
+        hooked |= pt_replaceSplashMethod(atCls, "splashReadyWithoutLogForPlacementID:sendTK:", 4, (IMP)pt_atSplashReadyWithoutLog2, NO);
+        if (hooked) {
+            hookedClasses++;
+        }
+    }
+
+    if (hookedClasses > 0) {
+        NSLog(@"[PlayTools] Splash ad blocker hooked %lu SDK class(es)", (unsigned long)hookedClasses);
+    }
+}
+
+static NSUInteger (*pt_origCellularDataRestrictedState)(id, SEL) = NULL;
+static void (*pt_origCellularDataSetNotifier)(id, SEL, void (^)(NSUInteger)) = NULL;
+static BOOL pt_cellularDataGuardInstalled = NO;
+static os_unfair_lock pt_cellularDataLock = OS_UNFAIR_LOCK_INIT;
+static const void *kPTCellularDataGenKey = &kPTCellularDataGenKey;
+
+static NSUInteger pt_cellularDataRestrictedState(id self, SEL _cmd) {
+    NSUInteger state = pt_origCellularDataRestrictedState ? pt_origCellularDataRestrictedState(self, _cmd) : 0;
+    return (state == 0) ? 2 : state;
+}
+
+static void pt_cellularDataSetNotifier(id self, SEL _cmd, void (^notifier)(NSUInteger)) {
+    uint64_t nextGen = 0;
+    os_unfair_lock_lock(&pt_cellularDataLock);
+    nextGen = [objc_getAssociatedObject(self, kPTCellularDataGenKey) unsignedLongLongValue] + 1;
+    objc_setAssociatedObject(self, kPTCellularDataGenKey, @(nextGen), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    os_unfair_lock_unlock(&pt_cellularDataLock);
+
+    if (pt_origCellularDataSetNotifier) {
+        pt_origCellularDataSetNotifier(self, _cmd, notifier);
+    }
+    if (!notifier) {
+        return;
+    }
+
+    NSUInteger origState = pt_origCellularDataRestrictedState
+        ? pt_origCellularDataRestrictedState(self, @selector(restrictedState))
+        : 0;
+    if (origState != 0) {
+        return;
+    }
+
+    void (^copiedNotifier)(NSUInteger) = [notifier copy];
+    __weak id weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 50 * NSEC_PER_MSEC),
+                   dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+        id strongSelf = weakSelf;
+        if (!strongSelf) {
+            return;
+        }
+        os_unfair_lock_lock(&pt_cellularDataLock);
+        uint64_t curGen = [objc_getAssociatedObject(strongSelf, kPTCellularDataGenKey) unsignedLongLongValue];
+        os_unfair_lock_unlock(&pt_cellularDataLock);
+        if (curGen == nextGen) {
+            copiedNotifier(2);
+        }
+    });
+}
+
+static void pt_installCellularDataCompatibilityGuard(void) {
+    if (pt_cellularDataGuardInstalled) {
+        return;
+    }
+    pt_cellularDataGuardInstalled = YES;
+
+    Class ctCls = objc_getClass("CTCellularData");
+    if (!ctCls) {
+        return;
+    }
+
+    SEL stateSel = sel_registerName("restrictedState");
+    Method stateM = class_getInstanceMethod(ctCls, stateSel);
+    if (stateM) {
+        IMP origImp = method_getImplementation(stateM);
+        if (origImp != (IMP)pt_cellularDataRestrictedState) {
+            pt_origCellularDataRestrictedState = (NSUInteger (*)(id, SEL))origImp;
+            class_replaceMethod(ctCls, stateSel, (IMP)pt_cellularDataRestrictedState, method_getTypeEncoding(stateM));
+        }
+    }
+
+    SEL notifierSel = sel_registerName("setCellularDataRestrictionDidUpdateNotifier:");
+    Method notifierM = class_getInstanceMethod(ctCls, notifierSel);
+    if (notifierM) {
+        IMP origImp = method_getImplementation(notifierM);
+        if (origImp != (IMP)pt_cellularDataSetNotifier) {
+            pt_origCellularDataSetNotifier = (void (*)(id, SEL, void (^)(NSUInteger)))origImp;
+            class_replaceMethod(ctCls, notifierSel, (IMP)pt_cellularDataSetNotifier, method_getTypeEncoding(notifierM));
+        }
+    }
+}
+
+static NSURL *pt_coerceNSURL(id maybeURL) {
+    if (maybeURL == nil || [maybeURL isKindOfClass:[NSURL class]]) {
+        return (NSURL *)maybeURL;
+    }
+    if ([maybeURL isKindOfClass:[NSString class]]) {
+        NSString *str = (NSString *)maybeURL;
+        if ([str containsString:@"://"]) {
+            return [NSURL URLWithString:str];
+        }
+        return [NSURL fileURLWithPath:str];
+    }
+    return (NSURL *)maybeURL;
+}
+
+static BOOL pt_nsDataURLGuardInstalled = NO;
+
+@interface NSData (PlayToolsURLGuard)
++ (instancetype)pt_dataWithContentsOfURL:(NSURL *)url options:(NSDataReadingOptions)options error:(NSError **)error;
+- (instancetype)pt_initWithContentsOfURL:(NSURL *)url options:(NSDataReadingOptions)options error:(NSError **)error __attribute__((objc_method_family(init)));
+@end
+
+@implementation NSData (PlayToolsURLGuard)
+
++ (instancetype)pt_dataWithContentsOfURL:(NSURL *)url options:(NSDataReadingOptions)options error:(NSError **)error {
+    return [self pt_dataWithContentsOfURL:pt_coerceNSURL(url) options:options error:error];
+}
+
+- (instancetype)pt_initWithContentsOfURL:(NSURL *)url options:(NSDataReadingOptions)options error:(NSError **)error {
+    return [self pt_initWithContentsOfURL:pt_coerceNSURL(url) options:options error:error];
+}
+
+@end
+
+static void pt_installNSDataURLTypeGuard(void) {
+    if (pt_nsDataURLGuardInstalled) {
+        return;
+    }
+    pt_nsDataURLGuardInstalled = YES;
+
+    Class nsDataMeta = object_getClass(NSData.class);
+    Method classOrigM = nsDataMeta ? class_getClassMethod(NSData.class, @selector(dataWithContentsOfURL:options:error:)) : NULL;
+    Method classSwizM = nsDataMeta ? class_getClassMethod(NSData.class, @selector(pt_dataWithContentsOfURL:options:error:)) : NULL;
+    if (classOrigM && classSwizM) {
+        method_exchangeImplementations(classOrigM, classSwizM);
+    }
+
+    Method instOrigM = class_getInstanceMethod(NSData.class, @selector(initWithContentsOfURL:options:error:));
+    Method instSwizM = class_getInstanceMethod(NSData.class, @selector(pt_initWithContentsOfURL:options:error:));
+    if (instOrigM && instSwizM) {
+        method_exchangeImplementations(instOrigM, instSwizM);
+    }
+}
+#endif
+
 static void pt_installUniversalCompatibilityGuards(void) {
     pt_ensure_device_settings_cached();
     (void)pt_should_block_sleep_spamming();
 
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
     // Prevent AppKit's "unexpectedly quit while reopening windows" modal from blocking Catalyst launch.
-    [defaults setBool:YES forKey:@"ApplePersistenceIgnoreState"];
+    if (![defaults boolForKey:@"ApplePersistenceIgnoreState"]) {
+        [defaults setBool:YES forKey:@"ApplePersistenceIgnoreState"];
+    }
     pt_applyUIScaleFactor();
 
     pt_installAppGroupContainerGuard();
     pt_installOrphanWindowSceneGuard();
 #if TARGET_OS_MACCATALYST
     pt_installStartupPresentationGuard();
+    pt_installCellularDataCompatibilityGuard();
+    pt_installNSDataURLTypeGuard();
+    pt_installNearbyInteractionGuard();
+    pt_installSplashAdBlockerIfNeeded();
 #endif
     pt_installNavigationAppearanceBalanceGuard();
     pt_installGlassEffectCompatibilityGuard();
@@ -2322,14 +3384,21 @@ static void pt_tryInstallTerminationTimeoutHookNow(void) {
     }
 }
 
+static id pt_terminationLaunchObserver = nil;
+
 static void pt_installTerminationTimeoutHooks(void) {
     pt_tryInstallTerminationTimeoutHookNow();
     if (!pt_terminationHookInstalled) {
-        [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidFinishLaunchingNotification
-                                                          object:nil
-                                                           queue:nil
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
+        pt_terminationLaunchObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationDidFinishLaunchingNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification * _Nonnull note) {
             pt_tryInstallTerminationTimeoutHookNow();
+            if (pt_terminationLaunchObserver) {
+                [[NSNotificationCenter defaultCenter] removeObserver:pt_terminationLaunchObserver];
+                pt_terminationLaunchObserver = nil;
+            }
         }];
     }
 }
@@ -2606,8 +3675,14 @@ static id pt_ckContainerWithIdentifier(id self, SEL _cmd, NSString *identifier) 
     return pt_stubContainerForIdentifier(identifier);
 }
 
+static id pt_cloudKitBundleObserver = nil;
+
 static void pt_tryInstallCloudKitHooksNow(void) {
     if (pt_cloudKitHooksInstalled) {
+        if (pt_cloudKitBundleObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:pt_cloudKitBundleObserver];
+            pt_cloudKitBundleObserver = nil;
+        }
         return;
     }
     Class ckContainer = objc_getClass("CKContainer");
@@ -2636,15 +3711,20 @@ static void pt_tryInstallCloudKitHooksNow(void) {
     }
 
     pt_cloudKitHooksInstalled = YES;
+    if (pt_cloudKitBundleObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:pt_cloudKitBundleObserver];
+        pt_cloudKitBundleObserver = nil;
+    }
 }
 
 static void pt_installCloudKitCompatibilityHooks(void) {
     pt_tryInstallCloudKitHooksNow();
     if (!pt_cloudKitHooksInstalled) {
-        [[NSNotificationCenter defaultCenter] addObserverForName:NSBundleDidLoadNotification
-                                                          object:nil
-                                                           queue:nil
-                                                      usingBlock:^(NSNotification * _Nonnull note) {
+        pt_cloudKitBundleObserver = [[NSNotificationCenter defaultCenter]
+            addObserverForName:NSBundleDidLoadNotification
+                        object:nil
+                         queue:nil
+                    usingBlock:^(NSNotification * _Nonnull note) {
             pt_tryInstallCloudKitHooksNow();
         }];
     }

@@ -5,6 +5,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#include <malloc/malloc.h>
 
 //! Project version number for PlayTools.
 FOUNDATION_EXPORT double PlayToolsVersionNumber;
@@ -17,6 +18,7 @@ FOUNDATION_EXPORT const unsigned char PlayToolsVersionString[];
 #import "UIApplication+Private.h"
 #import "UIEvent+Private.h"
 #import "UITouch+Private.h"
+#import "PlayLoader.h"
 
 // This is the function that CFRunLoop calls to serve main dispatch queue
 // Used by PlayInput to manually drain the queue

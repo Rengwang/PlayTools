@@ -14,6 +14,8 @@
    (*(_type const volatile *)&_interpose_##_replacee.replacee)
 
 __attribute__((visibility("hidden"))) void pt_initializePlatformIdentity(void);
+void pt_setPlayScreenScaledMode(BOOL isScaled);
+BOOL pt_isPlayScreenScaledMode(void);
 
 @interface PlayLoader : NSObject
 

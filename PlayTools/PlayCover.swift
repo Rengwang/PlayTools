@@ -18,6 +18,7 @@ public class PlayCover: NSObject {
         PlayScreen.shared.initialize()
         PlayInput.shared.initialize()
         DiscordIPC.shared.initialize()
+        PlayMemoryReclaimer.shared.initialize()
         PlayToolsSelfTest.startIfRequested()
 
         if PlaySettings.shared.rootWorkDir {
@@ -106,5 +107,128 @@ public class PlayCover: NSObject {
     static func delay(_ delay: Double, closure: @escaping () -> Void) {
         let when = DispatchTime.now() + delay
         DispatchQueue.main.asyncAfter(deadline: when, execute: closure)
+    }
+}
+
+/// Reclaims idle decoded image caches, SQLite connections and freed malloc pages
+/// after the app has remained hidden in the background.
+final class PlayMemoryReclaimer {
+    static let shared = PlayMemoryReclaimer()
+
+    private var initialized = false
+    private var isHidden = false
+    private var didTrimCurrentHideCycle = false
+    private var pendingWorkItem: DispatchWorkItem?
+
+    private lazy var trimDelay: TimeInterval = {
+        if let raw = ProcessInfo.processInfo.environment["PLAYTOOLS_BACKGROUND_TRIM_DELAY"],
+           let parsed = Double(raw), parsed >= 0.5 && parsed <= 120.0 {
+            return parsed
+        }
+        return 10.0
+    }()
+
+    func initialize() {
+        guard !initialized else { return }
+        initialized = true
+        guard ProcessInfo.processInfo.environment["PLAYTOOLS_DISABLE_BACKGROUND_TRIM"] != "1" else {
+            return
+        }
+
+        let center = NotificationCenter.default
+        let hideNames: [Notification.Name] = [
+            Notification.Name("NSApplicationDidHideNotification"),
+            UIApplication.didEnterBackgroundNotification
+        ]
+        for name in hideNames {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.handleDidHide()
+            }
+        }
+        center.addObserver(
+            forName: Notification.Name("NSWindowDidMiniaturizeNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self = self,
+                  !(AKInterface.shared?.hasVisibleUnminiaturizedWindow ?? false) else { return }
+            self.handleDidHide()
+        }
+
+        let activeNames: [Notification.Name] = [
+            Notification.Name("NSApplicationDidUnhideNotification"),
+            Notification.Name("NSApplicationDidBecomeActiveNotification"),
+            Notification.Name("NSWindowDidDeminiaturizeNotification"),
+            UIApplication.didBecomeActiveNotification
+        ]
+        for name in activeNames {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.handleDidBecomeVisibleOrActive()
+            }
+        }
+    }
+
+    private func handleDidHide() {
+        isHidden = true
+        guard !didTrimCurrentHideCycle else { return }
+        pendingWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.performBackgroundTrimIfStillHidden()
+        }
+        pendingWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + trimDelay, execute: workItem)
+    }
+
+    private func handleDidBecomeVisibleOrActive() {
+        isHidden = false
+        didTrimCurrentHideCycle = false
+        pendingWorkItem?.cancel()
+        pendingWorkItem = nil
+    }
+
+    private func performBackgroundTrimIfStillHidden() {
+        pendingWorkItem = nil
+        guard isHidden,
+              !(AKInterface.shared?.isApplicationActive ?? false),
+              !(AKInterface.shared?.hasVisibleUnminiaturizedWindow ?? false) else {
+            return
+        }
+        didTrimCurrentHideCycle = true
+
+        PlayScreen.shared.clearTransientCachesOnHide()
+        DispatchQueue.global(qos: .utility).async {
+            PlayKeychainDB.shared.releaseIdleResources()
+        }
+
+        // Flush URLCache in-memory entries only while leaving disk cache intact.
+        let savedMemoryCapacity = URLCache.shared.memoryCapacity
+        if savedMemoryCapacity > 0 {
+            URLCache.shared.memoryCapacity = 0
+            URLCache.shared.memoryCapacity = savedMemoryCapacity
+        }
+
+        let performWarningSel = NSSelectorFromString("_performMemoryWarning")
+        if UIApplication.shared.responds(to: performWarningSel) {
+            UIApplication.shared.perform(performWarningSel)
+        } else {
+            NotificationCenter.default.post(
+                name: UIApplication.didReceiveMemoryWarningNotification,
+                object: UIApplication.shared
+            )
+        }
+
+        for reliefDelay in [0.8, 3.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + reliefDelay) { [weak self] in
+                guard let self = self,
+                      self.isHidden,
+                      !(AKInterface.shared?.hasVisibleUnminiaturizedWindow ?? false) else {
+                    return
+                }
+                DispatchQueue.global(qos: .utility).async {
+                    _ = malloc_zone_pressure_relief(nil, 0)
+                }
+            }
+        }
     }
 }

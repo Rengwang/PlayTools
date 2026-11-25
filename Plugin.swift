@@ -19,6 +19,7 @@ public protocol Plugin: NSObjectProtocol {
     var isMainScreenEqualToFirst: Bool { get }
     var isFullscreen: Bool { get }
     @objc optional var isApplicationActive: Bool { get }
+    @objc optional var hasVisibleUnminiaturizedWindow: Bool { get }
     var cmdPressed: Bool { get }
 
     func hideCursor()

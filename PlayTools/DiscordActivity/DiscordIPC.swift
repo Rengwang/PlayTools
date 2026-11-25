@@ -7,12 +7,170 @@
 
 import Darwin
 import Foundation
-import SwordRPC
+import os.lock
 import UIKit
+
+/// Minimal POSIX AF_UNIX client for Discord's local IPC socket, replacing SwordRPC + SwiftNIO.
+private final class POSIXDiscordIPCClient {
+    private let appId: String
+    private let socketPath: String
+    private let lock: UnsafeMutablePointer<os_unfair_lock>
+    private var fd: Int32 = -1
+
+    init(appId: String, socketPath: String) {
+        self.appId = appId
+        self.socketPath = socketPath
+        self.lock = UnsafeMutablePointer<os_unfair_lock>.allocate(capacity: 1)
+        self.lock.initialize(to: os_unfair_lock())
+    }
+
+    deinit {
+        disconnect()
+        lock.deinitialize(count: 1)
+        lock.deallocate()
+    }
+
+    @discardableResult
+    func connect() -> Bool {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        if fd >= 0 {
+            return true
+        }
+        guard socketPath.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path) else {
+            return false
+        }
+
+        let sock = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard sock >= 0 else { return false }
+
+        var noSigPipe: Int32 = 1
+        _ = setsockopt(sock, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+        var tv = timeval(tv_sec: 2, tv_usec: 0)
+        _ = setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        let sunPathCapacity = MemoryLayout.size(ofValue: addr.sun_path)
+        withUnsafeMutablePointer(to: &addr.sun_path) { ptr in
+            ptr.withMemoryRebound(to: CChar.self, capacity: sunPathCapacity) { cPtr in
+                _ = socketPath.withCString { strlcpy(cPtr, $0, sunPathCapacity) }
+            }
+        }
+
+        let connectResult = withUnsafePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                Darwin.connect(sock, saPtr, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard connectResult == 0 else {
+            Darwin.close(sock)
+            return false
+        }
+
+        fd = sock
+        guard sendFrameLocked(opcode: 0, object: ["v": 1, "client_id": appId]),
+              readFrameLocked() else {
+            closeLocked()
+            return false
+        }
+        return true
+    }
+
+    func setActivity(_ activity: [String: Any]) {
+        os_unfair_lock_lock(lock)
+        defer { os_unfair_lock_unlock(lock) }
+        guard fd >= 0 else { return }
+        let payload: [String: Any] = [
+            "cmd": "SET_ACTIVITY",
+            "args": [
+                "pid": Int(getpid()),
+                "activity": activity
+            ],
+            "nonce": UUID().uuidString
+        ]
+        if !sendFrameLocked(opcode: 1, object: payload) {
+            closeLocked()
+        } else {
+            _ = readFrameLocked()
+        }
+    }
+
+    func disconnect() {
+        os_unfair_lock_lock(lock)
+        closeLocked()
+        os_unfair_lock_unlock(lock)
+    }
+
+    private func closeLocked() {
+        if fd >= 0 {
+            Darwin.close(fd)
+            fd = -1
+        }
+    }
+
+    private func sendFrameLocked(opcode: UInt32, object: [String: Any]) -> Bool {
+        guard fd >= 0,
+              let jsonData = try? JSONSerialization.data(withJSONObject: object) else {
+            return false
+        }
+        var header = [UInt8](repeating: 0, count: 8)
+        let opLE = opcode.littleEndian
+        let lenLE = UInt32(jsonData.count).littleEndian
+        withUnsafeBytes(of: opLE) { header.replaceSubrange(0..<4, with: $0) }
+        withUnsafeBytes(of: lenLE) { header.replaceSubrange(4..<8, with: $0) }
+        var frame = Data(header)
+        frame.append(jsonData)
+
+        return frame.withUnsafeBytes { rawBuf in
+            guard let base = rawBuf.baseAddress else { return false }
+            var sent = 0
+            while sent < frame.count {
+                let n = Darwin.send(fd, base.advanced(by: sent), frame.count - sent, 0)
+                if n <= 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                sent += n
+            }
+            return true
+        }
+    }
+
+    private func readFrameLocked() -> Bool {
+        guard fd >= 0 else { return false }
+        var header = [UInt8](repeating: 0, count: 8)
+        guard readExactLocked(into: &header, count: 8) else { return false }
+        let length = header.withUnsafeBytes { ptr -> UInt32 in
+            UInt32(littleEndian: ptr.load(fromByteOffset: 4, as: UInt32.self))
+        }
+        guard length <= 1024 * 1024 else { return false }
+        if length == 0 { return true }
+        var sink = [UInt8](repeating: 0, count: Int(length))
+        return readExactLocked(into: &sink, count: Int(length))
+    }
+
+    private func readExactLocked(into buffer: inout [UInt8], count: Int) -> Bool {
+        var received = 0
+        while received < count {
+            let n = buffer.withUnsafeMutableBytes { rawBuf -> ssize_t in
+                guard let base = rawBuf.baseAddress else { return -1 }
+                return Darwin.recv(fd, base.advanced(by: received), count - received, 0)
+            }
+            if n <= 0 {
+                if n < 0 && errno == EINTR { continue }
+                return false
+            }
+            received += n
+        }
+        return true
+    }
+}
 
 class DiscordIPC {
     public static let shared = DiscordIPC()
-    private var activeRPC: SwordRPC?
+    private var activeClient: POSIXDiscordIPCClient?
     private var terminationObserver: NSObjectProtocol?
 
     func initialize() {
@@ -21,14 +179,12 @@ class DiscordIPC {
         guard custom.enable, !appID.isEmpty else {
             return
         }
-        // Only spin up SwordRPC / iTunes artwork lookup when a Discord IPC socket
-        // actually exists; otherwise SwordRPC leaks 10 SwiftNIO EventLoopGroup threads.
-        guard Self.hasReachableDiscordIPCSocket() else {
+        guard let socketPath = Self.findReachableDiscordIPCSocket() else {
             return
         }
 
-        let ipc = SwordRPC(appId: appID)
-        activeRPC = ipc
+        let client = POSIXDiscordIPCClient(appId: appID, socketPath: socketPath)
+        activeClient = client
 
         if terminationObserver == nil {
             terminationObserver = NotificationCenter.default.addObserver(
@@ -36,20 +192,23 @@ class DiscordIPC {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                self?.activeRPC?.disconnect()
-                self?.activeRPC = nil
+                self?.activeClient?.disconnect()
+                self?.activeClient = nil
             }
         }
 
         Task(priority: .background) { [weak self] in
             guard let self = self else { return }
             let activity = await self.createActivity(from: custom)
-            ipc.connect()
-            ipc.setPresence(activity)
+            if client.connect() {
+                client.setActivity(activity)
+            } else {
+                client.disconnect()
+            }
         }
     }
 
-    private static func hasReachableDiscordIPCSocket() -> Bool {
+    private static func findReachableDiscordIPCSocket() -> String? {
         var candidateDirs: [String] = []
         let tempDir = FileManager.default.temporaryDirectory.path
         candidateDirs.append(tempDir)
@@ -66,69 +225,62 @@ class DiscordIPC {
             candidateDirs.append("/tmp")
         }
 
-        var foundAnySocket = false
-        var foundInSwordRPCDir = false
         for dir in candidateDirs {
             let trimmed = dir.hasSuffix("/") ? String(dir.dropLast()) : dir
             for ipcPort in 0..<10 {
                 let path = "\(trimmed)/discord-ipc-\(ipcPort)"
                 if access(path, F_OK) == 0 {
-                    foundAnySocket = true
-                    if trimmed == tempDir || trimmed == nsTemp {
-                        foundInSwordRPCDir = true
-                    }
-                    break
+                    return path
                 }
             }
         }
-        // SwordRPC.connect() only opens sockets in FileManager.default.temporaryDirectory,
-        // so require a socket there to prevent 10 failed MultiThreadedEventLoopGroup leaks.
-        return foundAnySocket && foundInSwordRPCDir
+        return nil
     }
 
-    func createActivity(from custom: DiscordActivity) async -> RichPresence {
-        var activity = RichPresence()
+    func createActivity(from custom: DiscordActivity) async -> [String: Any] {
+        var activity: [String: Any] = [:]
 
         if custom.details.isEmpty {
             let name = Bundle.main.infoDictionary?["CFBundleName"] as? String ?? ""
             let displayName = Bundle.main.infoDictionary?["CFBundleDisplayName"] as? String ?? name
-            activity.details = "Playing \(displayName)"
+            activity["details"] = "Playing \(displayName)"
         } else {
-            if custom.details.count == 1 { custom.details += " " }
-            activity.details = custom.details
+            var details = custom.details
+            if details.count == 1 { details += " " }
+            activity["details"] = details
         }
-        activity.detailsUrl = "https://github.com/PlayCover/PlayCover/releases"
-
-        activity.statusDisplayType = .details
+        activity["details_url"] = "https://github.com/PlayCover/PlayCover/releases"
 
         let poweredStr = "Powered by PlayCover"
+        var assets: [String: Any] = [:]
         if custom.state.isEmpty {
-            activity.state = poweredStr
+            activity["state"] = poweredStr
         } else {
-            if custom.state.count == 1 { custom.state += " " }
-            activity.state = custom.state
-            activity.assets.smallText = poweredStr
-            activity.assets.largeText = poweredStr
+            var state = custom.state
+            if state.count == 1 { state += " " }
+            activity["state"] = state
+            assets["small_text"] = poweredStr
+            assets["large_text"] = poweredStr
         }
-        activity.stateUrl = "https://github.com/PlayCover/PlayCover/releases"
+        activity["state_url"] = "https://github.com/PlayCover/PlayCover/releases"
 
         let logo = "https://raw.githubusercontent.com/PlayCover/PlaySite/master/src/assets/square-logo.png"
         if custom.image.isEmpty {
             let bundleID = Bundle.main.infoDictionary?["CFBundleIdentifier"] as? String ?? ""
             if let appImage = await loadImage(bundleID: bundleID) {
-                activity.assets.largeImage = appImage
-                activity.assets.largeText = nil
-                activity.assets.smallImage = logo
+                assets["large_image"] = appImage
+                assets.removeValue(forKey: "large_text")
+                assets["small_image"] = logo
             } else {
-                activity.assets.largeImage = logo
+                assets["large_image"] = logo
             }
         } else {
-            activity.assets.largeImage = custom.image
-            activity.assets.largeText = nil
-            activity.assets.smallImage = logo
+            assets["large_image"] = custom.image
+            assets.removeValue(forKey: "large_text")
+            assets["small_image"] = logo
         }
-
-        activity.timestamps.start = Date()
+        activity["assets"] = assets
+        activity["timestamps"] = ["start": Int(Date().timeIntervalSince1970)]
 
         return activity
     }

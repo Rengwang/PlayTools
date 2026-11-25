@@ -157,13 +157,16 @@ public class PlayScreen: NSObject {
     private var displayMode: PlayDisplayMode = .adaptive {
         didSet {
             if case .scaled(let logicalSize, _, _) = displayMode {
+                pt_setPlayScreenScaledMode(true)
                 updateBoundsSnapshot(CGRect(origin: .zero, size: logicalSize))
+            } else {
+                pt_setPlayScreenScaledMode(false)
             }
         }
     }
     private var lastAdaptiveBounds: CGRect? {
         didSet {
-            if let bounds = lastAdaptiveBounds, displayMode == .adaptive {
+            if let bounds = lastAdaptiveBounds, bounds != oldValue, displayMode == .adaptive {
                 updateBoundsSnapshot(bounds)
             }
         }
@@ -188,6 +191,7 @@ public class PlayScreen: NSObject {
     private var isHostLiveResizing = false
     private var lastDuoLandscapeActive = false
     private weak var cachedPrimaryWindow: UIWindow?
+    private var appWindowClassCache: [ObjectIdentifier: Bool] = [:]
 
     private var isDuoIdentity: Bool {
         PlaySettings.shared.layoutIdiom == 3
@@ -211,9 +215,21 @@ public class PlayScreen: NSObject {
         let mode = Self.initialDisplayMode(capabilities: appCapabilities)
         displayMode = mode
         if case .scaled(let logicalSize, _, _) = mode {
+            pt_setPlayScreenScaledMode(true)
             updateBoundsSnapshot(CGRect(origin: .zero, size: logicalSize))
         } else {
+            pt_setPlayScreenScaledMode(false)
             updateBoundsSnapshot(initialAdaptiveFallbackBounds())
+        }
+    }
+
+    func clearTransientCachesOnHide() {
+        if Thread.isMainThread {
+            cachedPrimaryWindow = nil
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.cachedPrimaryWindow = nil
+            }
         }
     }
 
@@ -468,8 +484,10 @@ public class PlayScreen: NSObject {
     var activePrimaryWindow: UIWindow? {
         if Thread.isMainThread,
            let cached = cachedPrimaryWindow,
-           isEligiblePrimaryWindow(cached),
+           !cached.isHidden,
+           cached.alpha > 0.01,
            cached.windowScene != nil,
+           !offscreenWindows.contains(cached),
            cached.bounds.width > 1,
            cached.bounds.height > 1 {
             return cached
@@ -595,7 +613,9 @@ private extension PlayScreen {
 
         if let win = activePrimaryWindow, win.bounds.width >= 100, win.bounds.height >= 100 {
             let resolved = CGRect(origin: .zero, size: win.bounds.size)
-            lastAdaptiveBounds = resolved
+            if lastAdaptiveBounds != resolved {
+                lastAdaptiveBounds = resolved
+            }
             return resolved
         }
         if let scene = UIApplication.shared.connectedScenes
@@ -604,14 +624,18 @@ private extension PlayScreen {
             let sBounds = scene.coordinateSpace.bounds
             if sBounds.width >= 100, sBounds.height >= 100 {
                 let resolved = CGRect(origin: .zero, size: sBounds.size)
-                lastAdaptiveBounds = resolved
+                if lastAdaptiveBounds != resolved {
+                    lastAdaptiveBounds = resolved
+                }
                 return resolved
             }
         }
         if let content = AKInterface.shared?.contentLayoutRect,
            content.width >= 100, content.height >= 100 {
             let resolved = CGRect(origin: .zero, size: content.size)
-            lastAdaptiveBounds = resolved
+            if lastAdaptiveBounds != resolved {
+                lastAdaptiveBounds = resolved
+            }
             return resolved
         }
         return fallback
@@ -639,12 +663,18 @@ private extension PlayScreen {
         if window === EditorController.shared.editorWindow {
             return false
         }
-        let cls = NSStringFromClass(type(of: window))
-        if cls.contains("Keyboard") || cls.contains("TextEffects") || cls.contains("Snapshot")
-            || cls.contains("Menu") || cls.contains("StatusBar") || cls.hasPrefix("_UI") {
-            return false
+        let winClass: AnyClass = type(of: window)
+        let key = ObjectIdentifier(winClass)
+        if Thread.isMainThread, let cached = appWindowClassCache[key] {
+            return cached
         }
-        return true
+        let cls = NSStringFromClass(winClass)
+        let allowed = !(cls.contains("Keyboard") || cls.contains("TextEffects") || cls.contains("Snapshot")
+            || cls.contains("Menu") || cls.contains("StatusBar") || cls.hasPrefix("_UI"))
+        if Thread.isMainThread {
+            appWindowClassCache[key] = allowed
+        }
+        return allowed
     }
 
     func viewportReferenceBounds(for window: UIWindow) -> CGRect {
@@ -720,13 +750,21 @@ private extension PlayScreen {
 
     func applySceneSizeRestrictions(for scene: UIWindowScene?) {
         guard let restrictions = scene?.sizeRestrictions else { return }
+        let targetMin: CGSize
+        let targetMax = CGSize(width: 8000, height: 8000)
         switch displayMode {
         case .adaptive:
-            restrictions.minimumSize = CGSize(width: 360, height: 540)
-            restrictions.maximumSize = CGSize(width: 8000, height: 8000)
+            targetMin = CGSize(width: 360, height: 540)
         case .scaled(_, let ratioW, let ratioH):
-            restrictions.minimumSize = Self.minSizeForRatio(ratioW: ratioW, ratioH: ratioH)
-            restrictions.maximumSize = CGSize(width: 8000, height: 8000)
+            targetMin = Self.minSizeForRatio(ratioW: ratioW, ratioH: ratioH)
+        }
+        if abs(restrictions.minimumSize.width - targetMin.width) > 0.5
+            || abs(restrictions.minimumSize.height - targetMin.height) > 0.5 {
+            restrictions.minimumSize = targetMin
+        }
+        if abs(restrictions.maximumSize.width - targetMax.width) > 0.5
+            || abs(restrictions.maximumSize.height - targetMax.height) > 0.5 {
+            restrictions.maximumSize = targetMax
         }
     }
 
@@ -943,6 +981,9 @@ private extension PlayScreen {
 
 private extension PlayScreen {
     func resetScaledTransformsIfNeeded(in window: UIWindow) {
+        guard scaledWindows.count > 0 || scaledViews.count > 0 || originalWindowBackground != nil else {
+            return
+        }
         let didTrackScaledViews = scaledViews.allObjects.contains {
             $0.window === window || $0.superview === window
         }
@@ -1394,6 +1435,17 @@ private extension PlayScreen {
     }
 
     func tickAutomation() {
+        let cmdURL = automationDirURL.appendingPathComponent("cmd.json")
+        if FileManager.default.fileExists(atPath: cmdURL.path),
+           let data = try? Data(contentsOf: cmdURL),
+           let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+           let action = (json["action"] as? String) ?? (json["cmd"] as? String),
+           action == "listWindows" {
+            try? FileManager.default.removeItem(at: cmdURL)
+            writeJSON(buildWindowInventoryPayload(), to: automationDirURL.appendingPathComponent("state.json"))
+            return
+        }
+
         guard let win = activePrimaryWindow, win.rootViewController?.view != nil else { return }
         if !didWriteReadyFile {
             didWriteReadyFile = true
@@ -1407,7 +1459,6 @@ private extension PlayScreen {
             writeJSON(readyPayload, to: automationDirURL.appendingPathComponent("ready.json"))
         }
 
-        let cmdURL = automationDirURL.appendingPathComponent("cmd.json")
         guard FileManager.default.fileExists(atPath: cmdURL.path),
               let data = try? Data(contentsOf: cmdURL) else { return }
         try? FileManager.default.removeItem(at: cmdURL)
@@ -1423,6 +1474,8 @@ private extension PlayScreen {
     func executeAutomationAction(_ action: String, params: [String: Any], in window: UIWindow) {
         let stateURL = automationDirURL.appendingPathComponent("state.json")
         switch action {
+        case "listWindows":
+            writeJSON(buildWindowInventoryPayload(), to: stateURL)
         case "dump":
             writeJSON(buildDumpPayload(action: "dump", window: window), to: stateURL)
         case "dumpTree":
@@ -1841,6 +1894,55 @@ private extension PlayScreen {
             "nodeCount": maxNodes - remaining,
             "truncated": remaining <= 0,
             "windows": winPayloads
+        ]
+    }
+
+    /// Read-only inventory across connected application scenes without loading `.view`
+    /// or promoting/mutating any window.
+    func buildWindowInventoryPayload() -> [String: Any] {
+        let appScenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .filter { $0.session.role == .windowApplication }
+
+        var scenePayloads: [[String: Any]] = []
+        var windowPayloads: [[String: Any]] = []
+
+        for scene in appScenes {
+            let sceneId = scene.session.persistentIdentifier
+            let activationState = scene.activationState.rawValue
+            var perSceneWindows: [[String: Any]] = []
+            for win in scene.windows {
+                let entry: [String: Any] = [
+                    "class": NSStringFromClass(type(of: win)),
+                    "rootViewControllerClass": win.rootViewController.map { NSStringFromClass(type(of: $0)) } ?? NSNull(),
+                    "isHidden": win.isHidden,
+                    "isKeyWindow": win.isKeyWindow,
+                    "alpha": win.alpha,
+                    "windowLevel": win.windowLevel.rawValue,
+                    "frame": rectDict(win.frame),
+                    "scenePersistentIdentifier": sceneId,
+                    "sceneActivationState": activationState
+                ]
+                perSceneWindows.append(entry)
+                windowPayloads.append(entry)
+            }
+            scenePayloads.append([
+                "persistentIdentifier": sceneId,
+                "role": scene.session.role.rawValue,
+                "activationState": activationState,
+                "windows": perSceneWindows
+            ])
+        }
+
+        return [
+            "action": "listWindows",
+            "timestamp": Date().timeIntervalSince1970,
+            "bundleId": Bundle.main.bundleIdentifier ?? "",
+            "mode": displayMode.name,
+            "sceneCount": scenePayloads.count,
+            "windowCount": windowPayloads.count,
+            "scenes": scenePayloads,
+            "windows": windowPayloads
         ]
     }
 

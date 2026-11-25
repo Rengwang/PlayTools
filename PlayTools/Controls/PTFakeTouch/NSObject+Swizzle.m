@@ -239,7 +239,8 @@ static double pt_cachedCustomScaler(void) {
 }
 
 - (void) pt_hook_UIWindow_setBounds:(CGRect)bounds {
-    if ([self isKindOfClass:[UIWindow class]]
+    if (pt_isPlayScreenScaledMode()
+        && [self isKindOfClass:[UIWindow class]]
         && [PlayScreen interceptWindowSetBounds:(UIWindow *)self bounds:bounds]) {
         return;
     }
@@ -247,7 +248,7 @@ static double pt_cachedCustomScaler(void) {
 }
 
 - (void) pt_hook_UIWindow_setRootViewController:(UIViewController *)rootViewController {
-    if ([self isKindOfClass:[UIWindow class]]) {
+    if (pt_isPlayScreenScaledMode() && [self isKindOfClass:[UIWindow class]]) {
         [PlayScreen onWindowWillSetRootViewController:(UIWindow *)self];
     }
     [self pt_hook_UIWindow_setRootViewController:rootViewController];
@@ -255,7 +256,7 @@ static double pt_cachedCustomScaler(void) {
 
 - (void) pt_hook_UIWindow_didAddSubview:(UIView *)subview {
     [self pt_hook_UIWindow_didAddSubview:subview];
-    if ([self isKindOfClass:[UIWindow class]] && subview) {
+    if (pt_isPlayScreenScaledMode() && [self isKindOfClass:[UIWindow class]] && subview) {
         [PlayScreen onWindow:(UIWindow *)self didAddSubview:subview];
     }
 }
@@ -342,9 +343,64 @@ static void pt_fitWindowModal(UIView *backdrop) {
     return [PlayScreen resolvedFixedCoordinateSpaceBounds:orig screen:screen];
 }
 
+static NSDictionary<NSString *, id> *sPhoneInfoPlistOverrides = nil;
+static os_unfair_lock sPhoneInfoDictCacheLock = OS_UNFAIR_LOCK_INIT;
+static NSDictionary<NSString *, id> *sLastOrigInfoDict = nil;
+static NSDictionary<NSString *, id> *sCachedPhoneInfoDict = nil;
+
+static BOOL pt_isSystemCatalystInfoKey(NSString *key) {
+    return [key hasPrefix:@"UI"]
+        || [key hasPrefix:@"CFBundle"]
+        || [key hasPrefix:@"LS"]
+        || [key hasPrefix:@"DT"]
+        || [key hasPrefix:@"NSExtension"]
+        || [key isEqualToString:@"NSUserActivityTypes"];
+}
+
+static void pt_preparePhoneInfoPlistOverrides(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        NSURL *infoURL = [[NSBundle mainBundle].bundleURL URLByAppendingPathComponent:@"Info.plist"];
+        NSDictionary<NSString *, id> *raw = [NSDictionary dictionaryWithContentsOfURL:infoURL];
+        if (![raw isKindOfClass:[NSDictionary class]]) {
+            return;
+        }
+        NSMutableSet<NSString *> *baseKeys = [NSMutableSet set];
+        for (id rawKey in raw) {
+            if (![rawKey isKindOfClass:[NSString class]]) {
+                continue;
+            }
+            NSString *k = (NSString *)rawKey;
+            if ([k hasSuffix:@"~ipad"]) {
+                [baseKeys addObject:[k substringToIndex:k.length - 5]];
+            } else if ([k hasSuffix:@"~iphone"]) {
+                [baseKeys addObject:[k substringToIndex:k.length - 7]];
+            }
+        }
+        NSMutableDictionary<NSString *, id> *overrides = [NSMutableDictionary dictionary];
+        for (NSString *baseKey in baseKeys) {
+            if (baseKey.length == 0 || pt_isSystemCatalystInfoKey(baseKey)) {
+                continue;
+            }
+            id iphoneVal = raw[[baseKey stringByAppendingString:@"~iphone"]];
+            id resolved = iphoneVal ?: raw[baseKey];
+            overrides[baseKey] = resolved ?: [NSNull null];
+        }
+        if (overrides.count > 0) {
+            sPhoneInfoPlistOverrides = [overrides copy];
+        }
+    });
+}
+
 - (id) pt_hook_NSBundle_objectForInfoDictionaryKey:(NSString *)key {
     id orig = [self pt_hook_NSBundle_objectForInfoDictionaryKey:key];
     if (key && [self isEqual:[NSBundle mainBundle]]) {
+        if (sPhoneInfoPlistOverrides) {
+            id overrideVal = sPhoneInfoPlistOverrides[key];
+            if (overrideVal) {
+                orig = (overrideVal == [NSNull null]) ? nil : overrideVal;
+            }
+        }
         return [PlayScreen resolvedMainBundleInfoValue:orig forKey:key];
     }
     return orig;
@@ -353,21 +409,41 @@ static void pt_fitWindowModal(UIView *backdrop) {
 - (NSDictionary<NSString *, id> *) pt_hook_NSBundle_infoDictionary {
     NSDictionary<NSString *, id> *orig = [self pt_hook_NSBundle_infoDictionary];
     if ([self isEqual:[NSBundle mainBundle]]) {
-        return [PlayScreen resolvedMainBundleInfoDictionary:orig];
+        NSDictionary<NSString *, id> *dict = orig;
+        if (orig && sPhoneInfoPlistOverrides) {
+            os_unfair_lock_lock(&sPhoneInfoDictCacheLock);
+            if (sLastOrigInfoDict == orig && sCachedPhoneInfoDict != nil) {
+                dict = sCachedPhoneInfoDict;
+            } else {
+                NSMutableDictionary<NSString *, id> *patched = [orig mutableCopy];
+                [sPhoneInfoPlistOverrides enumerateKeysAndObjectsUsingBlock:^(NSString *key, id val, BOOL *stop) {
+                    if (val == [NSNull null]) {
+                        [patched removeObjectForKey:key];
+                    } else {
+                        patched[key] = val;
+                    }
+                }];
+                dict = [patched copy];
+                sLastOrigInfoDict = orig;
+                sCachedPhoneInfoDict = dict;
+            }
+            os_unfair_lock_unlock(&sPhoneInfoDictCacheLock);
+        }
+        return [PlayScreen resolvedMainBundleInfoDictionary:dict];
     }
     return orig;
 }
 
 - (void) pt_hook_UIViewController_viewWillLayoutSubviews {
     [self pt_hook_UIViewController_viewWillLayoutSubviews];
-    if ([self isKindOfClass:[UIViewController class]]) {
+    if (pt_isPlayScreenScaledMode() && [self isKindOfClass:[UIViewController class]]) {
         [PlayScreen onViewControllerLayout:(UIViewController *)self];
     }
 }
 
 - (void) pt_hook_UIViewController_viewDidAppear:(BOOL)animated {
     [self pt_hook_UIViewController_viewDidAppear:animated];
-    if ([self isKindOfClass:[UIViewController class]]) {
+    if (pt_isPlayScreenScaledMode() && [self isKindOfClass:[UIViewController class]]) {
         [PlayScreen onViewControllerLayout:(UIViewController *)self];
     }
 }
@@ -916,6 +992,18 @@ static void pt_installClassSwizzle(Class target, SEL original, SEL alias) {
     pt_installSwizzle(object_getClass(target), original, object_getClass(PTSwizzleMethods.class), alias);
 }
 
+static BOOL sNSBundleInfoSwizzled = NO;
+
+static void pt_installNSBundleInfoSwizzlesOnce(void) {
+    if (sNSBundleInfoSwizzled) {
+        return;
+    }
+    sNSBundleInfoSwizzled = YES;
+    Class bundleCls = objc_getClass("NSBundle");
+    pt_installInstanceSwizzle(bundleCls, @selector(objectForInfoDictionaryKey:), @selector(pt_hook_NSBundle_objectForInfoDictionaryKey:));
+    pt_installInstanceSwizzle(bundleCls, @selector(infoDictionary), @selector(pt_hook_NSBundle_infoDictionary));
+}
+
 static UIUserInterfaceIdiom pt_phoneIdiom(id self, SEL selector) {
     return UIUserInterfaceIdiomPhone;
 }
@@ -1023,6 +1111,10 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
     pt_overrideIdentityGetter(device, @selector(localizedModel), model);
     if (phone) {
         pt_overrideIdentityGetter(device, @selector(systemName), (IMP)pt_phoneSystemName);
+        pt_preparePhoneInfoPlistOverrides();
+        if (sPhoneInfoPlistOverrides != nil) {
+            pt_installNSBundleInfoSwizzlesOnce();
+        }
     }
 }
 
@@ -1055,9 +1147,7 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
                 pt_installInstanceSwizzle(fixedSpaceCls, @selector(bounds), @selector(pt_hook_UIScreenFixedCoordinateSpace_bounds));
             }
             if ([[PlaySettings shared] sdkShift]) {
-                Class bundleCls = objc_getClass("NSBundle");
-                pt_installInstanceSwizzle(bundleCls, @selector(objectForInfoDictionaryKey:), @selector(pt_hook_NSBundle_objectForInfoDictionaryKey:));
-                pt_installInstanceSwizzle(bundleCls, @selector(infoDictionary), @selector(pt_hook_NSBundle_infoDictionary));
+                pt_installNSBundleInfoSwizzlesOnce();
             }
             pt_installInstanceSwizzle(objc_getClass("UIViewController"), @selector(viewWillLayoutSubviews), @selector(pt_hook_UIViewController_viewWillLayoutSubviews));
             pt_installInstanceSwizzle(objc_getClass("UIViewController"), @selector(viewDidAppear:), @selector(pt_hook_UIViewController_viewDidAppear:));
