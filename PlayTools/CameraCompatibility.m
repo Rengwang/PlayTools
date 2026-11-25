@@ -1,6 +1,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <TargetConditionals.h>
 #import <UIKit/UIKit.h>
+#import <math.h>
 #import <objc/runtime.h>
 
 #if TARGET_OS_MACCATALYST
@@ -13,10 +14,13 @@ static AVCaptureDeviceDiscoverySession *(*pt_nativeCameraDiscovery)(id, SEL, NSA
 static void (*pt_nativeCameraOrientation)(AVCaptureConnection *, SEL, AVCaptureVideoOrientation);
 static void (*pt_nativeCameraAngle)(AVCaptureConnection *, SEL, CGFloat);
 static void (*pt_nativeStartCameraSession)(AVCaptureSession *, SEL);
+static void (*pt_nativeCommitCameraConfiguration)(AVCaptureSession *, SEL);
+static id (*pt_nativePreviewInitWithSession)(AVCaptureVideoPreviewLayer *, SEL, AVCaptureSession *);
+static void (*pt_nativePreviewSetSession)(AVCaptureVideoPreviewLayer *, SEL, AVCaptureSession *);
+static CGFloat (*pt_nativeHorizonPreviewAngle)(AVCaptureDeviceRotationCoordinator *, SEL) API_AVAILABLE(macCatalyst(17.0));
+static CGFloat (*pt_nativeHorizonCaptureAngle)(AVCaptureDeviceRotationCoordinator *, SEL) API_AVAILABLE(macCatalyst(17.0));
 static __thread NSUInteger pt_nativePickerCheckDepth;
 static __thread BOOL pt_applyingCameraAngle;
-static char pt_frontFallbackKey;
-static char pt_rotationCoordinatorKey;
 
 // The settings are shared with PlayCover. An explicit angle overrides the app's orientation.
 static const NSInteger pt_automaticCameraRotation = -1;
@@ -39,12 +43,20 @@ static BOOL pt_usableCamera(AVCaptureDevice *device) {
     return device.isConnected && !device.isSuspended;
 }
 
-static BOOL pt_localFrontCamera(AVCaptureDevice *device) {
-    if (!pt_usableCamera(device) || device.position != AVCaptureDevicePositionFront) { return NO; }
+static BOOL pt_isLocalBuiltInMacCamera(AVCaptureDevice *device) {
+    if (!device || ![device.deviceType isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera]) {
+        return NO;
+    }
     if (@available(macCatalyst 16.0, *)) {
         if (device.isContinuityCamera) { return NO; }
     }
     return YES;
+}
+
+static BOOL pt_localFrontCamera(AVCaptureDevice *device) {
+    return pt_usableCamera(device) &&
+           device.position == AVCaptureDevicePositionFront &&
+           pt_isLocalBuiltInMacCamera(device);
 }
 
 static AVCaptureDevice *pt_findLocalFrontCamera(void) {
@@ -91,9 +103,6 @@ static AVCaptureDevice *pt_selectCamera(id self, SEL command, AVCaptureDeviceTyp
     }
 
     AVCaptureDevice *front = pt_findLocalFrontCamera();
-    if (front) {
-        objc_setAssociatedObject(front, &pt_frontFallbackKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    }
     return front ?: requested;
 }
 
@@ -117,7 +126,6 @@ static AVCaptureDeviceDiscoverySession *pt_discoverCameras(id self, SEL command,
     for (AVCaptureDevice *device in front.devices) {
         if (pt_localFrontCamera(device)) {
             hasFront = YES;
-            objc_setAssociatedObject(device, &pt_frontFallbackKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         }
     }
     // Report the actual front-facing device, including its true position and capabilities.
@@ -134,34 +142,39 @@ static AVCaptureDevice *pt_videoDeviceForConnection(AVCaptureConnection *connect
 }
 
 API_AVAILABLE(macCatalyst(17.0))
-static CGFloat pt_horizonAngle(AVCaptureConnection *connection, AVCaptureDevice *device) {
-    AVCaptureVideoPreviewLayer *preview = connection.videoPreviewLayer;
-    AVCaptureDeviceRotationCoordinator *coordinator = objc_getAssociatedObject(connection, &pt_rotationCoordinatorKey);
-    if (!coordinator || coordinator.device != device || coordinator.previewLayer != preview) {
-        coordinator = [[AVCaptureDeviceRotationCoordinator alloc] initWithDevice:device previewLayer:preview];
-        objc_setAssociatedObject(connection, &pt_rotationCoordinatorKey, coordinator, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+static CGFloat pt_alignedHorizonAngle(AVCaptureDeviceRotationCoordinator *coordinator, CGFloat angle) {
+    // Under PlayCover's default iOS platform (!useNativePlatform), AVCaptureConnection uses
+    // portrait sensor coordinates (90 deg = upright) whereas Catalyst's
+    // AVCaptureDeviceRotationCoordinator reports 0 deg for landscape built-in Mac cameras.
+    if (PlaySettings.shared.cameraRotation == pt_automaticCameraRotation &&
+        !PlaySettings.shared.useNativePlatform &&
+        pt_isLocalBuiltInMacCamera(coordinator.device)) {
+        return fmod(angle + 90.0, 360.0);
     }
-    return preview ? coordinator.videoRotationAngleForHorizonLevelPreview : coordinator.videoRotationAngleForHorizonLevelCapture;
+    return angle;
+}
+
+API_AVAILABLE(macCatalyst(17.0))
+static CGFloat pt_horizonPreviewAngle(AVCaptureDeviceRotationCoordinator *self, SEL command) {
+    CGFloat angle = pt_nativeHorizonPreviewAngle(self, command);
+    return pt_alignedHorizonAngle(self, angle);
+}
+
+API_AVAILABLE(macCatalyst(17.0))
+static CGFloat pt_horizonCaptureAngle(AVCaptureDeviceRotationCoordinator *self, SEL command) {
+    CGFloat angle = pt_nativeHorizonCaptureAngle(self, command);
+    return pt_alignedHorizonAngle(self, angle);
 }
 
 static BOOL pt_applyCameraRotation(AVCaptureConnection *connection) {
-    if (pt_applyingCameraAngle || !pt_nativeCameraAngle) { return NO; }
+    if (pt_applyingCameraAngle || !pt_nativeCameraAngle || !connection) { return NO; }
     if (@available(macCatalyst 17.0, *)) {
         NSInteger setting = PlaySettings.shared.cameraRotation;
-        BOOL automatic = setting == pt_automaticCameraRotation;
-        if (!automatic && setting != 0 && setting != 90 && setting != 180 && setting != 270) { return NO; }
+        if (setting != 0 && setting != 90 && setting != 180 && setting != 270) { return NO; }
         AVCaptureDevice *device = pt_videoDeviceForConnection(connection);
         if (!device) { return NO; }
 
-        if (automatic) {
-            if (![device.deviceType isEqualToString:AVCaptureDeviceTypeBuiltInWideAngleCamera] ||
-                 device.isContinuityCamera ||
-                 !objc_getAssociatedObject(device, &pt_frontFallbackKey)) {
-                return NO;
-            }
-        }
-
-        CGFloat angle = automatic ? pt_horizonAngle(connection, device) : setting;
+        CGFloat angle = (CGFloat)setting;
         if (![connection isVideoRotationAngleSupported:angle]) { return NO; }
         if (connection.videoRotationAngle != angle) {
             pt_applyingCameraAngle = YES;
@@ -184,11 +197,33 @@ static void pt_setCameraAngle(AVCaptureConnection *connection, SEL command, CGFl
     if (!pt_applyCameraRotation(connection)) { pt_nativeCameraAngle(connection, command, requested); }
 }
 
-static void pt_startCameraSession(AVCaptureSession *session, SEL command) {
+static void pt_applySessionRotations(AVCaptureSession *session) {
     for (AVCaptureConnection *connection in session.connections) {
         pt_applyCameraRotation(connection);
     }
+}
+
+static void pt_startCameraSession(AVCaptureSession *session, SEL command) {
+    pt_applySessionRotations(session);
     pt_nativeStartCameraSession(session, command);
+}
+
+static void pt_commitCameraConfiguration(AVCaptureSession *session, SEL command) {
+    pt_nativeCommitCameraConfiguration(session, command);
+    pt_applySessionRotations(session);
+}
+
+static id pt_previewInitWithSession(AVCaptureVideoPreviewLayer *layer, SEL command, AVCaptureSession *session) {
+    id result = pt_nativePreviewInitWithSession(layer, command, session);
+    if ([result isKindOfClass:AVCaptureVideoPreviewLayer.class]) {
+        pt_applyCameraRotation(((AVCaptureVideoPreviewLayer *)result).connection);
+    }
+    return result;
+}
+
+static void pt_previewSetSession(AVCaptureVideoPreviewLayer *layer, SEL command, AVCaptureSession *session) {
+    pt_nativePreviewSetSession(layer, command, session);
+    pt_applyCameraRotation(layer.connection);
 }
 
 __attribute__((constructor))
@@ -206,10 +241,20 @@ static void pt_installCameraCompatibility(void) {
         PT_CAMERA_HOOK(AVCaptureDeviceDiscoverySession, Class, discoverySessionWithDeviceTypes:mediaType:position:,
                        pt_nativeCameraDiscovery, pt_discoverCameras);
         if (@available(macCatalyst 17.0, *)) {
+            PT_CAMERA_HOOK(AVCaptureDeviceRotationCoordinator, Instance, videoRotationAngleForHorizonLevelPreview,
+                           pt_nativeHorizonPreviewAngle, pt_horizonPreviewAngle);
+            PT_CAMERA_HOOK(AVCaptureDeviceRotationCoordinator, Instance, videoRotationAngleForHorizonLevelCapture,
+                           pt_nativeHorizonCaptureAngle, pt_horizonCaptureAngle);
             PT_CAMERA_HOOK(AVCaptureConnection, Instance, setVideoRotationAngle:, pt_nativeCameraAngle, pt_setCameraAngle);
             PT_CAMERA_HOOK(AVCaptureConnection, Instance, setVideoOrientation:,
                            pt_nativeCameraOrientation, pt_setCameraOrientation);
             PT_CAMERA_HOOK(AVCaptureSession, Instance, startRunning, pt_nativeStartCameraSession, pt_startCameraSession);
+            PT_CAMERA_HOOK(AVCaptureSession, Instance, commitConfiguration,
+                           pt_nativeCommitCameraConfiguration, pt_commitCameraConfiguration);
+            PT_CAMERA_HOOK(AVCaptureVideoPreviewLayer, Instance, initWithSession:,
+                           pt_nativePreviewInitWithSession, pt_previewInitWithSession);
+            PT_CAMERA_HOOK(AVCaptureVideoPreviewLayer, Instance, setSession:,
+                           pt_nativePreviewSetSession, pt_previewSetSession);
         }
         if (pt_nativeTypedCamera) {
             PT_CAMERA_HOOK(UIImagePickerController, Class, isCameraDeviceAvailable:,
