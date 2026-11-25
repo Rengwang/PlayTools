@@ -37,6 +37,9 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     swizzle = read_text(pt_dir / "Controls" / "PTFakeTouch" / "NSObject+Swizzle.m")
     camera = read_text(pt_dir / "CameraCompatibility.m")
     screen = read_text(pt_dir / "PlayScreen.swift")
+    ak_plugin = read_text(root / "PlayTools" / "AKPlugin.swift")
+    ak_loader = read_text(pt_dir / "Utils" / "AKPluginLoader.swift")
+    location = read_text(pt_dir / "LocationCompatibility.m")
     pbxproj = read_text(root / "PlayTools" / "PlayTools.xcodeproj" / "project.pbxproj")
 
     required_tokens = [
@@ -50,16 +53,21 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("PlayLoader:WirelessInsightsVersion", loader, "0x001a0000"),
         ("PlayLoader:MarketplaceKitVersion", loader, "0x00110400"),
         ("PlayLoader:mscWebViewMouseTouchBridge", loader, "pt_installMSCMouseTouchCompatibility"),
+        ("PlayLoader:locationCompatibility", loader, "pt_installLocationCompatibility"),
         ("Camera:previewOnlyMirroring", camera, "if (!connection.videoPreviewLayer)"),
         ("Swizzle:FacebookBundleInfo", swizzle, "pt_installNSBundleInfoSwizzlesOnce"),
         ("pbxproj:OneNoteSceneCompatibility", pbxproj, "OneNoteSceneCompatibility.m"),
+        ("pbxproj:LocationCompatibility", pbxproj, "LocationCompatibility.m"),
         ("Camera:alignedHorizonAngle", camera, "pt_alignedHorizonAngle"),
         ("Camera:useNativePlatformFlag", camera, "!PlaySettings.shared.useNativePlatform"),
         ("Camera:perRoleMirroring", camera, "pt_applyCameraMirroring"),
         ("Camera:perInputRoleTracking", camera, "pt_requestedCameraRoleForConnection"),
         ("PlayScreen:exceedsFullCanvasGuard", screen, "exceedsFullCanvas"),
+        ("PlayScreen:iPadNoRuntimeFallback", screen, "!appCapabilities.supportsIPad"),
         ("PlayScreen:scaledZeroHeightSelfTest", screen, "geometry.scaled.zeroHeightStatusBarNonBlocking"),
         ("PlayScreen:scaledOversizedSelfTest", screen, "geometry.scaled.oversizedFullscreenClamped"),
+        ("AKPlugin:savedWindowFrame", ak_plugin, "PlayCover.SavedWindowFrame.v1"),
+        ("AKPluginLoader:preferFrameworkPlugin", ak_loader, "Bundle(for: AKInterface.self)"),
     ]
     for name, content, token in required_tokens:
         if token in content:
@@ -72,17 +80,23 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     else:
         passed.append("OneNote:sourceFileExists")
 
+    if not (pt_dir / "LocationCompatibility.m").is_file():
+        failures.append("Location: LocationCompatibility.m missing")
+    else:
+        passed.append("Location:sourceFileExists")
+
     # Ensure App Group path resolves under Library/PlayCoverGroupContainers (space-free), not Library/Application Support
     if 'URLByAppendingPathComponent:@"PlayCoverGroupContainers"' in loader and "NSLibraryDirectory" in loader:
         passed.append("PlayLoader:libraryGroupContainersRoot")
     else:
         failures.append("PlayLoader: missing NSLibraryDirectory + PlayCoverGroupContainers root")
 
-    # Forbidden tokens: temp traces and bundle-ID camera hardcodes
+    # Forbidden tokens: temp traces and bundle-ID hardcodes
     forbidden = [
         ("PlayLoader:noTempUmetripTrace", loader, "TEMP_UMETRIP_TRACE"),
         ("Camera:noTempCamTrace", camera, "PC_CAMTRACE"),
         ("Camera:noBundleIdHardcode", camera, "bundleIdentifier"),
+        ("Location:noBundleIdHardcode", location, "bundleIdentifier"),
     ]
     for name, content, token in forbidden:
         if token not in content:
@@ -133,6 +147,7 @@ def check_installed_invariants(root: Path, failures: list[str], passed: list[str
         ("MachO:HorizonPreview", "videoRotationAngleForHorizonLevelPreview"),
         ("MachO:VideoMirrored", "setVideoMirrored:"),
         ("MachO:MSCMouseTouchBridge", "__ptMscMouseTouchBridgeInstalled"),
+        ("MachO:LocationCompat", "PTLocationTimerBox"),
     ]:
         if needle in macho_strings:
             passed.append(s_name)
@@ -149,6 +164,10 @@ def check_installed_invariants(root: Path, failures: list[str], passed: list[str
             failures.append("XCFramework:iosSliceExcludesMSCBridge: unexpected MSC mouse-touch bridge found in ios-arm64 slice")
         else:
             passed.append("XCFramework:iosSliceExcludesMSCBridge")
+        if "PTLocationTimerBox" in ios_st.stdout or "pt_installLocationCompatibility" in ios_st.stdout:
+            failures.append("XCFramework:iosSliceExcludesLocationCompat: unexpected LocationCompatibility found in ios-arm64 slice")
+        else:
+            passed.append("XCFramework:iosSliceExcludesLocationCompat")
 
 
 def check_tests(root: Path, failures: list[str], passed: list[str]) -> None:
