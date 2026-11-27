@@ -54,8 +54,11 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("PlayLoader:spaceFreeAppGroup", loader, "PlayCoverGroupContainers"),
         ("PlayLoader:MarketplaceKitWeak", loader, "MarketplaceKit"),
         ("PlayLoader:WirelessInsightsWeak", loader, "WirelessInsights"),
+        ("PlayLoader:WirelessInsightsCompatSubpath", loader, "WirelessInsightsCompatibility/WirelessInsights.framework/WirelessInsights"),
+        ("PlayLoader:WirelessInsightsRebind", loader, "pt_rebind_weak_chained_fixups_in_image"),
         ("PlayLoader:WirelessInsightsVersion", loader, "0x001a0000"),
         ("PlayLoader:MarketplaceKitVersion", loader, "0x00110400"),
+        ("pbxproj:WirelessInsightsCompatibility", pbxproj, "Build WirelessInsights compatibility"),
         ("PlayLoader:mscWebViewMouseTouchBridge", loader, "pt_installMSCMouseTouchCompatibility"),
         ("PlayLoader:locationCompatibility", loader, "pt_installLocationCompatibility"),
         ("PlayLoader:appearanceReentrancyGuard", loader, "pt_installWindowAppearanceReentrancyGuard"),
@@ -78,6 +81,16 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("DuoVerticalBar:preferredBehavior", duo_vbar, "preferredVerticalBarBehavior"),
         ("DuoVerticalBar:navBarDedup", duo_vbar, "PTDuoClassifyNavBarSuppression"),
         ("DuoVerticalBar:navInsetCollapse", duo_vbar, "_edgeInsetsForChildViewController:insetsAreAbsolute:"),
+        ("DuoVerticalBar:recursiveChildDescent", duo_vbar, "pt_largestVisibleChildViewController"),
+        ("DuoVerticalBar:modernTabsProminent", duo_vbar, "prominentTabIdentifier"),
+        ("DuoVerticalBar:navBarHiddenBackGuard", duo_vbar, "PTDuoShouldShowSyntheticBackButton"),
+        ("DuoVerticalBar:emptyRightInsetCollapse", duo_vbar, "PTDuoShouldCollapseEmptyRightInset"),
+        ("DuoVerticalBar:barRegionStripMath", duo_vbar, "PTDuoBarRegionEdgeInsets"),
+        ("DuoVerticalBar:occupiedRightBarWidth", duo_vbar, "PTDuoResolveOccupiedRightBarWidth"),
+        ("DuoVerticalBar:swiftLayoutRegionInterpose", duo_vbar, "_$sSo6UIViewC5UIKitE10edgeInsets3forSo06UIEdgeD0VAbCE12LayoutRegionV_tF"),
+        ("DuoVerticalBar:swiftDirLayoutRegionInterpose", duo_vbar, "_$sSo6UIViewC5UIKitE21directionalEdgeInsets3forSo013NSDirectionaldE0VAbCE12LayoutRegionV_tF"),
+        ("DuoVerticalBar:swiftGuideLayoutRegionInterpose", duo_vbar, "_$sSo6UIViewC5UIKitE11layoutGuide3forSo08UILayoutD0CAbCE12LayoutRegionV_tF"),
+        ("DuoVerticalBar:adjustRightBarMath", duo_vbar, "PTDuoAdjustRightBarEdgeInsets"),
         ("pbxproj:DuoVerticalBarCompatibility", pbxproj, "DuoVerticalBarCompatibility.m"),
         ("PlaySettings:hideTitleBarDefault", settings, "var hideTitleBar = true"),
         ("PlaySettings:hideTitleBarDecodeDefault", settings, "forKey: .hideTitleBar) ?? true"),
@@ -104,6 +117,9 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("AKPlugin:setupOptionScrollZoom", ak_plugin, "func setupOptionScrollZoom("),
         ("OptionScrollZoom:controller", option_zoom, "class OptionScrollZoomController"),
         ("pbxproj:OptionScrollZoomController", pbxproj, "OptionScrollZoomController.swift"),
+        ("Swizzle:cmVirtualAlmondDeallocGuard", swizzle, "pt_CMMotionManager_dealloc"),
+        ("PlayLoader:skylightPrewarm", loader, "pt_ensure_skylight_prewarmed"),
+        ("PlayLoader:notificationRecursionGuard", loader, "pt_installNotificationRecursionGuard"),
     ]
     for name, content, token in required_tokens:
         if token in content:
@@ -255,6 +271,14 @@ def check_tests(root: Path, failures: list[str], passed: list[str]) -> None:
             passed.append("Test:check-duo-vertical-bar")
         else:
             failures.append(f"Test:check-duo-vertical-bar failed: {res.stdout} {res.stderr}")
+
+    global_back_test = root / "PlayTools" / "Tests" / "check-global-back.py"
+    if global_back_test.is_file():
+        res = subprocess.run([sys.executable, str(global_back_test)], capture_output=True, text=True, check=False)
+        if res.returncode == 0:
+            passed.append("Test:check-global-back")
+        else:
+            failures.append(f"Test:check-global-back failed: {res.stdout} {res.stderr}")
 
     routing = root / "build" / "diagnostics" / "installed-compat" / "camera" / "cross-app" / "test-routing"
     if routing.is_file() and os.access(routing, os.X_OK):

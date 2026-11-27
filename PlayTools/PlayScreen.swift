@@ -339,6 +339,14 @@ public class PlayScreen: NSObject {
         shared.handleViewControllerLayout(viewController)
     }
 
+    @objc public static func onViewController(_ viewController: UIViewController, willTransitionTo size: CGSize) {
+        guard shared.displayMode == .adaptive,
+              shared.isForcedPhoneAdaptive || PlaySettings.shared.duoVerticalBar else {
+            return
+        }
+        pt_recordRootViewControllerSizeTransition(viewController, size)
+    }
+
     @objc public static func interceptWindowSetFrame(_ window: UIWindow, frame: CGRect) -> Bool {
         shared.handleWindowSetFrame(window, frame: frame)
     }
@@ -840,6 +848,10 @@ private extension PlayScreen {
 
     func handleHostWindowLiveResizeStart() {
         isHostLiveResizing = true
+        if isForcedPhoneAdaptive || PlaySettings.shared.duoVerticalBar,
+           let win = activePrimaryWindow {
+            pt_seedWindowTransitionSizeBaselineIfNeeded(win, win.bounds.size)
+        }
         if isForcedPhoneAdaptive {
             relayoutWorkItem?.cancel()
             relayoutWorkItem = nil
@@ -980,8 +992,15 @@ private extension PlayScreen {
                 }
                 if abs(window.bounds.width - lastAdaptiveLayoutSize.width) > 0.5
                     || abs(window.bounds.height - lastAdaptiveLayoutSize.height) > 0.5 {
+                    let prevLaidOutSize = lastAdaptiveLayoutSize
                     lastAdaptiveLayoutSize = window.bounds.size
                     lastAdaptiveBounds = CGRect(origin: .zero, size: window.bounds.size)
+                    if isForcedPhoneAdaptive || PlaySettings.shared.duoVerticalBar {
+                        let baseline = (prevLaidOutSize.width >= 100 && prevLaidOutSize.height >= 100)
+                            ? prevLaidOutSize
+                            : window.bounds.size
+                        pt_seedWindowTransitionSizeBaselineIfNeeded(window, baseline)
+                    }
                     if isForcedPhoneAdaptive {
                         // Let UIKit drive intermediate layout frames during live drag;
                         // coalesce one lightweight pass after resizing settles.
@@ -1287,6 +1306,7 @@ private extension PlayScreen {
                 self.lastAdaptiveLayoutSize = win.bounds.size
                 self.lastAdaptiveBounds = CGRect(origin: .zero, size: win.bounds.size)
             }
+            pt_dispatchWindowResizeTransitionIfNeeded(win, win.bounds.size, self.isHostLiveResizing)
             win.setNeedsLayout()
             win.layoutIfNeeded()
         }
@@ -1521,6 +1541,16 @@ private extension PlayScreen {
                 buildTreeDumpPayload(window: window, maxDepth: maxDepth, maxNodes: maxNodes),
                 to: stateURL
             )
+        case "duoSnapshot":
+            var snapPayload: [String: Any] = [
+                "action": "duoSnapshot",
+                "timestamp": Date().timeIntervalSince1970,
+                "bundleId": Bundle.main.bundleIdentifier ?? ""
+            ]
+            if ProcessInfo.processInfo.environment["PLAYTOOLS_AUTOMATION"] == "1" {
+                snapPayload["snapshot"] = PTDuoCopyDecisionSnapshotForWindow(window) ?? [:]
+            }
+            writeJSON(snapPayload, to: stateURL)
         case "tap":
             let x = (params["x"] as? NSNumber)?.doubleValue ?? Double(window.bounds.midX)
             let y = (params["y"] as? NSNumber)?.doubleValue ?? Double(window.bounds.midY)
@@ -1909,6 +1939,10 @@ private extension PlayScreen {
             "clippedViewCount": clipped.count,
             "interactiveElements": elements
         ]
+        if ProcessInfo.processInfo.environment["PLAYTOOLS_AUTOMATION"] == "1",
+           let duoSnap = PTDuoCopyDecisionSnapshotForWindow(window) {
+            payload["duoDecisionSnapshot"] = duoSnap
+        }
         if case .scaled(let logical, let rW, let rH) = displayMode {
             payload["logicalSize"] = ["width": logical.width, "height": logical.height]
             payload["ratio"] = ["width": rW, "height": rH]
@@ -1943,6 +1977,15 @@ private extension PlayScreen {
                 "traitCollection": traitDict(win.traitCollection),
                 "subviews": treeNodes
             ]
+            if ProcessInfo.processInfo.environment["PLAYTOOLS_AUTOMATION"] == "1" {
+                winInfo["safeAreaInsets"] = edgeInsetsDict(win.safeAreaInsets)
+                winInfo["safeAreaLayoutGuideFrame"] = rectDict(win.safeAreaLayoutGuide.layoutFrame)
+                winInfo["windowSuperSafeAreaInsets"] = edgeInsetsDict(pt_duoDiagnosticWindowSuperSafeAreaInsets(win))
+                winInfo["trueNativeSafeAreaInsets"] = edgeInsetsDict(pt_duoDiagnosticWindowTrueNativeSafeAreaInsets(win))
+                if let duoSnap = PTDuoCopyDecisionSnapshotForWindow(win) {
+                    winInfo["duoDecisionSnapshot"] = duoSnap
+                }
+            }
             if let rootVC = win.rootViewController {
                 winInfo["rootViewController"] = dumpViewControllerTree(rootVC, depth: 0)
             }
@@ -2044,6 +2087,10 @@ private extension PlayScreen {
             dict["viewFrame"] = rectDict(view.frame)
             dict["viewHidden"] = view.isHidden
             dict["viewAlpha"] = view.alpha
+            if ProcessInfo.processInfo.environment["PLAYTOOLS_AUTOMATION"] == "1" {
+                dict["viewSafeAreaInsets"] = edgeInsetsDict(view.safeAreaInsets)
+                dict["viewSafeAreaLayoutGuideFrame"] = rectDict(view.safeAreaLayoutGuide.layoutFrame)
+            }
         }
         guard depth < 12 else { return dict }
         if !vc.children.isEmpty {
@@ -2078,6 +2125,10 @@ private extension PlayScreen {
             "traitCollection": traitDict(view.traitCollection),
             "layer": layerInfoDict(view.layer)
         ]
+        if ProcessInfo.processInfo.environment["PLAYTOOLS_AUTOMATION"] == "1" {
+            node["safeAreaInsets"] = edgeInsetsDict(view.safeAreaInsets)
+            node["safeAreaLayoutGuideFrame"] = rectDict(view.safeAreaLayoutGuide.layoutFrame)
+        }
         if let bg = colorString(view.backgroundColor) {
             node["backgroundColor"] = bg
         }
@@ -2375,6 +2426,10 @@ private extension PlayScreen {
 
     func rectDict(_ rect: CGRect) -> [String: CGFloat] {
         ["x": rect.origin.x, "y": rect.origin.y, "width": rect.size.width, "height": rect.size.height]
+    }
+
+    func edgeInsetsDict(_ insets: UIEdgeInsets) -> [String: CGFloat] {
+        ["top": insets.top, "left": insets.left, "bottom": insets.bottom, "right": insets.right]
     }
 
     func writeJSON(_ dict: [String: Any], to url: URL) {

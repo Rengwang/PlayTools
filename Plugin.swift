@@ -36,6 +36,15 @@ public protocol Plugin: NSObjectProtocol {
         _ onZoom: @escaping (CGFloat, CGFloat, CGFloat, Bool) -> Bool,
         onEnd: @escaping () -> Void
     )
+    @objc optional func setupGlobalBackIntegration(
+        queryState: @escaping (Bool) -> Int,
+        performBack: @escaping (Bool) -> Bool
+    )
+    @objc optional func setupGlobalHomeIntegration(
+        queryHome: @escaping () -> Bool,
+        performHome: @escaping () -> Bool
+    )
+    @objc optional func refreshGlobalBackUI()
     func urlForApplicationWithBundleIdentifier(_ value: String) -> URL?
     func setMenuBarVisible(_ value: Bool)
     func applyWindowAspectLock(width: CGFloat, height: CGFloat, minWidth: CGFloat, minHeight: CGFloat)

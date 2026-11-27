@@ -11,6 +11,7 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <os/lock.h>
+#import <stdatomic.h>
 #import "CoreGraphics/CoreGraphics.h"
 #import "UIKit/UIKit.h"
 #import <PlayTools/PlayTools-Swift.h>
@@ -137,6 +138,68 @@ static void (*sOrigCMStartGyro)(id, SEL, NSOperationQueue *, id) = NULL;
 static void (*sOrigCMStartMagnetometer)(id, SEL, NSOperationQueue *, id) = NULL;
 static void (*sOrigCMStartDeviceMotion)(id, SEL, NSOperationQueue *, id) = NULL;
 static void (*sOrigCMStartDeviceMotionRef)(id, SEL, CMAttitudeReferenceFrame, NSOperationQueue *, id) = NULL;
+
+#if TARGET_OS_MACCATALYST
+static void (*sOrigCMDealloc)(__unsafe_unretained id, SEL) = NULL;
+static atomic_bool sCMVirtualAlmondCalibrationDone = ATOMIC_VAR_INIT(false);
+static atomic_bool sCMVirtualAlmondExtraRetainEnabled = ATOMIC_VAR_INIT(true);
+static os_unfair_lock sCMVirtualAlmondCalibLock = OS_UNFAIR_LOCK_INIT;
+static __thread BOOL sInCMVirtualAlmondCalib = NO;
+
+static void pt_CMMotionManager_dealloc(__unsafe_unretained id self, SEL _cmd) {
+    // On macOS 27.2.1 Catalyst, -[CMMotionManager deallocPrivate] releases
+    // +[CMMotionManager virtualAlmondDevice] without having retained it in init
+    // and then sends messages to the stale global pointer, causing immediate UAF SIGSEGV.
+    // Self-calibrate on the first non-nil virtualAlmondDevice so a future macOS fix never leaks.
+    if (!atomic_load_explicit(&sCMVirtualAlmondCalibrationDone, memory_order_acquire) && !sInCMVirtualAlmondCalib) {
+        os_unfair_lock_lock(&sCMVirtualAlmondCalibLock);
+        if (!atomic_load_explicit(&sCMVirtualAlmondCalibrationDone, memory_order_relaxed) && !sInCMVirtualAlmondCalib) {
+            sInCMVirtualAlmondCalib = YES;
+            CFTypeRef retainedDev = NULL;
+            CFIndex beforeCount = 0;
+            Class cmCls = objc_getClass("CMMotionManager");
+            SEL devSel = sel_registerName("virtualAlmondDevice");
+            if (cmCls && [cmCls respondsToSelector:devSel]) {
+                CFTypeRef dev = ((CFTypeRef (*)(Class, SEL))objc_msgSend)(cmCls, devSel);
+                if (dev) {
+                    retainedDev = dev;
+                    beforeCount = CFGetRetainCount(retainedDev);
+                    CFRetain(retainedDev);
+                }
+            }
+            if (sOrigCMDealloc) {
+                sOrigCMDealloc(self, _cmd);
+            }
+            if (retainedDev) {
+                CFIndex afterCount = CFGetRetainCount(retainedDev);
+                if (afterCount == beforeCount + 1) {
+                    atomic_store_explicit(&sCMVirtualAlmondExtraRetainEnabled, false, memory_order_release);
+                    CFRelease(retainedDev);
+                }
+                atomic_store_explicit(&sCMVirtualAlmondCalibrationDone, true, memory_order_release);
+            }
+            sInCMVirtualAlmondCalib = NO;
+            os_unfair_lock_unlock(&sCMVirtualAlmondCalibLock);
+            return;
+        }
+        os_unfair_lock_unlock(&sCMVirtualAlmondCalibLock);
+    }
+
+    if (atomic_load_explicit(&sCMVirtualAlmondExtraRetainEnabled, memory_order_acquire)) {
+        Class cmCls = objc_getClass("CMMotionManager");
+        SEL devSel = sel_registerName("virtualAlmondDevice");
+        if (cmCls && [cmCls respondsToSelector:devSel]) {
+            CFTypeRef dev = ((CFTypeRef (*)(Class, SEL))objc_msgSend)(cmCls, devSel);
+            if (dev) {
+                CFRetain(dev);
+            }
+        }
+    }
+    if (sOrigCMDealloc) {
+        sOrigCMDealloc(self, _cmd);
+    }
+}
+#endif
 
 - (CGRect) pt_hook_FBSSceneSettings_frameDefault {
     CGRect rect = sOrigFBSSceneSettingsFrame ? sOrigFBSSceneSettingsFrame(self, _cmd) : CGRectZero;
@@ -445,6 +508,14 @@ static void pt_preparePhoneInfoPlistOverrides(void) {
     [self pt_hook_UIViewController_viewDidAppear:animated];
     if (pt_isPlayScreenScaledMode() && [self isKindOfClass:[UIViewController class]]) {
         [PlayScreen onViewControllerLayout:(UIViewController *)self];
+    }
+}
+
+- (void) pt_hook_UIViewController_viewWillTransitionToSize:(CGSize)size
+                                withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator {
+    [self pt_hook_UIViewController_viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+    if ([self isKindOfClass:[UIViewController class]]) {
+        [PlayScreen onViewController:(UIViewController *)self willTransitionTo:size];
     }
 }
 
@@ -1094,6 +1165,20 @@ static void pt_installCoreMotionGuards(void) {
                                    @selector(startDeviceMotionUpdatesUsingReferenceFrame:toQueue:withHandler:),
                                    @selector(pt_hook_CMMotionManager_startDeviceMotionUpdatesUsingReferenceFrame:toQueue:withHandler:),
                                    (IMP *)&sOrigCMStartDeviceMotionRef);
+#if TARGET_OS_MACCATALYST
+    SEL deallocSel = sel_registerName("dealloc");
+    Method deallocMethod = class_getInstanceMethod(cmCls, deallocSel);
+    if (deallocMethod) {
+        IMP origDealloc = method_getImplementation(deallocMethod);
+        if (origDealloc != (IMP)pt_CMMotionManager_dealloc) {
+            sOrigCMDealloc = (void (*)(__unsafe_unretained id, SEL))origDealloc;
+            class_replaceMethod(cmCls,
+                                deallocSel,
+                                (IMP)pt_CMMotionManager_dealloc,
+                                method_getTypeEncoding(deallocMethod));
+        }
+    }
+#endif
 }
 
 static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
@@ -1151,6 +1236,7 @@ static void pt_installDeviceLayoutIdentity(NSInteger layoutIdiom) {
             }
             pt_installInstanceSwizzle(objc_getClass("UIViewController"), @selector(viewWillLayoutSubviews), @selector(pt_hook_UIViewController_viewWillLayoutSubviews));
             pt_installInstanceSwizzle(objc_getClass("UIViewController"), @selector(viewDidAppear:), @selector(pt_hook_UIViewController_viewDidAppear:));
+            pt_installInstanceSwizzle(objc_getClass("UIViewController"), @selector(viewWillTransitionToSize:withTransitionCoordinator:), @selector(pt_hook_UIViewController_viewWillTransitionToSize:withTransitionCoordinator:));
             Class baseLayoutCls = objc_getClass("UICollectionViewLayout");
             sBaseLayoutPrepareMethod = class_getInstanceMethod(baseLayoutCls, @selector(prepareLayout));
             sBaseLayoutContentSizeMethod = class_getInstanceMethod(baseLayoutCls, @selector(collectionViewContentSize));

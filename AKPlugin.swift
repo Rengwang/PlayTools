@@ -90,17 +90,38 @@ private struct AKAppLayoutInfo {
 
 class AKPlugin: NSObject, Plugin {
     private static let savedFrameDefaultsKey = "PlayCover.SavedWindowFrame.v1"
+    private static let temporaryDefaultWideDuoWindow = true // TEMP_TEST_DEFAULT_WIDE_DUO_WINDOW: revert when testing completes
 
     private let layoutInfo = AKAppLayoutInfo()
     private let configuredWindows = NSHashTable<NSWindow>.weakObjects()
     private let verifiedTargetWindows = NSHashTable<NSWindow>.weakObjects()
     private var isRestoringSavedFrame = false
+    private static let globalBackChangedNotification = Notification.Name("io.playcover.PlayCover.GlobalBackSettingsChanged")
+    private var globalBackSettings = AKGlobalBackSettingsData.load()
+    private var globalBackQueryState: ((Bool) -> Int)?
+    private var globalBackPerformBack: ((Bool) -> Bool)?
+    private var globalHomeQueryState: (() -> Bool)?
+    private var globalHomePerformHome: (() -> Bool)?
+    private var globalBackMonitorInstalled = false
+    private var globalBackPostClickWorkItem: DispatchWorkItem?
+    private let globalBackAccessoryByWindow = NSMapTable<NSWindow, NSTitlebarAccessoryViewController>.weakToStrongObjects()
+    private let globalBackStackByWindow = NSMapTable<NSWindow, NSStackView>.weakToStrongObjects()
+    private let globalBackButtonByWindow = NSMapTable<NSWindow, AKGlobalBackTitlebarButton>.weakToStrongObjects()
+    private let globalHomeButtonByWindow = NSMapTable<NSWindow, AKGlobalBackTitlebarButton>.weakToStrongObjects()
 
     required override init() {
         super.init()
         configureAllWindows()
 
         let center = NotificationCenter.default
+        DistributedNotificationCenter.default().addObserver(
+            forName: Self.globalBackChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.reloadGlobalBackSettingsAndRefresh()
+        }
         center.addObserver(
             forName: NSApplication.didFinishLaunchingNotification,
             object: nil,
@@ -321,8 +342,11 @@ class AKPlugin: NSObject, Plugin {
         }
 
         NSEvent.addLocalMonitorForEvents(matching: downType, handler: { event in
-            // Always allow clicks on the window traffic-light buttons to pass through
+            // Always allow clicks on the window traffic-light buttons or titlebar Back button to pass through
             if isInTrafficLightArea(event) {
+                return event
+            }
+            if let win = event.window, self.isPointInGlobalBackButton(event.locationInWindow, window: win) {
                 return event
             }
 
@@ -347,8 +371,11 @@ class AKPlugin: NSObject, Plugin {
             return event
         })
         NSEvent.addLocalMonitorForEvents(matching: upType, handler: { event in
-            // Always allow releases on the traffic-light buttons to pass through
+            // Always allow releases on the traffic-light buttons or titlebar Back button to pass through
             if isInTrafficLightArea(event) {
+                return event
+            }
+            if let win = event.window, self.isPointInGlobalBackButton(event.locationInWindow, window: win) {
                 return event
             }
             if consumed(event.buttonNumber, false) {
@@ -665,6 +692,7 @@ private extension AKPlugin {
     func configureWindowIfNeeded(_ win: NSWindow) {
         guard isMainAppWindow(win) else { return }
         applyAppearanceRules(win)
+        updateGlobalBackButton(for: win)
 
         if !configuredWindows.contains(win) {
             configuredWindows.add(win)
@@ -707,10 +735,15 @@ private extension AKPlugin {
         let isAutomatedRun = env["PLAYTOOLS_AUTOMATION"] == "1"
             || !(env["PLAYCOVER_TARGET_SCREEN"] ?? "").isEmpty
 
+        let useTemporaryWideDuoDefault = Self.temporaryDefaultWideDuoWindow
+            && resolutionSetting == 7
+            && (layoutInfo.isAdaptive || sdkShiftSetting)
+
         if !isAutomatedRun,
            (resolutionSetting == 7 || resolutionSetting == 6),
            let saved = loadSavedWindowFrame(),
-           saved.resolution == resolutionSetting {
+           saved.resolution == resolutionSetting,
+           !(useTemporaryWideDuoDefault && (saved.frame.width <= saved.frame.height || saved.frame.width < 600)) {
             let target = screenForSavedFrame(saved.frame)
                 ?? win.screen ?? NSScreen.main ?? NSScreen.screens.first
             let visible = target?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
@@ -772,9 +805,18 @@ private extension AKPlugin {
                 win.resizeIncrements = NSSize(width: 1, height: 1)
                 if layoutIdiomSetting == 1 || (layoutIdiomSetting == 3 && layoutInfo.families.contains(1)) {
                     win.contentMinSize = NSSize(width: 320, height: 520)
-                    let initW = max(320, min(420, maxW))
-                    let initH = max(520, min(760, round(visible.height * 0.82), maxH))
-                    win.setContentSize(NSSize(width: initW, height: initH))
+                    if Self.temporaryDefaultWideDuoWindow {
+                        let initW = max(640, min(1000, round(visible.width * 0.78), maxW))
+                        var initH = max(520, min(760, round(visible.height * 0.82), maxH))
+                        if initW >= 600 && initH >= initW {
+                            initH = max(520, initW - 80)
+                        }
+                        win.setContentSize(NSSize(width: initW, height: initH))
+                    } else {
+                        let initW = max(320, min(420, maxW))
+                        let initH = max(520, min(760, round(visible.height * 0.82), maxH))
+                        win.setContentSize(NSSize(width: initW, height: initH))
+                    }
                 } else {
                     win.contentMinSize = NSSize(width: 360, height: 540)
                     let initW = max(360, min(920, round(visible.width * 0.68), maxW))
@@ -932,5 +974,509 @@ private extension AKPlugin {
         let x = max(visible.minX, min(frame.origin.x, visible.maxX - frame.width))
         let y = max(visible.minY, min(frame.origin.y, visible.maxY - frame.height))
         win.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+}
+
+private struct AKGlobalBackSettingsData: Codable {
+    var titlebarBackEnabled: Bool = true
+    var onlyWhenNoSidebarBackButton: Bool = true
+    var includeTopCloseButtons: Bool = true
+    var shortcutEnabled: Bool = true
+    var shortcutKind: String = "mouse"
+    var shortcutKeyCode: UInt16 = 0
+    var shortcutButtonNumber: Int = 3
+    var shortcutModifiersRaw: UInt = 0
+    var shortcutDisplayName: String = "Mouse Button 4"
+    var titlebarHomeEnabled: Bool = true
+    var homeShortcutEnabled: Bool = true
+    var homeShortcutKind: String = "none"
+    var homeShortcutKeyCode: UInt16 = 0
+    var homeShortcutButtonNumber: Int = -1
+    var homeShortcutModifiersRaw: UInt = 0
+    var homeShortcutDisplayName: String = ""
+
+    static var defaultSettings: AKGlobalBackSettingsData {
+        AKGlobalBackSettingsData()
+    }
+
+    static var configURL: URL {
+        URL(fileURLWithPath: "/Users/\(NSUserName())/Library/Containers/io.playcover.PlayCover")
+            .appendingPathComponent("GlobalBackSettings.plist")
+    }
+
+    static func load() -> AKGlobalBackSettingsData {
+        guard let data = try? Data(contentsOf: configURL),
+              let decoded = try? PropertyListDecoder().decode(AKGlobalBackSettingsData.self, from: data) else {
+            return .defaultSettings
+        }
+        return decoded
+    }
+
+    init() {}
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = AKGlobalBackSettingsData.defaultSettings
+        titlebarBackEnabled = try c.decodeIfPresent(Bool.self, forKey: .titlebarBackEnabled) ?? d.titlebarBackEnabled
+        onlyWhenNoSidebarBackButton = try c.decodeIfPresent(Bool.self, forKey: .onlyWhenNoSidebarBackButton) ?? d.onlyWhenNoSidebarBackButton
+        includeTopCloseButtons = try c.decodeIfPresent(Bool.self, forKey: .includeTopCloseButtons) ?? d.includeTopCloseButtons
+        shortcutEnabled = try c.decodeIfPresent(Bool.self, forKey: .shortcutEnabled) ?? d.shortcutEnabled
+        shortcutKind = try c.decodeIfPresent(String.self, forKey: .shortcutKind) ?? d.shortcutKind
+        shortcutKeyCode = try c.decodeIfPresent(UInt16.self, forKey: .shortcutKeyCode) ?? d.shortcutKeyCode
+        shortcutButtonNumber = try c.decodeIfPresent(Int.self, forKey: .shortcutButtonNumber) ?? d.shortcutButtonNumber
+        shortcutModifiersRaw = try c.decodeIfPresent(UInt.self, forKey: .shortcutModifiersRaw) ?? d.shortcutModifiersRaw
+        shortcutDisplayName = try c.decodeIfPresent(String.self, forKey: .shortcutDisplayName) ?? d.shortcutDisplayName
+        titlebarHomeEnabled = try c.decodeIfPresent(Bool.self, forKey: .titlebarHomeEnabled) ?? d.titlebarHomeEnabled
+        homeShortcutEnabled = try c.decodeIfPresent(Bool.self, forKey: .homeShortcutEnabled) ?? d.homeShortcutEnabled
+        homeShortcutKind = try c.decodeIfPresent(String.self, forKey: .homeShortcutKind) ?? d.homeShortcutKind
+        homeShortcutKeyCode = try c.decodeIfPresent(UInt16.self, forKey: .homeShortcutKeyCode) ?? d.homeShortcutKeyCode
+        homeShortcutButtonNumber = try c.decodeIfPresent(Int.self, forKey: .homeShortcutButtonNumber) ?? d.homeShortcutButtonNumber
+        homeShortcutModifiersRaw = try c.decodeIfPresent(UInt.self, forKey: .homeShortcutModifiersRaw) ?? d.homeShortcutModifiersRaw
+        homeShortcutDisplayName = try c.decodeIfPresent(String.self, forKey: .homeShortcutDisplayName) ?? d.homeShortcutDisplayName
+    }
+
+    var normalizedModifierFlags: NSEvent.ModifierFlags {
+        NSEvent.ModifierFlags(rawValue: shortcutModifiersRaw).intersection([.command, .option, .control, .shift])
+    }
+
+    var homeNormalizedModifierFlags: NSEvent.ModifierFlags {
+        NSEvent.ModifierFlags(rawValue: homeShortcutModifiersRaw).intersection([.command, .option, .control, .shift])
+    }
+}
+
+private final class AKGlobalBackTitlebarButton: NSButton {
+    var usesPillBackdrop = false {
+        didSet {
+            if usesPillBackdrop != oldValue {
+                updateAppearance()
+            }
+        }
+    }
+
+    private var isHovered = false {
+        didSet {
+            if isHovered != oldValue {
+                updateAppearance()
+            }
+        }
+    }
+
+    private var hoverTrackingArea: NSTrackingArea?
+
+    init(
+        frame frameRect: NSRect,
+        symbolName: String = "chevron.backward",
+        accessibilityDescription: String = "Back"
+    ) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        isBordered = false
+        title = ""
+        bezelStyle = .regularSquare
+        setButtonType(.momentaryPushIn)
+        imagePosition = .imageOnly
+        if let sym = NSImage(systemSymbolName: symbolName, accessibilityDescription: accessibilityDescription)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 12, weight: .semibold)) {
+            sym.isTemplate = true
+            image = sym
+        }
+        contentTintColor = .labelColor
+        updateAppearance()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let hoverTrackingArea {
+            removeTrackingArea(hoverTrackingArea)
+        }
+        let area = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(area)
+        hoverTrackingArea = area
+    }
+
+    override func mouseEntered(with event: NSEvent) {
+        isHovered = true
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        isHovered = false
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
+
+    private func updateAppearance() {
+        guard let layer else { return }
+        if usesPillBackdrop {
+            layer.cornerRadius = 6
+            layer.backgroundColor = NSColor.windowBackgroundColor
+                .withAlphaComponent(isHovered ? 0.92 : 0.72).cgColor
+            layer.borderWidth = 0.5
+            layer.borderColor = NSColor.separatorColor.withAlphaComponent(0.4).cgColor
+        } else {
+            layer.cornerRadius = 5
+            layer.backgroundColor = isHovered
+                ? NSColor.labelColor.withAlphaComponent(0.10).cgColor
+                : NSColor.clear.cgColor
+            layer.borderWidth = 0
+            layer.borderColor = nil
+        }
+    }
+}
+
+extension AKPlugin {
+    @objc func setupGlobalBackIntegration(
+        queryState: @escaping (Bool) -> Int,
+        performBack: @escaping (Bool) -> Bool
+    ) {
+        runOnMain {
+            self.globalBackQueryState = queryState
+            self.globalBackPerformBack = performBack
+            self.globalBackSettings = AKGlobalBackSettingsData.load()
+            self.installGlobalBackMonitorIfNeeded()
+            self.refreshGlobalBackUI()
+        }
+    }
+
+    @objc func setupGlobalHomeIntegration(
+        queryHome: @escaping () -> Bool,
+        performHome: @escaping () -> Bool
+    ) {
+        runOnMain {
+            self.globalHomeQueryState = queryHome
+            self.globalHomePerformHome = performHome
+            self.installGlobalBackMonitorIfNeeded()
+            self.refreshGlobalBackUI()
+        }
+    }
+
+    @objc func refreshGlobalBackUI() {
+        let work = { [weak self] in
+            guard let self else { return }
+            for win in NSApplication.shared.windows where self.isMainAppWindow(win) {
+                self.updateGlobalBackButton(for: win)
+            }
+        }
+        if Thread.isMainThread {
+            work()
+        } else {
+            DispatchQueue.main.async(execute: work)
+        }
+    }
+}
+
+private extension AKPlugin {
+
+    func scheduleDebouncedGlobalBackRefresh() {
+        globalBackPostClickWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.globalBackPostClickWorkItem = nil
+            self.refreshGlobalBackUI()
+        }
+        globalBackPostClickWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: item)
+    }
+
+    func reloadGlobalBackSettingsAndRefresh() {
+        globalBackSettings = AKGlobalBackSettingsData.load()
+        for win in NSApplication.shared.windows where isMainAppWindow(win) {
+            updateGlobalBackButton(for: win)
+        }
+    }
+
+    func shortcutTooltip(base: String, enabled: Bool, kind: String, displayName: String) -> String {
+        if enabled, kind != "none", !displayName.isEmpty {
+            return "\(base) (\(displayName))"
+        }
+        return base
+    }
+
+    func updateGlobalBackButton(for win: NSWindow) {
+        guard isMainAppWindow(win) else { return }
+        let isPrimary = (win === primaryWindow)
+        let showBack: Bool
+        let showHome: Bool
+        if isPrimary {
+            if let query = globalBackQueryState {
+                let state = query(globalBackSettings.includeTopCloseButtons)
+                let hasBack = (state & 1) != 0
+                let hasSidebarBack = (state & 2) != 0
+                showBack = globalBackSettings.titlebarBackEnabled
+                    && hasBack
+                    && (!globalBackSettings.onlyWhenNoSidebarBackButton || !hasSidebarBack)
+            } else {
+                showBack = false
+            }
+            if let queryHome = globalHomeQueryState {
+                showHome = globalBackSettings.titlebarHomeEnabled && queryHome()
+            } else {
+                showHome = false
+            }
+        } else {
+            showBack = false
+            showHome = false
+        }
+
+        if showHome || showBack {
+            let accessoryVC: NSTitlebarAccessoryViewController
+            let backBtn: AKGlobalBackTitlebarButton
+            let homeBtn: AKGlobalBackTitlebarButton
+            if let existingVC = globalBackAccessoryByWindow.object(forKey: win),
+               let existingBack = globalBackButtonByWindow.object(forKey: win),
+               let existingHome = globalHomeButtonByWindow.object(forKey: win) {
+                accessoryVC = existingVC
+                backBtn = existingBack
+                homeBtn = existingHome
+            } else {
+                let vc = NSTitlebarAccessoryViewController()
+                vc.layoutAttribute = .trailing
+
+                let hBtn = AKGlobalBackTitlebarButton(
+                    frame: NSRect(x: 0, y: 0, width: 28, height: 22),
+                    symbolName: "house",
+                    accessibilityDescription: "Home"
+                )
+                hBtn.translatesAutoresizingMaskIntoConstraints = false
+                hBtn.target = self
+                hBtn.action = #selector(handleTitlebarGlobalHomeClick(_:))
+
+                let bBtn = AKGlobalBackTitlebarButton(
+                    frame: NSRect(x: 0, y: 0, width: 28, height: 22),
+                    symbolName: "chevron.backward",
+                    accessibilityDescription: "Back"
+                )
+                bBtn.translatesAutoresizingMaskIntoConstraints = false
+                bBtn.target = self
+                bBtn.action = #selector(handleTitlebarGlobalBackClick(_:))
+
+                NSLayoutConstraint.activate([
+                    hBtn.widthAnchor.constraint(equalToConstant: 28),
+                    hBtn.heightAnchor.constraint(equalToConstant: 22),
+                    bBtn.widthAnchor.constraint(equalToConstant: 28),
+                    bBtn.heightAnchor.constraint(equalToConstant: 22)
+                ])
+
+                let stack = NSStackView(views: [hBtn, bBtn])
+                stack.translatesAutoresizingMaskIntoConstraints = false
+                stack.orientation = .horizontal
+                stack.alignment = .centerY
+                stack.spacing = 4
+                stack.detachesHiddenViews = true
+                stack.edgeInsets = NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 2)
+
+                let container = NSView(frame: NSRect(x: 0, y: 0, width: 64, height: 26))
+                container.addSubview(stack)
+                NSLayoutConstraint.activate([
+                    stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                    stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+                    stack.topAnchor.constraint(equalTo: container.topAnchor),
+                    stack.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+                ])
+
+                vc.view = container
+                globalBackAccessoryByWindow.setObject(vc, forKey: win)
+                globalBackStackByWindow.setObject(stack, forKey: win)
+                globalHomeButtonByWindow.setObject(hBtn, forKey: win)
+                globalBackButtonByWindow.setObject(bBtn, forKey: win)
+                accessoryVC = vc
+                homeBtn = hBtn
+                backBtn = bBtn
+            }
+
+            homeBtn.isHidden = !showHome
+            backBtn.isHidden = !showBack
+            homeBtn.usesPillBackdrop = hideTitleBarSetting
+            backBtn.usesPillBackdrop = hideTitleBarSetting
+            homeBtn.toolTip = shortcutTooltip(
+                base: "回到首页",
+                enabled: globalBackSettings.homeShortcutEnabled,
+                kind: globalBackSettings.homeShortcutKind,
+                displayName: globalBackSettings.homeShortcutDisplayName
+            )
+            backBtn.toolTip = shortcutTooltip(
+                base: "返回",
+                enabled: globalBackSettings.shortcutEnabled,
+                kind: globalBackSettings.shortcutKind,
+                displayName: globalBackSettings.shortcutDisplayName
+            )
+            let targetWidth: CGFloat = (showHome && showBack) ? 64 : 34
+            if abs(accessoryVC.view.frame.size.width - targetWidth) > 0.5 {
+                accessoryVC.view.setFrameSize(NSSize(width: targetWidth, height: 26))
+            }
+            if !win.titlebarAccessoryViewControllers.contains(where: { $0 === accessoryVC }) {
+                win.addTitlebarAccessoryViewController(accessoryVC)
+            }
+        } else if let existingVC = globalBackAccessoryByWindow.object(forKey: win),
+                  let idx = win.titlebarAccessoryViewControllers.firstIndex(where: { $0 === existingVC }) {
+            win.removeTitlebarAccessoryViewController(at: idx)
+        }
+    }
+
+    @objc func handleTitlebarGlobalBackClick(_ sender: Any?) {
+        _ = globalBackPerformBack?(globalBackSettings.includeTopCloseButtons)
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshGlobalBackUI()
+        }
+    }
+
+    @objc func handleTitlebarGlobalHomeClick(_ sender: Any?) {
+        _ = globalHomePerformHome?()
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshGlobalBackUI()
+        }
+    }
+
+    func isPointInGlobalBackButton(_ pointInWindow: NSPoint, window: NSWindow) -> Bool {
+        for table in [globalBackButtonByWindow, globalHomeButtonByWindow] {
+            if let button = table.object(forKey: window),
+               button.window === window,
+               !button.isHidden {
+                let localPoint = button.convert(pointInWindow, from: nil)
+                if button.bounds.contains(localPoint) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    func installGlobalBackMonitorIfNeeded() {
+        guard !globalBackMonitorInstalled else { return }
+        globalBackMonitorInstalled = true
+        NSEvent.addLocalMonitorForEvents(
+            matching: [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] event in
+            guard let self else { return event }
+            return self.handleGlobalBackMonitorEvent(event)
+        }
+        NSEvent.addLocalMonitorForEvents(matching: .leftMouseUp) { [weak self] event in
+            guard let self else { return event }
+            if self.globalBackSettings.titlebarBackEnabled
+                || self.globalBackSettings.titlebarHomeEnabled
+                || self.globalBackSettings.shortcutEnabled
+                || self.globalBackSettings.homeShortcutEnabled,
+               let win = event.window,
+               win === self.primaryWindow,
+               win.isVisible,
+               !self.isPointInGlobalBackButton(event.locationInWindow, window: win) {
+                self.scheduleDebouncedGlobalBackRefresh()
+            }
+            return event
+        }
+    }
+
+    func matchesShortcutEvent(
+        _ event: NSEvent,
+        kind: String,
+        keyCode: UInt16,
+        buttonNumber: Int,
+        targetFlags: NSEvent.ModifierFlags,
+        win: NSWindow
+    ) -> Bool {
+        let relevantFlags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        switch kind {
+        case "keyboard":
+            return event.type == .keyDown
+                && !event.isARepeat
+                && event.keyCode == keyCode
+                && relevantFlags == targetFlags
+        case "mouse":
+            guard event.type == .leftMouseDown || event.type == .rightMouseDown || event.type == .otherMouseDown,
+                  event.buttonNumber == buttonNumber,
+                  relevantFlags == targetFlags else {
+                return false
+            }
+            let pt = event.locationInWindow
+            if isPointInTrafficLightArea(pt, window: win) || isPointInGlobalBackButton(pt, window: win) {
+                return false
+            }
+            if buttonNumber == 0 && relevantFlags.isEmpty && pt.y > win.contentLayoutRect.maxY {
+                return false
+            }
+            return true
+        default:
+            return false
+        }
+    }
+
+    func handleGlobalBackMonitorEvent(_ event: NSEvent) -> NSEvent? {
+        guard let win = event.window,
+              win === primaryWindow,
+              win.isVisible else {
+            return event
+        }
+        let relevantFlags = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        let includeClose = globalBackSettings.includeTopCloseButtons
+
+        if globalBackSettings.shortcutEnabled,
+           globalBackSettings.shortcutKind != "none",
+           matchesShortcutEvent(
+               event,
+               kind: globalBackSettings.shortcutKind,
+               keyCode: globalBackSettings.shortcutKeyCode,
+               buttonNumber: globalBackSettings.shortcutButtonNumber,
+               targetFlags: globalBackSettings.normalizedModifierFlags,
+               win: win
+           ),
+           let query = globalBackQueryState {
+            let state = query(includeClose)
+            let hasBack = (state & 1) != 0
+            let isTextInput = (state & 4) != 0
+            if globalBackSettings.shortcutKind == "keyboard",
+               isTextInput && relevantFlags.isEmpty && event.keyCode != 53 {
+                return event
+            }
+            if hasBack {
+                let handled = globalBackPerformBack?(includeClose) ?? false
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshGlobalBackUI()
+                }
+                if handled {
+                    return nil
+                }
+            }
+        }
+
+        if globalBackSettings.homeShortcutEnabled,
+           globalBackSettings.homeShortcutKind != "none",
+           matchesShortcutEvent(
+               event,
+               kind: globalBackSettings.homeShortcutKind,
+               keyCode: globalBackSettings.homeShortcutKeyCode,
+               buttonNumber: globalBackSettings.homeShortcutButtonNumber,
+               targetFlags: globalBackSettings.homeNormalizedModifierFlags,
+               win: win
+           ),
+           let queryHome = globalHomeQueryState {
+            let state = globalBackQueryState?(false) ?? 0
+            let isTextInput = (state & 4) != 0
+            if globalBackSettings.homeShortcutKind == "keyboard",
+               isTextInput && relevantFlags.isEmpty && event.keyCode != 53 {
+                return event
+            }
+            if queryHome() {
+                let handled = globalHomePerformHome?() ?? false
+                DispatchQueue.main.async { [weak self] in
+                    self?.refreshGlobalBackUI()
+                }
+                if handled {
+                    return nil
+                }
+            }
+        }
+
+        return event
     }
 }

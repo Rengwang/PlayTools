@@ -14,6 +14,7 @@ public class PlayCover: NSObject {
     @objc static public func launch() {
         quitWhenClose()
         AKInterface.initialize()
+        initializeGlobalBackIntegration()
         UserPluginLoader.initialize()
         PlayScreen.shared.initialize()
         PlayInput.shared.initialize()
@@ -107,6 +108,52 @@ public class PlayCover: NSObject {
     static func delay(_ delay: Double, closure: @escaping () -> Void) {
         let when = DispatchTime.now() + delay
         DispatchQueue.main.asyncAfter(deadline: when, execute: closure)
+    }
+
+    static func activeUIWindow() -> UIWindow? {
+        for scene in UIApplication.shared.connectedScenes {
+            guard let windowScene = scene as? UIWindowScene else { continue }
+            if let keyWindow = windowScene.windows.first(where: { $0.isKeyWindow && !$0.isHidden }) {
+                return keyWindow
+            }
+            if let visibleWindow = windowScene.windows.first(where: { !$0.isHidden && $0.alpha > 0.01 }) {
+                return visibleWindow
+            }
+        }
+        return nil
+    }
+
+    static func initializeGlobalBackIntegration() {
+        PTDuoSetGlobalBackRefreshHandler {
+            DispatchQueue.main.async {
+                AKInterface.shared?.refreshGlobalBackUI?()
+            }
+        }
+        AKInterface.shared?.setupGlobalBackIntegration?(
+            queryState: { includeTopClose in
+                let win = PlayCover.activeUIWindow()
+                var hasSidebarBack: ObjCBool = false
+                let hasBack = PTDuoQueryGlobalBackStateForWindow(win, includeTopClose, &hasSidebarBack)
+                let isTextInput = PTDuoWindowHasActiveTextInput(win)
+                var bitmask = 0
+                if hasBack { bitmask |= 1 }
+                if hasSidebarBack.boolValue { bitmask |= 2 }
+                if isTextInput { bitmask |= 4 }
+                return bitmask
+            },
+            performBack: { includeTopClose in
+                let win = PlayCover.activeUIWindow()
+                return PTDuoPerformGlobalBackActionForWindow(win, includeTopClose)
+            }
+        )
+        AKInterface.shared?.setupGlobalHomeIntegration?(
+            queryHome: {
+                PTDuoQueryGlobalHomeStateForWindow(PlayCover.activeUIWindow())
+            },
+            performHome: {
+                PTDuoPerformGlobalHomeActionForWindow(PlayCover.activeUIWindow())
+            }
+        )
     }
 }
 
