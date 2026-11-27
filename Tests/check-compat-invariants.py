@@ -142,6 +142,47 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     else:
         passed.append("DuoVerticalBar:sourceFileExists")
 
+    # --- Risk-SDK neutralisation contract ---------------------------------
+    # Guardrails so the diagnostic/anti-risk code cannot regress into global
+    # overhead, unbounded scanning, or bundle-specific special cases.
+    risk_contract = [
+        ("RiskProbe:defaultSilent",
+         "if (!pt_riskProbeVerbose()) {",
+         loader),
+        ("RiskProbe:optInLog",
+         "if (!pt_riskProbeVerbose()) return;",
+         loader),
+        ("RiskNeutralize:importPrefilter",
+         "pt_countSensitiveImports",
+         loader),
+        ("RiskNeutralize:familyGate",
+         "pt_countInlineExitStubs",
+         loader),
+        ("RiskNeutralize:callgraphMatcher",
+         "pt_findPredicateByCallgraph",
+         loader),
+        ("RiskNeutralize:prologueFallback",
+         "pt_findPredicateByPrologue",
+         loader),
+        ("RiskNeutralize:skipSelfImage",
+         "/PlayTools.framework/",
+         loader),
+        ("RiskNeutralize:boundedTextEnd",
+         "seg->filesize < seg->vmsize ? seg->filesize : seg->vmsize",
+         loader),
+        ("RiskNeutralize:offSwitch",
+         'environment][@"PT_RISK_NEUTRALIZE"]',
+         loader),
+        ("RiskBanner:offSwitch",
+         'environment][@"PT_RISK_BANNER"]',
+         loader),
+    ]
+    for name, token, content in risk_contract:
+        if token in content:
+            passed.append(name)
+        else:
+            failures.append(f"{name}: missing token '{token}'")
+
     # Ensure App Group path resolves under Library/PlayCoverGroupContainers (space-free), not Library/Application Support
     if 'URLByAppendingPathComponent:@"PlayCoverGroupContainers"' in loader and "NSLibraryDirectory" in loader:
         passed.append("PlayLoader:libraryGroupContainersRoot")

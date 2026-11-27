@@ -1595,21 +1595,267 @@ static BOOL pt_isSystemImagePath(const char *path) {
     if (strncmp(path, "/usr/lib/", 9) == 0) return YES;
     if (strncmp(path, "/Library/Apple/", 15) == 0) return YES;
     if (strstr(path, "/System/iOSSupport/") != NULL) return YES;
+    if (strstr(path, "/PlayTools.framework/") != NULL) return YES; // never scan ourselves
     return NO;
 }
 
-static int pt_neutralizeRiskPredicate(void) {
-    // Prologue of the predicate: stp x26,x25 / stp x24,x23 / stp x22,x21 /
-    // stp x20,x19 / mov x12,#0 / mov x21,#0 — six consecutive instructions.
-    static const uint8_t kSignature[24] = {
-        0xfa, 0x67, 0xbc, 0xa9,
-        0xf8, 0x5f, 0x01, 0xa9,
-        0xf6, 0x57, 0x02, 0xa9,
-        0xf4, 0x4f, 0x03, 0xa9,
-        0x0c, 0x00, 0x80, 0xd2,
-        0x15, 0x00, 0x80, 0xd2,
-    };
+// libsystem imports a "pointer provenance" check has to look at. Counted per image
+// as a micro-second prefilter: no candidate ever has its executable pages touched
+// unless it imports this family of APIs.
+static const char *const pt_sensitiveSymbols[] = {
+    "_sysctl", "_sysctlbyname", "_uname", "_dlsym", "_dladdr", "_task_info",
+    "_open", "_stat", "_lstat", "_fopen", "_mincore", "_chdir", "_getenv",
+    "_clock_gettime", "_pathconf", "_mkdir", "_syscall", "_ptrace",
+    "__dyld_get_image_header", "__dyld_get_image_name",
+};
+#define PT_SENSITIVE_SYMBOL_COUNT (sizeof(pt_sensitiveSymbols) / sizeof(pt_sensitiveSymbols[0]))
+#define PT_MAX_TEXT_SEGMENTS 8
+#define PT_MAX_GOT_SECTIONS 8
 
+typedef struct {
+    uintptr_t textStart[PT_MAX_TEXT_SEGMENTS];
+    uintptr_t textEnd[PT_MAX_TEXT_SEGMENTS];
+    size_t textCount;
+    uintptr_t gotStart[PT_MAX_GOT_SECTIONS];
+    uintptr_t gotEnd[PT_MAX_GOT_SECTIONS];
+    size_t gotCount;
+    uintptr_t linkEditAddr;
+    uintptr_t linkEditFileOff;
+    BOOL hasLinkEdit;
+    BOOL hasSymbolTable;
+} pt_image_layout_t;
+
+static BOOL pt_parse_image_layout(const struct mach_header_64 *hdr, intptr_t slide,
+                                  pt_image_layout_t *out) {
+    memset(out, 0, sizeof(*out));
+    const uint8_t *cursor = (const uint8_t *)(hdr + 1);
+    for (uint32_t c = 0; c < hdr->ncmds; c++) {
+        const struct load_command *lc = (const struct load_command *)cursor;
+        if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
+            uintptr_t segAddr = (uintptr_t)seg->vmaddr + (uintptr_t)slide;
+            if (strncmp(seg->segname, "__LINKEDIT", sizeof(seg->segname)) == 0) {
+                out->linkEditAddr = segAddr;
+                out->linkEditFileOff = (uintptr_t)seg->fileoff;
+                out->hasLinkEdit = YES;
+            } else if ((seg->initprot & VM_PROT_EXECUTE) && seg->filesize >= 32 &&
+                       out->textCount < PT_MAX_TEXT_SEGMENTS) {
+                // Never scan past the bytes that are actually backed by the file.
+                uint64_t mapped = seg->filesize < seg->vmsize ? seg->filesize : seg->vmsize;
+                out->textStart[out->textCount] = segAddr;
+                out->textEnd[out->textCount] = segAddr + (uintptr_t)mapped;
+                out->textCount++;
+            }
+            const struct section_64 *sect = (const struct section_64 *)(seg + 1);
+            for (uint32_t si = 0; si < seg->nsects && out->gotCount < PT_MAX_GOT_SECTIONS; si++) {
+                if (strncmp(sect[si].sectname, "__got", sizeof(sect[si].sectname)) != 0) continue;
+                out->gotStart[out->gotCount] = (uintptr_t)sect[si].addr + (uintptr_t)slide;
+                out->gotEnd[out->gotCount] = out->gotStart[out->gotCount] + (uintptr_t)sect[si].size;
+                out->gotCount++;
+            }
+        } else if (lc->cmd == LC_SYMTAB && out->hasLinkEdit) {
+            const struct symtab_command *sym = (const struct symtab_command *)lc;
+            if (sym->nsyms > 0 && sym->stroff >= out->linkEditFileOff) {
+                out->hasSymbolTable = YES;
+            }
+        }
+        cursor += lc->cmdsize;
+    }
+    return out->textCount > 0;
+}
+
+// How many of the sensitive libsystem imports this image pulls in. Import tables
+// are read from LC_SYMTAB's undefined entries; images that carry no symbol table
+// report -1 so the caller can fall back to the structural matcher.
+static int pt_countSensitiveImports(const struct mach_header_64 *hdr, const pt_image_layout_t *layout) {
+    if (!layout->hasSymbolTable) return -1;
+    const struct load_command *lc = (const struct load_command *)(hdr + 1);
+    for (uint32_t c = 0; c < hdr->ncmds; c++) {
+        if (lc->cmd == LC_SYMTAB) {
+            const struct symtab_command *sym = (const struct symtab_command *)lc;
+            const struct nlist_64 *syms = (const struct nlist_64 *)
+                (layout->linkEditAddr + (sym->symoff - layout->linkEditFileOff));
+            const char *strtab = (const char *)
+                (layout->linkEditAddr + (sym->stroff - layout->linkEditFileOff));
+            uint64_t seen = 0;
+            int found = 0;
+            for (uint32_t n = 0; n < sym->nsyms; n++) {
+                const struct nlist_64 *entry = &syms[n];
+                if ((entry->n_type & N_TYPE) != N_UNDF) continue;
+                if (entry->n_un.n_strx == 0) continue;
+                const char *symbol = strtab + entry->n_un.n_strx;
+                for (size_t k = 0; k < PT_SENSITIVE_SYMBOL_COUNT; k++) {
+                    if (seen & (1ULL << k)) continue;
+                    if (strcmp(symbol, pt_sensitiveSymbols[k]) != 0) continue;
+                    seen |= (1ULL << k);
+                    found++;
+                }
+            }
+            return found;
+        }
+        lc = (const struct load_command *)((const uint8_t *)lc + lc->cmdsize);
+    }
+    return -1;
+}
+
+static uintptr_t pt_adrpTarget(uint32_t insn, uintptr_t pc) {
+    int64_t immhi = (insn >> 5) & 0x7FFFF;
+    int64_t immlo = (insn >> 29) & 0x3;
+    int64_t imm = (immhi << 2) | immlo;
+    if (imm & (1LL << 20)) imm -= (1LL << 21);
+    return (pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12);
+}
+
+static BOOL pt_gotSlotIndex(const pt_image_layout_t *layout, uintptr_t addr, size_t *outIndex) {
+    for (size_t g = 0; g < layout->gotCount; g++) {
+        if (addr < layout->gotStart[g] || addr >= layout->gotEnd[g]) continue;
+        size_t slot = (size_t)((addr - layout->gotStart[g]) / 8);
+        if (slot >= 64) return NO;                 // mask has 64 bits per section
+        *outIndex = g * 64 + slot;
+        return YES;
+    }
+    return NO;
+}
+
+// Locate the predicate from its *call shape* rather than its bytes:
+//   load a sensitive GOT slot (ADRP + LDR/ADD) -> BL to a shared callee.
+// The callee reached from >= 8 distinct slots is the GOT-provenance predicate.
+// This survives recompiles, register reallocation and OLLVM reseeding.
+// Risk SDKs that carry their own tamper response drop raw syscall exit stubs
+// inline (mov x0,#0 ; mov w16,#1 ; svc #0x80). Normal SDKs — crash reporters,
+// ad SDKs, UI/audio libraries — never do. This is the decisive family gate that
+// keeps the call-graph matcher from ever touching them.
+static size_t pt_countInlineExitStubs(const pt_image_layout_t *layout) {
+    static const uint32_t kStub[3] = { 0xd2800000u, 0x52800030u, 0xd4001001u };
+    size_t count = 0;
+    for (size_t sIdx = 0; sIdx < layout->textCount; sIdx++) {
+        for (uintptr_t pc = layout->textStart[sIdx]; pc + 12 <= layout->textEnd[sIdx]; pc += 4) {
+            const uint32_t *w = (const uint32_t *)pc;
+            if (w[0] != kStub[0] || w[1] != kStub[1]) continue;
+            // Third word is either the raw svc or the NOP left behind by
+            // pt_patchFirebaseInlineExits(), so ordering does not matter.
+            if (w[2] == kStub[2] || w[2] == 0xd503201fu) count++;
+        }
+    }
+    return count;
+}
+
+#define PT_CALLGRAPH_MAX_TARGETS 32
+typedef struct {
+    uintptr_t target;
+    uint64_t slotMask[4];   // 256 bits: 4 sections x 64 slots
+} pt_callgraph_hit_t;
+
+static uintptr_t pt_findPredicateByCallgraph(const pt_image_layout_t *layout, size_t *outDistinct) {
+    if (layout->gotCount == 0) return 0;
+    pt_callgraph_hit_t hits[PT_CALLGRAPH_MAX_TARGETS];
+    size_t hitCount = 0;
+    memset(hits, 0, sizeof(hits));
+
+    for (size_t sIdx = 0; sIdx < layout->textCount; sIdx++) {
+        for (uintptr_t pc = layout->textStart[sIdx]; pc + 64 <= layout->textEnd[sIdx]; pc += 4) {
+            uint32_t insn = *(const uint32_t *)pc;
+            if ((insn & 0x9F000000u) != 0x90000000u) continue;   // ADRP
+            uint32_t rd = insn & 0x1Fu;
+            uintptr_t page = pt_adrpTarget(insn, pc);
+
+            uintptr_t slotAddr = 0;
+            size_t skip = 0;
+            for (size_t k = 1; k <= 4; k++) {
+                const uint32_t *w = (const uint32_t *)(pc + 4 * k);
+                if ((w[0] & 0xFFC00000u) == 0xF9400000u && ((w[0] >> 5) & 0x1Fu) == rd) {
+                    slotAddr = page + (uintptr_t)(((w[0] >> 10) & 0xFFFu) * 8);  // LDR (unsigned)
+                    skip = k;
+                    break;
+                }
+                if ((w[0] & 0xFF800000u) == 0x91000000u && ((w[0] >> 5) & 0x1Fu) == rd) {
+                    slotAddr = page + (uintptr_t)((w[0] >> 10) & 0xFFFu);        // ADD (imm12)
+                    skip = k;
+                    break;
+                }
+            }
+            if (skip == 0) continue;
+            size_t slotIndex = 0;
+            if (!pt_gotSlotIndex(layout, slotAddr, &slotIndex)) continue;
+            if (slotIndex >= 256) continue;
+
+            for (size_t m = skip + 1; m <= skip + 16; m++) {
+                uintptr_t callPc = pc + 4 * m;
+                if (callPc + 4 > layout->textEnd[sIdx]) break;
+                uint32_t call = *(const uint32_t *)callPc;
+                if ((call & 0xFC000000u) != 0x94000000u) continue;           // BL
+                int32_t imm26 = (int32_t)(call & 0x03FFFFFFu);
+                if (imm26 & 0x02000000) imm26 -= 0x04000000;
+                uintptr_t target = (uintptr_t)((intptr_t)callPc + (int64_t)imm26 * 4);
+
+                size_t hit = 0;
+                for (; hit < hitCount; hit++) {
+                    if (hits[hit].target == target) break;
+                }
+                if (hit == hitCount) {
+                    if (hitCount == PT_CALLGRAPH_MAX_TARGETS) break;
+                    hits[hitCount].target = target;
+                    memset(hits[hitCount].slotMask, 0, sizeof(hits[hitCount].slotMask));
+                    hitCount++;
+                }
+                hits[hit].slotMask[slotIndex / 64] |= (1ULL << (slotIndex % 64));
+                break;
+            }
+        }
+    }
+
+    uintptr_t best = 0;
+    size_t bestDistinct = 0;
+    for (size_t i = 0; i < hitCount; i++) {
+        size_t distinct = 0;
+        for (size_t w = 0; w < 4; w++) {
+            distinct += (size_t)__builtin_popcountll(hits[i].slotMask[w]);
+        }
+        if (distinct > bestDistinct) {
+            bestDistinct = distinct;
+            best = hits[i].target;
+        }
+    }
+    if (outDistinct != NULL) *outDistinct = bestDistinct;
+    return (bestDistinct >= 8) ? best : 0;
+}
+
+static size_t pt_countBlCallsTo(const pt_image_layout_t *layout, uintptr_t target) {
+    size_t calls = 0;
+    for (size_t sIdx = 0; sIdx < layout->textCount; sIdx++) {
+        for (uintptr_t pc = layout->textStart[sIdx]; pc + 4 <= layout->textEnd[sIdx]; pc += 4) {
+            uint32_t insn = *(const uint32_t *)pc;
+            if ((insn & 0xFC000000u) != 0x94000000u) continue;
+            int32_t imm26 = (int32_t)(insn & 0x03FFFFFFu);
+            if (imm26 & 0x02000000) imm26 -= 0x04000000;
+            if ((uintptr_t)((intptr_t)pc + (int64_t)imm26 * 4) == target) calls++;
+        }
+    }
+    return calls;
+}
+
+// Structural fallback for images that ship no symbol table: the original
+// six-instruction prologue plus BL density. Kept only as a safety net.
+static uintptr_t pt_findPredicateByPrologue(const pt_image_layout_t *layout, size_t *outCalls) {
+    static const uint8_t kSignature[24] = {
+        0xfa, 0x67, 0xbc, 0xa9, 0xf8, 0x5f, 0x01, 0xa9,
+        0xf6, 0x57, 0x02, 0xa9, 0xf4, 0x4f, 0x03, 0xa9,
+        0x0c, 0x00, 0x80, 0xd2, 0x15, 0x00, 0x80, 0xd2,
+    };
+    for (size_t sIdx = 0; sIdx < layout->textCount; sIdx++) {
+        for (uintptr_t addr = layout->textStart[sIdx];
+             addr + sizeof(kSignature) <= layout->textEnd[sIdx]; addr += 4) {
+            if (memcmp((const void *)addr, kSignature, sizeof(kSignature)) != 0) continue;
+            size_t calls = pt_countBlCallsTo(layout, addr);
+            if (calls < 8) continue;
+            if (outCalls != NULL) *outCalls = calls;
+            return addr;
+        }
+    }
+    return 0;
+}
+
+static int pt_neutralizeRiskPredicate(void) {
     uint32_t imageCount = _dyld_image_count();
     int patched = 0;
     for (uint32_t i = 1; i < imageCount; i++) {
@@ -1621,57 +1867,44 @@ static int pt_neutralizeRiskPredicate(void) {
         const struct mach_header_64 *hdr = (const struct mach_header_64 *)rawHeader;
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
 
-        uintptr_t segStart[8] = { 0 };
-        uintptr_t segEnd[8] = { 0 };
-        size_t segCount = 0;
-        const uint8_t *cursor = (const uint8_t *)(hdr + 1);
-        for (uint32_t c = 0; c < hdr->ncmds && segCount < 8; c++) {
-            const struct load_command *lc = (const struct load_command *)cursor;
-            if (lc->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                if ((seg->initprot & VM_PROT_EXECUTE) && seg->filesize >= 32) {
-                    segStart[segCount] = (uintptr_t)seg->vmaddr + (uintptr_t)slide;
-                    segEnd[segCount] = segStart[segCount] + (uintptr_t)seg->vmsize;
-                    segCount++;
-                }
-            }
-            cursor += lc->cmdsize;
+        pt_image_layout_t layout;
+        if (!pt_parse_image_layout(hdr, slide, &layout)) continue;
+
+        int sensitiveImports = pt_countSensitiveImports(hdr, &layout);
+        if (sensitiveImports >= 0 && sensitiveImports < 8) continue; // cheap prefilter
+
+        // Family gate: only images that ship inline syscall exit stubs are risk
+        // SDKs. Everything else (Flutter, ad SDKs, crash reporters, media stacks)
+        // is skipped before a single page is considered for patching.
+        size_t exitStubs = pt_countInlineExitStubs(&layout);
+        if (pt_riskProbeVerbose()) {
+            NSString *dbg = [NSString stringWithFormat:@"candidate image=%s imports=%d exitStubs=%zu textSegs=%zu got=%zu",
+                             name, sensitiveImports, exitStubs, layout.textCount, layout.gotCount];
+            NSLog(@"[PC] %@", dbg);
+            pt_riskProbeEmit(dbg);
         }
-        if (segCount == 0) continue;
+        if (exitStubs < 1) continue;
 
-        for (size_t sIdx = 0; sIdx < segCount; sIdx++) {
-            for (uintptr_t addr = segStart[sIdx]; addr + sizeof(kSignature) <= segEnd[sIdx]; addr += 4) {
-                if (memcmp((const void *)addr, kSignature, sizeof(kSignature)) != 0) continue;
+        size_t evidence = 0;
+        const char *matcher = "callgraph";
+        uintptr_t predicate = pt_findPredicateByCallgraph(&layout, &evidence);
+        if (predicate == 0) {
+            matcher = "prologue";
+            predicate = pt_findPredicateByPrologue(&layout, &evidence);
+            if (predicate == 0) continue;
+        }
+        if (evidence < 8) continue;
 
-                // Confirm the call-graph density: the predicate must be reached by many
-                // "bl" sites, which is the shape of a per-GOT-slot provenance check.
-                size_t callSites = 0;
-                for (size_t cIdx = 0; cIdx < segCount; cIdx++) {
-                    for (uintptr_t p = segStart[cIdx]; p + 4 <= segEnd[cIdx]; p += 4) {
-                        uint32_t insn = *(const uint32_t *)p;
-                        if ((insn & 0xFC000000u) != 0x94000000u) continue;
-                        // BL imm26 is a signed word offset (sign bit 25) — extend properly,
-                        // otherwise every backward call site is mis-decoded.
-                        int32_t imm26 = (int32_t)(insn & 0x03FFFFFFu);
-                        if ((imm26 & 0x02000000) != 0) imm26 -= 0x04000000;
-                        int64_t delta = (int64_t)imm26 * 4;
-                        if ((uintptr_t)((intptr_t)p + delta) == addr) callSites++;
-                    }
-                }
-                if (callSites < 8) continue;
-
-                static const uint32_t kNeutralized[2] = { 0x52800000u, 0xd65f03c0u }; // mov w0,#0 ; ret
-                if (pt_writeCodeWords(addr, kNeutralized, 2)) {
-                    patched++;
-                    if (pt_riskProbeVerbose()) {
-                        NSString *line = [NSString stringWithFormat:
-                            @"neutralize predicate image=%s off=0x%lx callSites=%zu",
-                            name, (long)(addr - (uintptr_t)rawHeader), callSites];
-                        NSLog(@"[PC] %@", line);
-                        pt_riskProbeEmit(line);
-                    }
-                }
-            }
+        static const uint32_t kNeutralized[2] = { 0x52800000u, 0xd65f03c0u }; // mov w0,#0 ; ret
+        if (!pt_writeCodeWords(predicate, kNeutralized, 2)) continue;
+        patched++;
+        if (pt_riskProbeVerbose()) {
+            NSString *line = [NSString stringWithFormat:
+                @"neutralize predicate matcher=%s imports=%d exitStubs=%zu evidence=%zu image=%s off=0x%lx",
+                matcher, sensitiveImports, exitStubs, evidence, name,
+                (long)(predicate - (uintptr_t)rawHeader)];
+            NSLog(@"[PC] %@", line);
+            pt_riskProbeEmit(line);
         }
     }
     return patched;
@@ -1757,16 +1990,6 @@ static void pt_postNotificationName(id self, SEL _cmd, NSNotificationName name, 
 // 历史上这里会把风控文案直接吞掉，从而掩盖真实检测信号。
 // 现在只观测：记录文案、触发通道、调用方（镜像+偏移），行为完全放行。
 
-static BOOL pt_riskProbeDisabled(void) {
-    static BOOL disabled = NO;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        NSString *env = [NSProcessInfo processInfo].environment[@"PT_RISK_PROBE"];
-        disabled = [env isEqualToString:@"0"];
-    });
-    return disabled;
-}
-
 static BOOL pt_riskProbeVerbose(void) {
     static BOOL verbose = NO;
     static dispatch_once_t onceToken;
@@ -1795,7 +2018,7 @@ static void pt_riskProbeEmit(NSString *line) {
 static void pt_riskProbeLog(const char *channel, id text, void *returnAddress) {
     // Opt-in only: production runs stay silent (no log file, no NSLog traffic).
     // Set PT_RISK_PROBE=1 to record channel / caller / message for diagnostics.
-    if (!pt_riskProbeVerbose() || pt_riskProbeDisabled()) return;
+    if (!pt_riskProbeVerbose()) return;
     const char *image = "?";
     long offset = 0;
     Dl_info info;
@@ -1903,7 +2126,7 @@ static void pt_probeDumpView(UIView *view, int depth, NSMutableArray<NSString *>
 }
 
 static void pt_probeDumpAllWindows(const char *tag) {
-    if (pt_riskProbeDisabled() || !pt_riskProbeVerbose()) return;
+    if (!pt_riskProbeVerbose()) return;
     NSMutableArray<NSString *> *sink = [NSMutableArray array];
     int budget = 40;
     for (UIWindow *window in [[UIApplication sharedApplication] windows]) {
@@ -1953,6 +2176,11 @@ static void pt_installRiskBannerHooks(void) {
                                     (IMP)pt_setMessageText, method_getTypeEncoding(m));
             }
         }
+    }
+    // Diagnostics only: the HUD/alert probes (and their main-queue timers) exist
+    // purely for investigation, so they must cost nothing in normal runs.
+    if (!pt_riskProbeVerbose()) {
+        return;
     }
     Class hudCls = objc_getClass("MBProgressHUD");
     Class hudMeta = hudCls ? object_getClass(hudCls) : Nil;
@@ -4655,10 +4883,12 @@ static void pt_installUniversalCompatibilityGuards(void) {
         }
     }
 
-    pt_patchFirebaseInlineExits();
+    // Neutralize predicates first: the inline-exit-stub patcher below rewrites the
+    // very bytes the family gate keys on, so the gate must look at pristine code.
     if (![[[NSProcessInfo processInfo] environment][@"PT_RISK_NEUTRALIZE"] isEqualToString:@"0"]) {
         pt_neutralizeRiskPredicate();
     }
+    pt_patchFirebaseInlineExits();
     // PT_RISK_HOOKS=0 keeps this build free of injected IMPs for diagnosis.
     if (![[[NSProcessInfo processInfo] environment][@"PT_RISK_HOOKS"] isEqualToString:@"0"]) {
         pt_installRiskBannerHooks();
