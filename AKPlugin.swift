@@ -13,6 +13,7 @@ import Foundation
 private struct AKAppSettingsData: Codable {
     var keymapping: Bool?
     var optionScrollZoom: Bool?
+    var touchAlternatives: Bool?
     var hideTitleBar: Bool?
     var floatingWindow: Bool?
     var resolution: Int?
@@ -21,6 +22,7 @@ private struct AKAppSettingsData: Codable {
     var resizableAspectRatioHeight: Int?
     var layoutIdiom: Int?
     var sdkShift: Bool?
+    var appearanceStyle: Int?
 }
 
 private struct AKAppLayoutInfo {
@@ -97,6 +99,8 @@ class AKPlugin: NSObject, Plugin {
     private let verifiedTargetWindows = NSHashTable<NSWindow>.weakObjects()
     private var isRestoringSavedFrame = false
     private static let globalBackChangedNotification = Notification.Name("io.playcover.PlayCover.GlobalBackSettingsChanged")
+    private static let touchAlternativesChangedNotification = Notification.Name("io.playcover.PlayCover.TouchAlternativesSettingsChanged")
+    private static let windowVisibilityDidChangeNotification = Notification.Name("PTWindowVisibilityDidChangeNotification")
     private var globalBackSettings = AKGlobalBackSettingsData.load()
     private var globalBackQueryState: ((Bool) -> Int)?
     private var globalBackPerformBack: ((Bool) -> Bool)?
@@ -111,9 +115,27 @@ class AKPlugin: NSObject, Plugin {
 
     required override init() {
         super.init()
+        syncTouchAlternativesFromPlaySettingsIfNeeded()
+        Self.installTouchAlternativesScrollWheelCompatibility()
         configureAllWindows()
 
         let center = NotificationCenter.default
+        DistributedNotificationCenter.default().addObserver(
+            forName: Self.touchAlternativesChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notif in
+            guard let self else { return }
+            let targetBundleID = notif.object as? String
+            if let targetBundleID,
+               let myBundleID = Bundle.main.bundleIdentifier,
+               targetBundleID != myBundleID {
+                return
+            }
+            if let enabled = (notif.userInfo?["enabled"] as? NSNumber)?.boolValue {
+                self.applyTouchAlternativesState(enabled)
+            }
+        }
         DistributedNotificationCenter.default().addObserver(
             forName: Self.globalBackChangedNotification,
             object: nil,
@@ -169,6 +191,22 @@ class AKPlugin: NSObject, Plugin {
                 self.saveWindowFrameIfAppropriate(win)
             }
         }
+
+        for name: Notification.Name in [
+            NSWindow.didChangeOcclusionStateNotification,
+            NSWindow.didMiniaturizeNotification,
+            NSWindow.didDeminiaturizeNotification,
+            NSApplication.didHideNotification,
+            NSApplication.didUnhideNotification
+        ] {
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notif in
+                guard let self else { return }
+                if let win = notif.object as? NSWindow, !self.isMainAppWindow(win) {
+                    return
+                }
+                NotificationCenter.default.post(name: Self.windowVisibilityDidChangeNotification, object: self)
+            }
+        }
     }
 
     var screenCount: Int {
@@ -203,6 +241,12 @@ class AKPlugin: NSObject, Plugin {
 
     var hasVisibleUnminiaturizedWindow: Bool {
         NSApplication.shared.windows.contains { isMainAppWindow($0) && $0.isVisible && !$0.isMiniaturized }
+    }
+
+    var hasUnoccludedVisibleWindow: Bool {
+        NSApplication.shared.windows.contains {
+            isMainAppWindow($0) && $0.isVisible && !$0.isMiniaturized && $0.occlusionState.contains(.visible)
+        }
     }
 
     var cmdPressed: Bool = false
@@ -412,11 +456,13 @@ class AKPlugin: NSObject, Plugin {
     /// Convenience instance property that exposes the cached static preference.
     private var keymappingSetting: Bool { Self.akAppSettingsData?.keymapping ?? false }
     private var optionScrollZoomSetting: Bool { Self.akAppSettingsData?.optionScrollZoom ?? true }
+    private var touchAlternativesSetting: Bool { Self.akAppSettingsData?.touchAlternatives ?? true }
     private var hideTitleBarSetting: Bool { Self.akAppSettingsData?.hideTitleBar ?? true }
     private var floatingWindowSetting: Bool { Self.akAppSettingsData?.floatingWindow ?? false }
     private var resolutionSetting: Int { Self.akAppSettingsData?.resolution ?? 7 }
     private var layoutIdiomSetting: Int { Self.akAppSettingsData?.layoutIdiom ?? 3 }
     private var sdkShiftSetting: Bool { Self.akAppSettingsData?.sdkShift ?? false }
+    private var appearanceStyleSetting: Int { Self.akAppSettingsData?.appearanceStyle ?? 0 }
     private var aspectRatioSetting: NSSize? {
         guard resolutionSetting == 6 else {
             return nil
@@ -440,6 +486,7 @@ class AKPlugin: NSObject, Plugin {
             var data = AKAppSettingsData()
             data.keymapping = (dict["keymapping"] as? NSNumber)?.boolValue
             data.optionScrollZoom = (dict["optionScrollZoom"] as? NSNumber)?.boolValue
+            data.touchAlternatives = (dict["touchAlternatives"] as? NSNumber)?.boolValue
             data.hideTitleBar = (dict["hideTitleBar"] as? NSNumber)?.boolValue
             data.floatingWindow = (dict["floatingWindow"] as? NSNumber)?.boolValue
             data.resolution = (dict["resolution"] as? NSNumber)?.intValue
@@ -448,6 +495,7 @@ class AKPlugin: NSObject, Plugin {
             data.resizableAspectRatioHeight = (dict["resizableAspectRatioHeight"] as? NSNumber)?.intValue
             data.layoutIdiom = (dict["layoutIdiom"] as? NSNumber)?.intValue
             data.sdkShift = (dict["sdkShift"] as? NSNumber)?.boolValue
+            data.appearanceStyle = (dict["appearanceStyle"] as? NSNumber)?.intValue
             return data
         }
 
@@ -691,6 +739,11 @@ private extension AKPlugin {
 
     func configureWindowIfNeeded(_ win: NSWindow) {
         guard isMainAppWindow(win) else { return }
+        if appearanceStyleSetting == 1 {
+            win.appearance = NSAppearance(named: .aqua)
+        } else if appearanceStyleSetting == 2 {
+            win.appearance = NSAppearance(named: .darkAqua)
+        }
         applyAppearanceRules(win)
         updateGlobalBackButton(for: win)
 
@@ -974,6 +1027,212 @@ private extension AKPlugin {
         let x = max(visible.minX, min(frame.origin.x, visible.maxX - frame.width))
         let y = max(visible.minY, min(frame.origin.y, visible.maxY - frame.height))
         win.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+}
+
+private extension AKPlugin {
+    static let touchAlternativesControlsModeKey = "com.apple.uikit.controlsmode"
+    static let touchAlternativesLastSyncedKey = "PlayCover.LastSyncedTouchAlternatives"
+
+    func syncTouchAlternativesFromPlaySettingsIfNeeded() {
+        let defaults = UserDefaults.standard
+        let desired = touchAlternativesSetting
+        let hasControlsMode = defaults.object(forKey: Self.touchAlternativesControlsModeKey) != nil
+        let lastSynced = defaults.object(forKey: Self.touchAlternativesLastSyncedKey) as? Bool
+        if !hasControlsMode || lastSynced == nil || lastSynced != desired {
+            applyTouchAlternativesState(desired)
+        }
+    }
+
+    func applyTouchAlternativesState(_ enabled: Bool) {
+        let defaults = UserDefaults.standard
+        defaults.set(enabled, forKey: Self.touchAlternativesControlsModeKey)
+        defaults.set(enabled, forKey: Self.touchAlternativesLastSyncedKey)
+        let sel = NSSelectorFromString("userDefaultsChanged")
+        for win in NSApp?.windows ?? [] {
+            if let inputView = Self.findUINSInputView(in: win.contentView),
+               inputView.responds(to: sel) {
+                _ = inputView.perform(sel)
+            }
+        }
+    }
+
+    static var touchAlternativesScrollFixInstalled = false
+    static var bypassTouchAlternativesScrollFix = false
+    static var scrollHookHitCount = 0
+    static var scrollHookMouseRoutedCount = 0
+    static var originalUINSInputViewScrollWheel: (@convention(c) (AnyObject, Selector, NSEvent) -> Void)?
+    static var mouseTranslatorScrollWheelIMP: (@convention(c) (AnyObject, Selector, NSEvent) -> Void)?
+    static var uinsInputViewMouseTranslatorIvar: Ivar?
+
+    /// Lets discrete mouse scroll wheel events bypass Apple's Touch Alternatives
+    /// scroll-to-drag translator by routing them directly to `_mouseEventTranslator`.
+    static func installTouchAlternativesScrollWheelCompatibility() {
+        guard !touchAlternativesScrollFixInstalled else { return }
+        touchAlternativesScrollFixInstalled = true
+
+        guard let inputViewClass = objc_getClass("UINSInputView") as? AnyClass else { return }
+        let scrollSel = #selector(NSResponder.scrollWheel(with:))
+        guard let method = class_getInstanceMethod(inputViewClass, scrollSel) else { return }
+
+        uinsInputViewMouseTranslatorIvar = class_getInstanceVariable(
+            inputViewClass,
+            "_mouseEventTranslator"
+        )
+        if let mouseTranslatorClass = objc_getClass("UINSMouseEventTranslator") as? AnyClass,
+           let mouseMethod = class_getInstanceMethod(mouseTranslatorClass, scrollSel) {
+            mouseTranslatorScrollWheelIMP = unsafeBitCast(
+                method_getImplementation(mouseMethod),
+                to: (@convention(c) (AnyObject, Selector, NSEvent) -> Void).self
+            )
+        }
+
+        let origIMP = method_getImplementation(method)
+        originalUINSInputViewScrollWheel = unsafeBitCast(
+            origIMP,
+            to: (@convention(c) (AnyObject, Selector, NSEvent) -> Void).self
+        )
+
+        let block: @convention(block) (AnyObject, NSEvent) -> Void = { target, event in
+            Self.handleUINSInputViewScrollWheel(target: target, selector: scrollSel, event: event)
+        }
+        let newIMP = imp_implementationWithBlock(block)
+        method_setImplementation(method, newIMP)
+    }
+
+    static func handleUINSInputViewScrollWheel(target: AnyObject, selector: Selector, event: NSEvent) {
+        scrollHookHitCount += 1
+        let isMouseScrollWheel = !event.hasPreciseScrollingDeltas
+            || (event.phase.isEmpty && event.momentumPhase.isEmpty)
+        if !bypassTouchAlternativesScrollFix,
+           isMouseScrollWheel,
+           let mouseTranslatorIvar = uinsInputViewMouseTranslatorIvar,
+           let mouseTranslatorObj = object_getIvar(target, mouseTranslatorIvar),
+           let mouseScrollIMP = mouseTranslatorScrollWheelIMP {
+            scrollHookMouseRoutedCount += 1
+            mouseScrollIMP(mouseTranslatorObj as AnyObject, selector, event)
+            return
+        }
+
+        originalUINSInputViewScrollWheel?(target, selector, event)
+    }
+
+    @objc func automationDispatchScrollWheel(_ params: NSDictionary) -> NSDictionary {
+        guard ProcessInfo.processInfo.environment["PLAYTOOLS_AUTOMATION"] == "1" else {
+            return ["ok": false, "error": "PLAYTOOLS_AUTOMATION=1 required"]
+        }
+        guard let win = primaryWindow else {
+            return ["ok": false, "error": "no primaryWindow"]
+        }
+        let normX = (params["normX"] as? NSNumber)?.doubleValue ?? 0.5
+        let normY = (params["normY"] as? NSNumber)?.doubleValue ?? 0.5
+        let deltaY = Int32((params["deltaY"] as? NSNumber)?.intValue ?? -5)
+        let repeatCount = max(1, min(30, (params["repeat"] as? NSNumber)?.intValue ?? 3))
+        Self.bypassTouchAlternativesScrollFix = (params["bypassFix"] as? NSNumber)?.boolValue ?? false
+        defer { Self.bypassTouchAlternativesScrollFix = false }
+
+        if let controlsMode = params["controlsMode"] as? NSNumber {
+            UserDefaults.standard.set(controlsMode.intValue, forKey: "com.apple.uikit.controlsmode")
+        }
+        if let scrollToDragDisabled = params["scrollToDragDisabled"] as? NSNumber {
+            UserDefaults.standard.set(scrollToDragDisabled.boolValue, forKey: "com.apple.uikit.scrollToDragDisabled")
+        }
+
+        let inputView = Self.findUINSInputView(in: win.contentView)
+        if let setNeedsUpdate = inputView,
+           params["controlsMode"] != nil || params["scrollToDragDisabled"] != nil {
+            let sel = NSSelectorFromString("userDefaultsChanged")
+            if setNeedsUpdate.responds(to: sel) {
+                _ = setNeedsUpdate.perform(sel)
+            }
+        }
+
+        let rect = win.contentView?.frame ?? win.contentLayoutRect
+        let winPt = NSPoint(
+            x: rect.minX + rect.width * CGFloat(normX),
+            y: rect.maxY - rect.height * CGFloat(normY)
+        )
+
+        let hitsBefore = Self.scrollHookHitCount
+        let routedBefore = Self.scrollHookMouseRoutedCount
+        var sentCount = 0
+        for _ in 0..<repeatCount {
+            guard let cgEvent = CGEvent(
+                scrollWheelEvent2Source: nil,
+                units: .line,
+                wheelCount: 1,
+                wheel1: deltaY,
+                wheel2: 0,
+                wheel3: 0
+            ),
+            let nsEvent = NSEvent(cgEvent: cgEvent) else {
+                continue
+            }
+            Self.configureSyntheticEvent(nsEvent, window: win, locationInWindow: winPt)
+            win.sendEvent(nsEvent)
+            sentCount += 1
+        }
+
+        var diagnostics: [String: Any] = [
+            "ok": sentCount > 0,
+            "sentCount": sentCount,
+            "bypassFix": Self.bypassTouchAlternativesScrollFix,
+            "hookHits": Self.scrollHookHitCount - hitsBefore,
+            "mouseRoutedHits": Self.scrollHookMouseRoutedCount - routedBefore,
+            "controlsMode": UserDefaults.standard.object(forKey: "com.apple.uikit.controlsmode") ?? NSNull(),
+            "scrollToDragDisabled": UserDefaults.standard.object(forKey: "com.apple.uikit.scrollToDragDisabled") ?? NSNull(),
+            "inputViewClass": inputView.map { NSStringFromClass(type(of: $0)) } ?? "nil",
+            "winPt": ["x": winPt.x, "y": winPt.y]
+        ]
+        if let iv = inputView {
+            diagnostics["activeFlag"] = Self.readBoolIvar(iv, name: "_gameControllerInputAlternativeActive") ?? NSNull()
+            diagnostics["mouseTranslatorClass"] = Self.readObjectIvarClass(iv, name: "_mouseEventTranslator") ?? "nil"
+            diagnostics["gameTranslatorClass"] = Self.readObjectIvarClass(iv, name: "_gameEventTranslator") ?? "nil"
+            if let gtIvar = class_getInstanceVariable(type(of: iv), "_gameEventTranslator"),
+               let gt = object_getIvar(iv, gtIvar) {
+                diagnostics["gameTranslatorEnabled"] = Self.readBoolIvar(gt as AnyObject, name: "_enabled") ?? NSNull()
+            }
+        }
+        return diagnostics as NSDictionary
+    }
+
+    static func findUINSInputView(in view: NSView?) -> NSView? {
+        guard let view else { return nil }
+        if NSStringFromClass(type(of: view)) == "UINSInputView" {
+            return view
+        }
+        for sub in view.subviews {
+            if let found = findUINSInputView(in: sub) {
+                return found
+            }
+        }
+        return nil
+    }
+
+    static func configureSyntheticEvent(_ event: NSEvent, window: NSWindow, locationInWindow: NSPoint) {
+        if let locIvar = class_getInstanceVariable(NSEvent.self, "_location") {
+            let ptr = Unmanaged.passUnretained(event).toOpaque().advanced(by: ivar_getOffset(locIvar))
+            ptr.assumingMemoryBound(to: NSPoint.self).pointee = locationInWindow
+        }
+        if let winNumIvar = class_getInstanceVariable(NSEvent.self, "_windowNumber") {
+            let ptr = Unmanaged.passUnretained(event).toOpaque().advanced(by: ivar_getOffset(winNumIvar))
+            ptr.assumingMemoryBound(to: Int.self).pointee = window.windowNumber
+        }
+        if let winIvar = class_getInstanceVariable(NSEvent.self, "_window") {
+            object_setIvar(event, winIvar, window)
+        }
+    }
+
+    static func readBoolIvar(_ obj: AnyObject, name: String) -> Bool? {
+        guard let ivar = class_getInstanceVariable(type(of: obj), name) else { return nil }
+        let ptr = Unmanaged.passUnretained(obj).toOpaque().advanced(by: ivar_getOffset(ivar))
+        return ptr.assumingMemoryBound(to: Bool.self).pointee
+    }
+
+    static func readObjectIvarClass(_ obj: AnyObject, name: String) -> String? {
+        guard let ivar = class_getInstanceVariable(type(of: obj), name) else { return nil }
+        guard let val = object_getIvar(obj, ivar) else { return nil }
+        return NSStringFromClass(type(of: val as AnyObject))
     }
 }
 

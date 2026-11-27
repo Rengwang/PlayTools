@@ -1570,6 +1570,23 @@ private extension PlayScreen {
             )
         case "setMode":
             performAutomationSetMode(params: params, in: window, stateURL: stateURL)
+        case "scrollWheel":
+            let dict = params as NSDictionary
+            let sel = NSSelectorFromString("automationDispatchScrollWheel:")
+            var diag: [String: Any] = [:]
+            if let plugin = AKInterface.shared as? NSObject, plugin.responds(to: sel),
+               let res = plugin.perform(sel, with: dict)?.takeUnretainedValue() as? [String: Any] {
+                diag = res
+            } else {
+                diag = ["ok": false, "error": "AKInterface unavailable"]
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self, weak window] in
+                guard let self, let win = window ?? self.activePrimaryWindow else { return }
+                var payload = self.buildTreeDumpPayload(window: win, maxDepth: 28, maxNodes: 1200)
+                payload["action"] = "scrollWheel"
+                payload["scrollDiag"] = diag
+                self.writeJSON(payload, to: stateURL)
+            }
         #if PLAYTOOLS_FRAMEWORK_PROBES
         case "selftestAuthorization":
             guard PlayToolsSelfTest.isRequested, PlayToolsSelfTest.isContractFixture,

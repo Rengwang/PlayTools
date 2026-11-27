@@ -127,6 +127,8 @@ let settings = PlaySettings.shared
 
     @objc lazy var optionScrollZoom = settingsData.optionScrollZoom
 
+    @objc lazy var touchAlternatives = settingsData.touchAlternatives
+
     @objc lazy var hideTitleBar = settingsData.hideTitleBar
 
     @objc lazy var floatingWindow = settingsData.floatingWindow
@@ -160,7 +162,14 @@ let settings = PlaySettings.shared
     @objc lazy var cameraFrontMirror = settingsData.cameraFrontMirror
     @objc lazy var cameraBackMirror = settingsData.cameraBackMirror
 
-    @objc lazy var spoofPowerState = settingsData.spoofPowerState
+    @objc lazy var powerSavingMode = settingsData.powerSavingMode
+    @objc lazy var memorySavingMode = settingsData.memorySavingMode
+    @objc lazy var powerStatePolicy = settingsData.powerStatePolicy
+    @objc lazy var frameRateCap = settingsData.frameRateCap
+    @objc lazy var metalMemorySaver = settingsData.metalMemorySaver
+    @objc lazy var avMediaSaver = settingsData.avMediaSaver
+    @objc lazy var appearanceStyle = settingsData.appearanceStyle
+    @objc lazy var spoofPowerState = (powerStatePolicy == 1)
     @objc lazy var blockSplashAds = settingsData.blockSplashAds
     @objc lazy var mockLocationEnabled = settingsData.mockLocationEnabled
     @objc lazy var mockLocationLatitude = settingsData.mockLocationLatitude
@@ -171,6 +180,7 @@ let settings = PlaySettings.shared
         return [
             "keymapping": settingsData.keymapping,
             "optionScrollZoom": settingsData.optionScrollZoom,
+            "touchAlternatives": settingsData.touchAlternatives,
             "hideTitleBar": settingsData.hideTitleBar,
             "floatingWindow": settingsData.floatingWindow,
             "resolution": settingsData.resolution,
@@ -179,7 +189,8 @@ let settings = PlaySettings.shared
             "resizableAspectRatioHeight": settingsData.resizableAspectRatioHeight,
             "layoutIdiom": settingsData.layoutIdiom,
             "duoVerticalBar": settingsData.duoVerticalBar,
-            "sdkShift": settingsData.sdkShift
+            "sdkShift": settingsData.sdkShift,
+            "appearanceStyle": settingsData.appearanceStyle
         ]
     }
 }
@@ -208,6 +219,7 @@ struct AppSettingsData: Codable {
     var noKMOnInput = false
     var enableScrollWheel = true
     var optionScrollZoom = true
+    var touchAlternatives = true
     var hideTitleBar = true
     var floatingWindow = false
     var checkMicPermissionSync = false
@@ -227,6 +239,13 @@ struct AppSettingsData: Codable {
     var cameraFrontMirror = -1
     var cameraBackMirror = -1
     var spoofPowerState = false
+    var powerSavingMode = false
+    var memorySavingMode = false
+    var powerStatePolicy = 0
+    var frameRateCap = 0
+    var metalMemorySaver = false
+    var avMediaSaver = false
+    var appearanceStyle = 0
     var blockSplashAds = true
     var mockLocationEnabled = false
     var mockLocationLatitude: Double = 39.9042
@@ -259,6 +278,7 @@ struct AppSettingsData: Codable {
         noKMOnInput = try container.decodeIfPresent(Bool.self, forKey: .noKMOnInput) ?? false
         enableScrollWheel = try container.decodeIfPresent(Bool.self, forKey: .enableScrollWheel) ?? true
         optionScrollZoom = try container.decodeIfPresent(Bool.self, forKey: .optionScrollZoom) ?? true
+        touchAlternatives = try container.decodeIfPresent(Bool.self, forKey: .touchAlternatives) ?? true
         hideTitleBar = try container.decodeIfPresent(Bool.self, forKey: .hideTitleBar) ?? true
         floatingWindow = try container.decodeIfPresent(Bool.self, forKey: .floatingWindow) ?? false
         checkMicPermissionSync = try container.decodeIfPresent(
@@ -285,6 +305,17 @@ struct AppSettingsData: Codable {
         cameraFrontMirror = try container.decodeIfPresent(Int.self, forKey: .cameraFrontMirror) ?? -1
         cameraBackMirror = try container.decodeIfPresent(Int.self, forKey: .cameraBackMirror) ?? -1
         spoofPowerState = try container.decodeIfPresent(Bool.self, forKey: .spoofPowerState) ?? false
+        powerSavingMode = try container.decodeIfPresent(Bool.self, forKey: .powerSavingMode) ?? false
+        memorySavingMode = try container.decodeIfPresent(Bool.self, forKey: .memorySavingMode) ?? false
+        if let decodedPowerStatePolicy = try container.decodeIfPresent(Int.self, forKey: .powerStatePolicy) {
+            powerStatePolicy = decodedPowerStatePolicy
+        } else {
+            powerStatePolicy = spoofPowerState ? 1 : 0
+        }
+        frameRateCap = try container.decodeIfPresent(Int.self, forKey: .frameRateCap) ?? 0
+        metalMemorySaver = try container.decodeIfPresent(Bool.self, forKey: .metalMemorySaver) ?? false
+        avMediaSaver = try container.decodeIfPresent(Bool.self, forKey: .avMediaSaver) ?? false
+        appearanceStyle = try container.decodeIfPresent(Int.self, forKey: .appearanceStyle) ?? 0
         blockSplashAds = try container.decodeIfPresent(Bool.self, forKey: .blockSplashAds) ?? true
         mockLocationEnabled = try container.decodeIfPresent(Bool.self, forKey: .mockLocationEnabled) ?? false
         mockLocationLatitude = try container.decodeIfPresent(Double.self, forKey: .mockLocationLatitude) ?? 39.9042

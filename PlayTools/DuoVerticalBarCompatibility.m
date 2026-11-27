@@ -21,6 +21,84 @@ BOOL PTShouldEnableDuoVerticalBar(void) {
 
 #if TARGET_OS_MACCATALYST
 
+static BOOL pt_duoIsPowerSavingModeEnabled(void) {
+    const char *disable = getenv("PLAYTOOLS_DISABLE_POWER_SAVING");
+    if (disable && disable[0] == '1' && disable[1] == '\0') {
+        return NO;
+    }
+    return [[PlaySettings shared] powerSavingMode];
+}
+
+static UIColor *pt_duoOpaquePillBackgroundColor(BOOL isDark) {
+    return isDark
+        ? [UIColor colorWithRed:0.16 green:0.16 blue:0.18 alpha:1.0]
+        : [UIColor colorWithRed:0.94 green:0.94 blue:0.96 alpha:1.0];
+}
+
+static BOOL pt_duoResolvedColorRGBA(UIColor *color,
+                                    UITraitCollection *traits,
+                                    CGFloat *outR,
+                                    CGFloat *outG,
+                                    CGFloat *outB,
+                                    CGFloat *outA,
+                                    CGFloat *outLuma) {
+    if (!color) {
+        return NO;
+    }
+    UIColor *resolved = color;
+    if (traits && [resolved respondsToSelector:@selector(resolvedColorWithTraitCollection:)]) {
+        resolved = [resolved resolvedColorWithTraitCollection:traits];
+    }
+    CGFloat r = 0.0, g = 0.0, b = 0.0, a = 0.0;
+    if (![resolved getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat white = 0.0;
+        if (![resolved getWhite:&white alpha:&a]) {
+            return NO;
+        }
+        r = white;
+        g = white;
+        b = white;
+    }
+    CGFloat luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (outR) { *outR = r; }
+    if (outG) { *outG = g; }
+    if (outB) { *outB = b; }
+    if (outA) { *outA = a; }
+    if (outLuma) { *outLuma = luma; }
+    return YES;
+}
+
+static BOOL pt_duoColorIsBrightLight(UIColor *color, UITraitCollection *traits) {
+    CGFloat a = 0.0, luma = 0.0;
+    if (!pt_duoResolvedColorRGBA(color, traits, NULL, NULL, NULL, &a, &luma)) {
+        return NO;
+    }
+    return (a > 0.5 && luma > 0.72);
+}
+
+static UIColor *pt_duoContrastSafeTintForPowerSaving(UIColor *candidateTint,
+                                                     UIColor *neutralFG,
+                                                     BOOL contextDark,
+                                                     UITraitCollection *traits) {
+    if (!candidateTint) {
+        return neutralFG;
+    }
+    CGFloat a = 0.0, luma = 0.0;
+    if (!pt_duoResolvedColorRGBA(candidateTint, traits, NULL, NULL, NULL, &a, &luma)) {
+        return neutralFG;
+    }
+    if (a < 0.25) {
+        return neutralFG;
+    }
+    if (!contextDark && luma > 0.68) {
+        return neutralFG;
+    }
+    if (contextDark && luma < 0.32) {
+        return neutralFG;
+    }
+    return candidateTint;
+}
+
 static const CGFloat kPTDuoVerticalBarWidth = 60.0;
 static const CGFloat kPTDuoVerticalBarMinWindowWidth = 600.0;
 static const CGFloat kPTDuoVerticalBarMinWindowHeight = 320.0;
@@ -1184,6 +1262,7 @@ static PTDuoWindowInsetState *pt_insetStateForWindow(UIWindow *window, BOOL crea
 
 static BOOL pt_duoVerticalBarInstalled = NO;
 static __thread NSInteger pt_duoRefreshDepth = 0;
+static __thread NSInteger pt_duoInternalSafeAreaNotifyDepth = 0;
 static __thread NSInteger pt_duoInternalTabBarHiddenDepth = 0;
 static __thread NSInteger pt_duoInternalNavBarVisualDepth = 0;
 static __thread NSInteger pt_duoInternalToolbarVisualDepth = 0;
@@ -1233,14 +1312,11 @@ static void pt_attachBarRegionMeta(id region,
 
 // MARK: - Window & ViewController State Resolution
 
-static BOOL pt_isEligiblePrimaryWindow(UIWindow *window) {
-    if (!window || window.hidden || window.alpha <= 0.01) {
+static BOOL pt_isWindowStructuralPrimaryCandidate(UIWindow *window) {
+    if (!window) {
         return NO;
     }
     if (window.windowLevel != UIWindowLevelNormal) {
-        return NO;
-    }
-    if (!window.rootViewController) {
         return NO;
     }
     NSString *clsName = NSStringFromClass([window class]);
@@ -1249,6 +1325,19 @@ static BOOL pt_isEligiblePrimaryWindow(UIWindow *window) {
         || [clsName containsString:@"TextEffects"]
         || [clsName containsString:@"StatusBar"]
         || [clsName containsString:@"Alert"]) {
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL pt_isEligiblePrimaryWindow(UIWindow *window) {
+    if (!pt_isWindowStructuralPrimaryCandidate(window)) {
+        return NO;
+    }
+    if (window.hidden || window.alpha <= 0.01) {
+        return NO;
+    }
+    if (!window.rootViewController) {
         return NO;
     }
     return YES;
@@ -2371,8 +2460,17 @@ static BOOL pt_imageIsOpaqueFilledBadge(UIImage *image) {
     return opaqueFilled;
 }
 
-static BOOL pt_imageNeedsTemplateTintOnGlass(UIImage *image, BOOL isDarkMode) {
-    if (!image || image.renderingMode != UIImageRenderingModeAlwaysOriginal) {
+static BOOL pt_duoAnalyzeMonochromeImageLuma(UIImage *image,
+                                             BOOL requireAlwaysOriginal,
+                                             CGFloat maxOpaqueRatio,
+                                             CGFloat *outOpaqueRatio,
+                                             CGFloat *outAvgLuma) {
+    if (outOpaqueRatio) { *outOpaqueRatio = 0.0; }
+    if (outAvgLuma) { *outAvgLuma = 0.0; }
+    if (!image) {
+        return NO;
+    }
+    if (requireAlwaysOriginal && image.renderingMode != UIImageRenderingModeAlwaysOriginal) {
         return NO;
     }
     CGImageRef cg = image.CGImage;
@@ -2421,11 +2519,60 @@ static BOOL pt_imageNeedsTemplateTintOnGlass(UIImage *image, BOOL isDarkMode) {
         visibleCount++;
     }
     CGFloat opaqueRatio = (CGFloat)visibleCount / 256.0;
-    if (visibleCount == 0 || opaqueRatio >= 0.55 || chromaticCount > MAX(1, visibleCount / 8)) {
+    if (visibleCount == 0 || opaqueRatio >= maxOpaqueRatio || chromaticCount > MAX(1, visibleCount / 8)) {
         return NO;
     }
-    CGFloat avgLuma = lumaSum / (CGFloat)visibleCount;
+    if (outOpaqueRatio) { *outOpaqueRatio = opaqueRatio; }
+    if (outAvgLuma) { *outAvgLuma = lumaSum / (CGFloat)visibleCount; }
+    return YES;
+}
+
+static BOOL pt_imageNeedsTemplateTintOnGlass(UIImage *image, BOOL isDarkMode) {
+    CGFloat avgLuma = 0.0;
+    if (!pt_duoAnalyzeMonochromeImageLuma(image, YES, 0.55, NULL, &avgLuma)) {
+        return NO;
+    }
     return isDarkMode ? (avgLuma < 0.22) : (avgLuma > 0.78);
+}
+
+static BOOL pt_duoImageNeedsTemplateOnOpaquePill(UIImage *image, BOOL contextDark) {
+    if (!image || pt_imageIsOpaqueFilledBadge(image)) {
+        return NO;
+    }
+    CGFloat avgLuma = 0.0;
+    if (!pt_duoAnalyzeMonochromeImageLuma(image, YES, 0.68, NULL, &avgLuma)) {
+        return NO;
+    }
+    return contextDark ? (avgLuma < 0.32) : (avgLuma > 0.68);
+}
+
+static BOOL pt_duoImageHasBrightForegroundOnTransparent(UIImage *image) {
+    if (!image || pt_imageIsOpaqueFilledBadge(image)) {
+        return NO;
+    }
+    CGFloat avgLuma = 0.0;
+    if (!pt_duoAnalyzeMonochromeImageLuma(image, NO, 0.70, NULL, &avgLuma)) {
+        return NO;
+    }
+    return (avgLuma > 0.72);
+}
+
+static void pt_duoResolvePowerSavingVisualContrast(UIImage * __strong *ioImage,
+                                                   UIColor * __strong *ioTint,
+                                                   UIColor *neutralFG,
+                                                   BOOL contextDark,
+                                                   UITraitCollection *traits) {
+    UIImage *img = ioImage ? *ioImage : nil;
+    UIColor *tint = ioTint ? *ioTint : nil;
+    if (img && (pt_imageNeedsTemplateTintOnGlass(img, contextDark) || pt_duoImageNeedsTemplateOnOpaquePill(img, contextDark))) {
+        if (ioImage) {
+            *ioImage = [img imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+        }
+        tint = neutralFG;
+    }
+    if (ioTint) {
+        *ioTint = pt_duoContrastSafeTintForPowerSaving(tint, neutralFG, contextDark, traits);
+    }
 }
 
 static BOOL pt_computeImagePixelStats(UIImage *image,
@@ -2499,6 +2646,7 @@ static UIImage *pt_snapshotViewForVerticalBarWithStats(UIView *view,
         view.alpha = appAlpha ? appAlpha.doubleValue : 1.0;
     }
     UIImage *snapshot = nil;
+    BOOL hasValidStats = NO;
     @try {
         UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
         fmt.opaque = NO;
@@ -2507,7 +2655,8 @@ static UIImage *pt_snapshotViewForVerticalBarWithStats(UIView *view,
         snapshot = [renderer imageWithActions:^(UIGraphicsImageRendererContext *rendererContext) {
             [view.layer renderInContext:rendererContext.CGContext];
         }];
-        if ((!snapshot || !pt_computeImagePixelStats(snapshot, outOpaqueRatio, outMinLuma, outMaxLuma))
+        hasValidStats = (snapshot != nil && pt_computeImagePixelStats(snapshot, outOpaqueRatio, outMinLuma, outMaxLuma));
+        if (!hasValidStats
             && view.window != nil && !view.hidden && view.alpha > 0.01) {
             UIImage *hierarchySnap = [renderer imageWithActions:^(UIGraphicsImageRendererContext *rendererContext) {
                 (void)rendererContext;
@@ -2515,6 +2664,7 @@ static UIImage *pt_snapshotViewForVerticalBarWithStats(UIView *view,
             }];
             if (hierarchySnap) {
                 snapshot = hierarchySnap;
+                hasValidStats = pt_computeImagePixelStats(snapshot, outOpaqueRatio, outMinLuma, outMaxLuma);
             }
         }
     } @finally {
@@ -2523,7 +2673,7 @@ static UIImage *pt_snapshotViewForVerticalBarWithStats(UIView *view,
             view.alpha = prevAlpha;
         }
     }
-    if (!snapshot || !pt_computeImagePixelStats(snapshot, outOpaqueRatio, outMinLuma, outMaxLuma)) {
+    if (!snapshot || !hasValidStats) {
         return nil;
     }
     return [snapshot imageWithRenderingMode:UIImageRenderingModeAlwaysOriginal];
@@ -4962,7 +5112,10 @@ static PTDuoBarItemPlan *pt_buildVerticalBarItemPlanForNavs(UINavigationControll
 
 @interface PTDuoBarPillContainerView : UIView
 @property (nonatomic, strong) UIVisualEffectView *blurView;
+@property (nonatomic, strong) UIView *solidBackgroundView;
 @property (nonatomic, strong) UIStackView *stackView;
+@property (nonatomic, assign) BOOL powerSavingMode;
+@property (nonatomic, strong) NSNumber *forcedDarkSurface;
 - (instancetype)initWithCornerRadius:(CGFloat)radius;
 - (void)applyGlassBorderForTraitCollection:(UITraitCollection *)traits;
 @end
@@ -4974,20 +5127,43 @@ static PTDuoBarItemPlan *pt_buildVerticalBarItemPlanForNavs(UINavigationControll
     if (self) {
         self.translatesAutoresizingMaskIntoConstraints = NO;
         self.backgroundColor = [UIColor clearColor];
+        _powerSavingMode = pt_duoIsPowerSavingModeEnabled();
 
-        self.layer.shadowColor = [UIColor blackColor].CGColor;
-        self.layer.shadowOpacity = 0.14;
-        self.layer.shadowRadius = 10.0;
-        self.layer.shadowOffset = CGSizeMake(0.0, 3.0);
+        UIView *surfaceView = nil;
+        UIView *stackHostView = nil;
+        if (_powerSavingMode) {
+            self.layer.shadowColor = NULL;
+            self.layer.shadowOpacity = 0.0;
+            self.layer.shadowRadius = 0.0;
+            self.layer.shadowOffset = CGSizeZero;
 
-        UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial];
-        _blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
-        _blurView.translatesAutoresizingMaskIntoConstraints = NO;
-        _blurView.layer.cornerRadius = radius;
-        _blurView.layer.cornerCurve = kCACornerCurveContinuous;
-        _blurView.layer.borderWidth = 0.75;
-        _blurView.clipsToBounds = YES;
-        [self addSubview:_blurView];
+            _solidBackgroundView = [[UIView alloc] initWithFrame:CGRectZero];
+            _solidBackgroundView.translatesAutoresizingMaskIntoConstraints = NO;
+            _solidBackgroundView.opaque = YES;
+            _solidBackgroundView.layer.cornerRadius = radius;
+            _solidBackgroundView.layer.cornerCurve = kCACornerCurveContinuous;
+            _solidBackgroundView.layer.borderWidth = 0.75;
+            _solidBackgroundView.clipsToBounds = YES;
+            [self addSubview:_solidBackgroundView];
+            surfaceView = _solidBackgroundView;
+            stackHostView = _solidBackgroundView;
+        } else {
+            self.layer.shadowColor = [UIColor blackColor].CGColor;
+            self.layer.shadowOpacity = 0.14;
+            self.layer.shadowRadius = 10.0;
+            self.layer.shadowOffset = CGSizeMake(0.0, 3.0);
+
+            UIBlurEffect *blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial];
+            _blurView = [[UIVisualEffectView alloc] initWithEffect:blur];
+            _blurView.translatesAutoresizingMaskIntoConstraints = NO;
+            _blurView.layer.cornerRadius = radius;
+            _blurView.layer.cornerCurve = kCACornerCurveContinuous;
+            _blurView.layer.borderWidth = 0.75;
+            _blurView.clipsToBounds = YES;
+            [self addSubview:_blurView];
+            surfaceView = _blurView;
+            stackHostView = _blurView.contentView;
+        }
 
         _stackView = [[UIStackView alloc] init];
         _stackView.translatesAutoresizingMaskIntoConstraints = NO;
@@ -4995,29 +5171,45 @@ static PTDuoBarItemPlan *pt_buildVerticalBarItemPlanForNavs(UINavigationControll
         _stackView.alignment = UIStackViewAlignmentCenter;
         _stackView.distribution = UIStackViewDistributionEqualSpacing;
         _stackView.spacing = 4.0;
-        [_blurView.contentView addSubview:_stackView];
+        [stackHostView addSubview:_stackView];
 
         [NSLayoutConstraint activateConstraints:@[
-            [_blurView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
-            [_blurView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
-            [_blurView.topAnchor constraintEqualToAnchor:self.topAnchor],
-            [_blurView.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
-            [_stackView.leadingAnchor constraintEqualToAnchor:_blurView.contentView.leadingAnchor constant:3.0],
-            [_stackView.trailingAnchor constraintEqualToAnchor:_blurView.contentView.trailingAnchor constant:-3.0],
-            [_stackView.topAnchor constraintEqualToAnchor:_blurView.contentView.topAnchor constant:4.0],
-            [_stackView.bottomAnchor constraintEqualToAnchor:_blurView.contentView.bottomAnchor constant:-4.0],
+            [surfaceView.leadingAnchor constraintEqualToAnchor:self.leadingAnchor],
+            [surfaceView.trailingAnchor constraintEqualToAnchor:self.trailingAnchor],
+            [surfaceView.topAnchor constraintEqualToAnchor:self.topAnchor],
+            [surfaceView.bottomAnchor constraintEqualToAnchor:self.bottomAnchor],
+            [_stackView.leadingAnchor constraintEqualToAnchor:stackHostView.leadingAnchor constant:3.0],
+            [_stackView.trailingAnchor constraintEqualToAnchor:stackHostView.trailingAnchor constant:-3.0],
+            [_stackView.topAnchor constraintEqualToAnchor:stackHostView.topAnchor constant:4.0],
+            [_stackView.bottomAnchor constraintEqualToAnchor:stackHostView.bottomAnchor constant:-4.0],
         ]];
         [self applyGlassBorderForTraitCollection:self.traitCollection];
     }
     return self;
 }
 
+- (void)setForcedDarkSurface:(NSNumber *)forcedDarkSurface {
+    if ((_forcedDarkSurface == nil && forcedDarkSurface == nil) ||
+        (_forcedDarkSurface != nil && forcedDarkSurface != nil && [_forcedDarkSurface isEqualToNumber:forcedDarkSurface])) {
+        return;
+    }
+    _forcedDarkSurface = forcedDarkSurface;
+    [self applyGlassBorderForTraitCollection:self.traitCollection];
+}
+
 - (void)applyGlassBorderForTraitCollection:(UITraitCollection *)traits {
-    BOOL isDark = (traits.userInterfaceStyle == UIUserInterfaceStyleDark);
-    _blurView.layer.borderColor = (isDark
+    BOOL isDark = self.forcedDarkSurface ? self.forcedDarkSurface.boolValue : (traits.userInterfaceStyle == UIUserInterfaceStyleDark);
+    CGColorRef borderColor = (isDark
         ? [UIColor colorWithWhite:1.0 alpha:0.18]
         : [UIColor colorWithWhite:0.0 alpha:0.09]).CGColor;
-    self.layer.shadowOpacity = isDark ? 0.30 : 0.14;
+    if (_powerSavingMode) {
+        _solidBackgroundView.backgroundColor = pt_duoOpaquePillBackgroundColor(isDark);
+        _solidBackgroundView.layer.borderColor = borderColor;
+        self.layer.shadowOpacity = 0.0;
+    } else {
+        _blurView.layer.borderColor = borderColor;
+        self.layer.shadowOpacity = isDark ? 0.30 : 0.14;
+    }
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
@@ -5098,6 +5290,9 @@ static void pt_configureRailButtonVisual(UIButton *btn,
 @property (nonatomic, strong) PTDuoBarPillContainerView *dockPill;
 @property (nonatomic, strong) UIView *prominentPill;
 @property (nonatomic, strong) UIVisualEffectView *prominentBlurView;
+@property (nonatomic, strong) UIView *prominentSolidView;
+@property (nonatomic, assign) BOOL powerSavingMode;
+@property (nonatomic, strong) NSNumber *forcedDarkSurface;
 @property (nonatomic, strong) UIButton *prominentButton;
 @end
 
@@ -5172,23 +5367,46 @@ static void pt_configureRailButtonVisual(UIButton *btn,
         _dockPill.hidden = YES;
         [_bottomStackView addArrangedSubview:_dockPill];
 
+        _powerSavingMode = pt_duoIsPowerSavingModeEnabled();
+
         _prominentPill = [[UIView alloc] initWithFrame:CGRectZero];
         _prominentPill.translatesAutoresizingMaskIntoConstraints = NO;
         _prominentPill.backgroundColor = [UIColor clearColor];
         _prominentPill.hidden = YES;
-        _prominentPill.layer.shadowColor = [UIColor blackColor].CGColor;
-        _prominentPill.layer.shadowOpacity = 0.16;
-        _prominentPill.layer.shadowRadius = 10.0;
-        _prominentPill.layer.shadowOffset = CGSizeMake(0.0, 3.0);
+        if (_powerSavingMode) {
+            _prominentPill.layer.shadowColor = NULL;
+            _prominentPill.layer.shadowOpacity = 0.0;
+            _prominentPill.layer.shadowRadius = 0.0;
+            _prominentPill.layer.shadowOffset = CGSizeZero;
+        } else {
+            _prominentPill.layer.shadowColor = [UIColor blackColor].CGColor;
+            _prominentPill.layer.shadowOpacity = 0.16;
+            _prominentPill.layer.shadowRadius = 10.0;
+            _prominentPill.layer.shadowOffset = CGSizeMake(0.0, 3.0);
+        }
         [_bottomStackView addArrangedSubview:_prominentPill];
 
-        _prominentBlurView = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
-        _prominentBlurView.translatesAutoresizingMaskIntoConstraints = NO;
-        _prominentBlurView.layer.cornerRadius = 23.0;
-        _prominentBlurView.layer.cornerCurve = kCACornerCurveContinuous;
-        _prominentBlurView.layer.borderWidth = 0.75;
-        _prominentBlurView.clipsToBounds = YES;
-        [_prominentPill addSubview:_prominentBlurView];
+        UIView *prominentSurface = nil;
+        if (_powerSavingMode) {
+            _prominentSolidView = [[UIView alloc] initWithFrame:CGRectZero];
+            _prominentSolidView.translatesAutoresizingMaskIntoConstraints = NO;
+            _prominentSolidView.opaque = YES;
+            _prominentSolidView.layer.cornerRadius = 23.0;
+            _prominentSolidView.layer.cornerCurve = kCACornerCurveContinuous;
+            _prominentSolidView.layer.borderWidth = 0.75;
+            _prominentSolidView.clipsToBounds = YES;
+            [_prominentPill addSubview:_prominentSolidView];
+            prominentSurface = _prominentSolidView;
+        } else {
+            _prominentBlurView = [[UIVisualEffectView alloc] initWithEffect:[UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemChromeMaterial]];
+            _prominentBlurView.translatesAutoresizingMaskIntoConstraints = NO;
+            _prominentBlurView.layer.cornerRadius = 23.0;
+            _prominentBlurView.layer.cornerCurve = kCACornerCurveContinuous;
+            _prominentBlurView.layer.borderWidth = 0.75;
+            _prominentBlurView.clipsToBounds = YES;
+            [_prominentPill addSubview:_prominentBlurView];
+            prominentSurface = _prominentBlurView;
+        }
 
         _prominentButton = [UIButton buttonWithType:UIButtonTypeSystem];
         _prominentButton.translatesAutoresizingMaskIntoConstraints = NO;
@@ -5211,10 +5429,10 @@ static void pt_configureRailButtonVisual(UIButton *btn,
             [_dockPill.widthAnchor constraintEqualToConstant:46.0],
             [_prominentPill.widthAnchor constraintEqualToConstant:46.0],
             [_prominentPill.heightAnchor constraintEqualToConstant:46.0],
-            [_prominentBlurView.leadingAnchor constraintEqualToAnchor:_prominentPill.leadingAnchor],
-            [_prominentBlurView.trailingAnchor constraintEqualToAnchor:_prominentPill.trailingAnchor],
-            [_prominentBlurView.topAnchor constraintEqualToAnchor:_prominentPill.topAnchor],
-            [_prominentBlurView.bottomAnchor constraintEqualToAnchor:_prominentPill.bottomAnchor],
+            [prominentSurface.leadingAnchor constraintEqualToAnchor:_prominentPill.leadingAnchor],
+            [prominentSurface.trailingAnchor constraintEqualToAnchor:_prominentPill.trailingAnchor],
+            [prominentSurface.topAnchor constraintEqualToAnchor:_prominentPill.topAnchor],
+            [prominentSurface.bottomAnchor constraintEqualToAnchor:_prominentPill.bottomAnchor],
             [_prominentButton.leadingAnchor constraintEqualToAnchor:_prominentPill.leadingAnchor],
             [_prominentButton.trailingAnchor constraintEqualToAnchor:_prominentPill.trailingAnchor],
             [_prominentButton.topAnchor constraintEqualToAnchor:_prominentPill.topAnchor],
@@ -5225,12 +5443,37 @@ static void pt_configureRailButtonVisual(UIButton *btn,
     return self;
 }
 
+- (void)setForcedDarkSurface:(NSNumber *)forcedDarkSurface {
+    if ((_forcedDarkSurface == nil && forcedDarkSurface == nil) ||
+        (_forcedDarkSurface != nil && forcedDarkSurface != nil && [_forcedDarkSurface isEqualToNumber:forcedDarkSurface])) {
+        return;
+    }
+    _forcedDarkSurface = forcedDarkSurface;
+    [self applyProminentGlassBorderForTraitCollection:self.traitCollection];
+}
+
 - (void)applyProminentGlassBorderForTraitCollection:(UITraitCollection *)traits {
-    BOOL isDark = (traits.userInterfaceStyle == UIUserInterfaceStyleDark);
-    self.prominentBlurView.layer.borderColor = (isDark
+    BOOL isDark = self.forcedDarkSurface ? self.forcedDarkSurface.boolValue : (traits.userInterfaceStyle == UIUserInterfaceStyleDark);
+    CGColorRef borderColor = (isDark
         ? [UIColor colorWithWhite:1.0 alpha:0.18]
         : [UIColor colorWithWhite:0.0 alpha:0.09]).CGColor;
-    self.prominentPill.layer.shadowOpacity = isDark ? 0.30 : 0.16;
+    if (self.powerSavingMode) {
+        self.prominentSolidView.backgroundColor = pt_duoOpaquePillBackgroundColor(isDark);
+        self.prominentSolidView.layer.borderColor = borderColor;
+        self.prominentPill.layer.shadowOpacity = 0.0;
+    } else {
+        self.prominentBlurView.layer.borderColor = borderColor;
+        self.prominentPill.layer.shadowOpacity = isDark ? 0.30 : 0.16;
+    }
+}
+
+- (void)setProminentBackdropHidden:(BOOL)hidden {
+    if (self.prominentBlurView) {
+        self.prominentBlurView.hidden = hidden;
+    }
+    if (self.prominentSolidView) {
+        self.prominentSolidView.hidden = hidden;
+    }
 }
 
 - (void)traitCollectionDidChange:(UITraitCollection *)previousTraitCollection {
@@ -5991,6 +6234,46 @@ static BOOL pt_navBarUsesPlatterContainer(UINavigationBar *navBar) {
     }
 }
 
+static BOOL pt_duoImageIsBrightForeground(UIImage *img, double snapshotOpaqueRatio, double snapshotMinLuma) {
+    if (!img || pt_imageIsOpaqueFilledBadge(img)) {
+        return NO;
+    }
+    if (snapshotOpaqueRatio > 0.0 && snapshotOpaqueRatio < 0.70 && snapshotMinLuma > 0.65) {
+        return YES;
+    }
+    return pt_imageNeedsTemplateTintOnGlass(img, NO) || pt_duoImageHasBrightForegroundOnTransparent(img);
+}
+
+static BOOL pt_duoEntryTriggersDarkContext(PTDuoBarItemEntry *entry, UITraitCollection *traits) {
+    if (!entry) {
+        return NO;
+    }
+    if (pt_duoColorIsBrightLight(entry.item.tintColor, traits)) {
+        return YES;
+    }
+    if (pt_duoImageIsBrightForeground(entry.resolvedImage, entry.snapshotOpaqueRatio, entry.snapshotMinLuma)) {
+        return YES;
+    }
+    if (entry.isOverflowMenu) {
+        for (PTDuoBarItemEntry *sub in entry.overflowSubEntries) {
+            if (pt_duoEntryTriggersDarkContext(sub, traits)) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static BOOL pt_duoOverlayTriggersDarkContext(PTDuoTabSlotOverlay *ov, UITraitCollection *traits) {
+    if (!ov || ov.accentBgColor != nil) {
+        return NO;
+    }
+    if (pt_duoColorIsBrightLight(ov.accentTintColor, traits)) {
+        return YES;
+    }
+    return pt_duoImageIsBrightForeground(ov.image, ov.snapshotOpaqueRatio, ov.snapshotMinLuma);
+}
+
 - (void)populateBarItemsPill:(PTDuoBarPillContainerView *)pill
                  withEntries:(NSArray<PTDuoBarItemEntry *> *)entries
                  startingTag:(NSInteger)startTag
@@ -6000,6 +6283,9 @@ static BOOL pt_navBarUsesPlatterContainer(UINavigationBar *navBar) {
         [v removeFromSuperview];
     }
     pill.hidden = (entries.count == 0);
+    UIColor *pillNeutralFG = isDarkMode
+        ? [UIColor colorWithWhite:0.96 alpha:1.0]
+        : [UIColor colorWithWhite:0.10 alpha:1.0];
     for (NSUInteger i = 0; i < entries.count; i++) {
         PTDuoBarItemEntry *entry = entries[i];
         UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -6018,7 +6304,8 @@ static BOOL pt_navBarUsesPlatterContainer(UINavigationBar *navBar) {
             }
             UIImageSymbolConfiguration *moreCfg = [UIImageSymbolConfiguration configurationWithPointSize:16.0 weight:UIImageSymbolWeightMedium];
             UIImage *moreImg = [UIImage systemImageNamed:@"ellipsis" withConfiguration:moreCfg];
-            pt_configureRailButtonVisual(btn, moreImg, @"More", [UIColor labelColor], UIEdgeInsetsMake(7.0, 7.0, 7.0, 7.0), 11.0, UIFontWeightMedium, isDarkMode, NO);
+            UIColor *moreTint = self.powerSavingMode ? pillNeutralFG : [UIColor labelColor];
+            pt_configureRailButtonVisual(btn, moreImg, @"More", moreTint, UIEdgeInsetsMake(7.0, 7.0, 7.0, 7.0), 11.0, UIFontWeightMedium, isDarkMode, NO);
             if (@available(iOS 14.0, *)) {
                 NSMutableArray<UIMenuElement *> *menuChildren = [NSMutableArray array];
                 __weak PTDuoVerticalBarHostView *weakSelf = self;
@@ -6065,8 +6352,10 @@ static BOOL pt_navBarUsesPlatterContainer(UINavigationBar *navBar) {
                     btn.toolTip = (title.length > 0) ? title : item.accessibilityLabel;
                 }
             }
-            UIColor *tint = item.tintColor ?: [UIColor labelColor];
-            if (img && pt_imageNeedsTemplateTintOnGlass(img, isDarkMode)) {
+            UIColor *tint = item.tintColor ?: (self.powerSavingMode ? pillNeutralFG : [UIColor labelColor]);
+            if (self.powerSavingMode) {
+                pt_duoResolvePowerSavingVisualContrast(&img, &tint, pillNeutralFG, isDarkMode, self.traitCollection);
+            } else if (img && pt_imageNeedsTemplateTintOnGlass(img, isDarkMode)) {
                 tint = [UIColor labelColor];
             }
             btn.backgroundColor = entry.selected ? [tint colorWithAlphaComponent:0.16] : [UIColor clearColor];
@@ -6138,18 +6427,24 @@ static UIColor *pt_resolvedContrastTintForAccentBg(UIColor *bgColor,
     UIImage *pImg = ov.image;
     BOOL filledBadge = (pImg && pt_imageIsOpaqueFilledBadge(pImg));
     if (filledBadge) {
-        self.prominentBlurView.hidden = YES;
+        [self setProminentBackdropHidden:YES];
         self.prominentButton.backgroundColor = [UIColor clearColor];
         pt_configureRailButtonVisual(self.prominentButton, pImg, ov.title, nil, UIEdgeInsetsZero, 13.0, UIFontWeightSemibold, isDarkMode, YES);
     } else if (ov.accentBgColor != nil) {
-        self.prominentBlurView.hidden = YES;
+        [self setProminentBackdropHidden:YES];
         self.prominentButton.backgroundColor = ov.accentBgColor;
         UIColor *tint = pt_resolvedContrastTintForAccentBg(ov.accentBgColor, ov.accentTintColor, &pImg);
         pt_configureRailButtonVisual(self.prominentButton, pImg, ov.title, tint, UIEdgeInsetsMake(10.0, 10.0, 10.0, 10.0), 13.0, UIFontWeightSemibold, isDarkMode, NO);
     } else {
-        self.prominentBlurView.hidden = NO;
+        [self setProminentBackdropHidden:NO];
         self.prominentButton.backgroundColor = [UIColor clearColor];
-        UIColor *tint = ov.accentTintColor ?: [UIColor labelColor];
+        UIColor *pillNeutralFG = isDarkMode
+            ? [UIColor colorWithWhite:0.96 alpha:1.0]
+            : [UIColor colorWithWhite:0.10 alpha:1.0];
+        UIColor *tint = ov.accentTintColor ?: (self.powerSavingMode ? pillNeutralFG : [UIColor labelColor]);
+        if (self.powerSavingMode) {
+            pt_duoResolvePowerSavingVisualContrast(&pImg, &tint, pillNeutralFG, isDarkMode, self.traitCollection);
+        }
         pt_configureRailButtonVisual(self.prominentButton, pImg, ov.title, tint, UIEdgeInsetsMake(10.0, 10.0, 10.0, 10.0), 12.0, UIFontWeightSemibold, isDarkMode, NO);
     }
 }
@@ -6383,8 +6678,76 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
 
     PTDuoTabSlotOverlay *effectiveProminentOverlay = hasModernRelocatableTabs ? modernProminentOverlay : legacyProminentOverlay;
 
+    BOOL contextDark = isDarkMode;
+    if (!contextDark && self.powerSavingMode) {
+        UIViewController *headerTopVC = effHeaderNav.topViewController;
+        UIViewController *toolbarTopVC = effToolbarNav.topViewController;
+        if (headerTopVC.preferredStatusBarStyle == UIStatusBarStyleLightContent
+            || toolbarTopVC.preferredStatusBarStyle == UIStatusBarStyleLightContent
+            || effHeaderNav.navigationBar.barStyle == UIBarStyleBlack
+            || effToolbarNav.navigationBar.barStyle == UIBarStyleBlack
+            || headerTopVC.overrideUserInterfaceStyle == UIUserInterfaceStyleDark
+            || toolbarTopVC.overrideUserInterfaceStyle == UIUserInterfaceStyleDark
+            || (tabVC && tabVC.overrideUserInterfaceStyle == UIUserInterfaceStyleDark)) {
+            contextDark = YES;
+        }
+        if (!contextDark && (pt_duoColorIsBrightLight(effHeaderNav.navigationBar.tintColor, self.traitCollection)
+                             || pt_duoColorIsBrightLight(effToolbarNav.navigationBar.tintColor, self.traitCollection)
+                             || pt_duoColorIsBrightLight(prominentTintColor, self.traitCollection)
+                             || pt_duoColorIsBrightLight(eligibleTabBar.tintColor, self.traitCollection))) {
+            contextDark = YES;
+        }
+        if (!contextDark) {
+            for (PTDuoBarItemEntry *entry in plan.leadingEntries) {
+                if (pt_duoEntryTriggersDarkContext(entry, self.traitCollection)) { contextDark = YES; break; }
+            }
+        }
+        if (!contextDark) {
+            for (PTDuoBarItemEntry *entry in plan.navBarEntries) {
+                if (pt_duoEntryTriggersDarkContext(entry, self.traitCollection)) { contextDark = YES; break; }
+            }
+        }
+        if (!contextDark) {
+            for (PTDuoBarItemEntry *entry in plan.toolbarEntries) {
+                if (pt_duoEntryTriggersDarkContext(entry, self.traitCollection)) { contextDark = YES; break; }
+            }
+        }
+        if (!contextDark) {
+            if (pt_duoOverlayTriggersDarkContext(effectiveProminentOverlay, self.traitCollection)
+                || pt_duoOverlayTriggersDarkContext(pureActionDockOverlay, self.traitCollection)) {
+                contextDark = YES;
+            }
+        }
+        if (!contextDark) {
+            NSDictionary<NSNumber *, PTDuoTabSlotOverlay *> *activeOverlays = hasModernRelocatableTabs ? modernOverlayByTabIdx : legacySlotOverlays;
+            for (PTDuoTabSlotOverlay *ov in [activeOverlays allValues]) {
+                if (pt_duoOverlayTriggersDarkContext(ov, self.traitCollection)) {
+                    contextDark = YES;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (self.powerSavingMode) {
+        NSNumber *darkOverride = @(contextDark);
+        self.backPill.forcedDarkSurface = darkOverride;
+        self.leadingPill.forcedDarkSurface = darkOverride;
+        self.itemsPill.forcedDarkSurface = darkOverride;
+        self.toolbarPill.forcedDarkSurface = darkOverride;
+        self.dockPill.forcedDarkSurface = darkOverride;
+        self.forcedDarkSurface = darkOverride;
+    } else {
+        self.backPill.forcedDarkSurface = nil;
+        self.leadingPill.forcedDarkSurface = nil;
+        self.itemsPill.forcedDarkSurface = nil;
+        self.toolbarPill.forcedDarkSurface = nil;
+        self.dockPill.forcedDarkSurface = nil;
+        self.forcedDarkSurface = nil;
+    }
+
     // Build compact signature to avoid unnecessary view churn
-    NSMutableString *sig = [NSMutableString stringWithFormat:@"d:%d|b:%d|l:", isDarkMode ? 1 : 0, showBack ? 1 : 0];
+    NSMutableString *sig = [NSMutableString stringWithFormat:@"d:%d|cd:%d|b:%d|l:", isDarkMode ? 1 : 0, contextDark ? 1 : 0, showBack ? 1 : 0];
     void (^appendEntrySig)(PTDuoBarItemEntry *) = ^(PTDuoBarItemEntry *entry) {
         if (entry.isOverflowMenu) {
             [sig appendFormat:@"ov:%lu[", (unsigned long)entry.overflowSubEntries.count];
@@ -6583,8 +6946,15 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
     btn.backgroundColor = [UIColor clearColor];
     NSString *title = !pt_stringIsEffectivelyBlank(ov.title) ? ov.title : nil;
     btn.accessibilityLabel = title.length > 0 ? title : @"Action";
-    UIColor *tint = ov.accentTintColor ?: [UIColor secondaryLabelColor];
-    pt_configureRailButtonVisual(btn, ov.image, title, tint, UIEdgeInsetsMake(7.0, 7.0, 7.0, 7.0), 11.0, UIFontWeightMedium, isDarkMode, NO);
+    UIColor *pillNeutralFG = isDarkMode
+        ? [UIColor colorWithWhite:0.96 alpha:1.0]
+        : [UIColor colorWithWhite:0.10 alpha:1.0];
+    UIImage *img = ov.image;
+    UIColor *tint = ov.accentTintColor ?: (self.powerSavingMode ? pillNeutralFG : [UIColor secondaryLabelColor]);
+    if (self.powerSavingMode) {
+        pt_duoResolvePowerSavingVisualContrast(&img, &tint, pillNeutralFG, isDarkMode, self.traitCollection);
+    }
+    pt_configureRailButtonVisual(btn, img, title, tint, UIEdgeInsetsMake(7.0, 7.0, 7.0, 7.0), 11.0, UIFontWeightMedium, isDarkMode, NO);
     [btn addTarget:self action:@selector(handlePureActionOverlayTap:) forControlEvents:UIControlEventTouchUpInside];
     [NSLayoutConstraint activateConstraints:@[
         [btn.widthAnchor constraintEqualToConstant:38.0],
@@ -6608,7 +6978,13 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
                 prominentBgColor:(UIColor *)prominentBgColor
               prominentTintColor:(UIColor *)prominentTintColor {
     self.backPill.hidden = !showBack;
-    BOOL isDarkMode = (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    BOOL isDarkMode = self.powerSavingMode
+        ? (self.forcedDarkSurface ? self.forcedDarkSurface.boolValue : (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark))
+        : (self.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    UIColor *pillNeutralFG = isDarkMode
+        ? [UIColor colorWithWhite:0.96 alpha:1.0]
+        : [UIColor colorWithWhite:0.10 alpha:1.0];
+    self.backButton.tintColor = self.powerSavingMode ? pillNeutralFG : [UIColor labelColor];
 
     NSInteger tagOffset = 0;
     [self populateBarItemsPill:self.leadingPill withEntries:leadingEntries startingTag:tagOffset isDarkMode:isDarkMode];
@@ -6647,7 +7023,7 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
             btn.layer.cornerRadius = 18.0;
             btn.layer.cornerCurve = kCACornerCurveContinuous;
             btn.backgroundColor = isSelected ? [activeTint colorWithAlphaComponent:0.14] : [UIColor clearColor];
-            UIColor *tint = isSelected ? activeTint : [UIColor secondaryLabelColor];
+            UIColor *tint = isSelected ? activeTint : (self.powerSavingMode ? pillNeutralFG : [UIColor secondaryLabelColor]);
             NSString *title = pt_tabTitle(tab);
             if (pt_stringIsEffectivelyBlank(title)) {
                 title = (ov && !pt_stringIsEffectivelyBlank(ov.title)) ? ov.title : nil;
@@ -6665,6 +7041,9 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
             if (!img && pt_tabIsSearchTab(tab)) {
                 UIImageSymbolConfiguration *searchCfg = [UIImageSymbolConfiguration configurationWithPointSize:17.0 weight:UIImageSymbolWeightMedium];
                 img = [UIImage systemImageNamed:@"magnifyingglass" withConfiguration:searchCfg];
+            }
+            if (self.powerSavingMode) {
+                pt_duoResolvePowerSavingVisualContrast(&img, &tint, pillNeutralFG, isDarkMode, self.traitCollection);
             }
             pt_configureRailButtonVisual(btn, img, title, tint, UIEdgeInsetsMake(7.0, 7.0, 7.0, 7.0), 11.0, isSelected ? UIFontWeightSemibold : UIFontWeightRegular, isDarkMode, NO);
 
@@ -6716,20 +7095,23 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
 
             if (pImg && pt_imageIsOpaqueFilledBadge(pImg)) {
                 // Filled circular badge image (e.g. accented circular '+' icon) fills the circular pill cleanly.
-                self.prominentBlurView.hidden = YES;
+                [self setProminentBackdropHidden:YES];
                 self.prominentButton.backgroundColor = [UIColor clearColor];
                 pt_configureRailButtonVisual(self.prominentButton, pImg, pTitle, nil, UIEdgeInsetsZero, 13.0, UIFontWeightSemibold, isDarkMode, YES);
             } else if (prominentBgColor != nil) {
                 // Accent-colored circular button mirroring _UITabBarAuxiliaryView's explicit background.
-                self.prominentBlurView.hidden = YES;
+                [self setProminentBackdropHidden:YES];
                 self.prominentButton.backgroundColor = prominentBgColor;
                 UIColor *tint = pt_resolvedContrastTintForAccentBg(prominentBgColor, prominentTintColor, &pImg);
                 pt_configureRailButtonVisual(self.prominentButton, pImg, pTitle, tint, UIEdgeInsetsMake(10.0, 10.0, 10.0, 10.0), 13.0, UIFontWeightSemibold, isDarkMode, NO);
             } else {
                 // Translucent glass circular pill (e.g. UISearchTab or monochrome prominent tab).
-                self.prominentBlurView.hidden = NO;
+                [self setProminentBackdropHidden:NO];
                 self.prominentButton.backgroundColor = pSelected ? [activeTint colorWithAlphaComponent:0.16] : [UIColor clearColor];
-                UIColor *tint = pSelected ? activeTint : (prominentTintColor ?: [UIColor labelColor]);
+                UIColor *tint = pSelected ? activeTint : (prominentTintColor ?: (self.powerSavingMode ? pillNeutralFG : [UIColor labelColor]));
+                if (self.powerSavingMode) {
+                    pt_duoResolvePowerSavingVisualContrast(&pImg, &tint, pillNeutralFG, isDarkMode, self.traitCollection);
+                }
                 pt_configureRailButtonVisual(self.prominentButton, pImg, pTitle, tint, UIEdgeInsetsMake(10.0, 10.0, 10.0, 10.0), 12.0, UIFontWeightSemibold, isDarkMode, NO);
             }
         } else if (prominentOverlay) {
@@ -6763,7 +7145,7 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
                 btn.layer.cornerRadius = 18.0;
                 btn.layer.cornerCurve = kCACornerCurveContinuous;
                 btn.backgroundColor = isSelected ? [legacyTint colorWithAlphaComponent:0.18] : [UIColor clearColor];
-                UIColor *tint = isSelected ? legacyTint : [UIColor secondaryLabelColor];
+                UIColor *tint = isSelected ? legacyTint : (self.powerSavingMode ? pillNeutralFG : [UIColor secondaryLabelColor]);
                 NSString *title = !pt_stringIsEffectivelyBlank(ti.title)
                     ? ti.title
                     : (!pt_stringIsEffectivelyBlank(ov.title) ? ov.title : @"");
@@ -6773,6 +7155,9 @@ outDetectedSidebarWidth:(CGFloat *)outDetectedSidebarWidth {
                 UIImage *img = !pt_imageIsPlaceholderBlank(candidateImg) ? candidateImg : nil;
                 if (!img && ov && ov.image) {
                     img = ov.image;
+                }
+                if (self.powerSavingMode) {
+                    pt_duoResolvePowerSavingVisualContrast(&img, &tint, pillNeutralFG, isDarkMode, self.traitCollection);
                 }
                 pt_configureRailButtonVisual(btn, img, title, tint, UIEdgeInsetsMake(7.0, 7.0, 7.0, 7.0), 11.0, isSelected ? UIFontWeightSemibold : UIFontWeightRegular, isDarkMode, NO);
 
@@ -6864,6 +7249,11 @@ static void pt_refreshDuoVerticalBarForWindow(UIWindow *window) {
     if (pt_duoRefreshDepth > 0) {
         return;
     }
+    if (!pt_isWindowStructuralPrimaryCandidate(window)
+        && objc_getAssociatedObject(window, kPTDuoWindowStateKey) == nil
+        && pt_hostViewForWindow(window, NO) == nil) {
+        return;
+    }
     pt_duoRefreshDepth++;
     @try {
         PTDuoBarState prevState = PTDuoBarStateUnset;
@@ -6871,14 +7261,24 @@ static void pt_refreshDuoVerticalBarForWindow(UIWindow *window) {
         if (prevNum) {
             prevState = (PTDuoBarState)prevNum.integerValue;
         }
+        PTDuoBarState nextState = pt_computeDesiredBarStateForWindow(window);
+        BOOL wasActive = (prevState == PTDuoBarStateActive);
+        BOOL isActive = (nextState == PTDuoBarStateActive);
+
+        // Skip state allocation, trait mutation, and safe-area notifications for windows
+        // that were never active and remain ineligible/inactive (e.g. hidden popup windows).
+        if (!wasActive && !isActive
+            && objc_getAssociatedObject(window, kPTDuoWindowInsetStateKey) == nil
+            && objc_getAssociatedObject(window, kPTDuoWindowTraitStateKey) == nil
+            && pt_hostViewForWindow(window, NO) == nil) {
+            objc_setAssociatedObject(window, kPTDuoWindowStateKey, @(nextState), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            return;
+        }
+
         PTDuoWindowInsetState *insetState = pt_insetStateForWindow(window, YES);
         CGFloat prevOccupiedWidth = (prevState == PTDuoBarStateActive && !insetState.collapsedEmptyRightInset)
             ? ((insetState.occupiedRightBarWidth > 0.0) ? insetState.occupiedRightBarWidth : kPTDuoVerticalBarWidth)
             : 0.0;
-
-        PTDuoBarState nextState = pt_computeDesiredBarStateForWindow(window);
-        BOOL wasActive = (prevState == PTDuoBarStateActive);
-        BOOL isActive = (nextState == PTDuoBarStateActive);
 
         // Apply traits to window and windowScene using dedicated trait-state keys.
         // Per UIVerticalBarEdge.h, verticalBarEdge remains Trailing whenever active,
@@ -7053,7 +7453,9 @@ static void pt_refreshDuoVerticalBarForWindow(UIWindow *window) {
             insetState.occupiedRightBarWidth = 0.0;
             insetState.forceReprobe = NO;
             insetState.postMountRecheckScheduled = NO;
-            insetState.safeAreaDriftRetryCount = 0;
+            if (wasActive) {
+                insetState.safeAreaDriftRetryCount = 0;
+            }
             insetState.unknownSlotRetryCount = 0;
 
             PTDuoVerticalBarHostView *host = pt_hostViewForWindow(window, NO);
@@ -7072,26 +7474,33 @@ static void pt_refreshDuoVerticalBarForWindow(UIWindow *window) {
         CGFloat actualWinRight = isfinite(rawActualWinRight) ? rawActualWinRight : 0.0;
         CGFloat expectedRightInset = PTDuoEffectiveRightSafeAreaInsetForOccupiedWidth(
             isActive, nowOccupiedWidth, nativeWinRight);
-        if (fabs(actualWinRight - expectedRightInset) <= 0.5) {
-            insetState.safeAreaDriftRetryCount = 0;
-        }
-        if (PTDuoShouldNotifySafeAreaChange(prevOccupiedWidth,
-                                            nowOccupiedWidth,
-                                            actualWinRight,
-                                            expectedRightInset,
-                                            epochChanged,
-                                            hostBecameVisible,
-                                            insetState.safeAreaDriftRetryCount)) {
-            if (fabs(actualWinRight - expectedRightInset) > 0.5) {
-                insetState.safeAreaDriftRetryCount += 1;
-            }
-            pt_notifySafeAreaInsetsChanged(window, expectedRightInset);
-            CGFloat rawPostWinRight = pt_windowSuperSafeAreaInsets(window).right;
-            CGFloat postWinRight = isfinite(rawPostWinRight) ? rawPostWinRight : 0.0;
-            if (fabs(postWinRight - expectedRightInset) > 0.5 && insetState.safeAreaDriftRetryCount < 3) {
-                pt_scheduleRefreshForWindow(window);
-            } else if (fabs(postWinRight - expectedRightInset) <= 0.5) {
+        if (isActive || wasActive || prevOccupiedWidth > 0.5) {
+            if (fabs(actualWinRight - expectedRightInset) <= 0.5) {
                 insetState.safeAreaDriftRetryCount = 0;
+            }
+            if (PTDuoShouldNotifySafeAreaChange(prevOccupiedWidth,
+                                                nowOccupiedWidth,
+                                                actualWinRight,
+                                                expectedRightInset,
+                                                epochChanged,
+                                                hostBecameVisible,
+                                                insetState.safeAreaDriftRetryCount)) {
+                if (fabs(actualWinRight - expectedRightInset) > 0.5) {
+                    insetState.safeAreaDriftRetryCount += 1;
+                }
+                pt_duoInternalSafeAreaNotifyDepth++;
+                @try {
+                    pt_notifySafeAreaInsetsChanged(window, expectedRightInset);
+                } @finally {
+                    pt_duoInternalSafeAreaNotifyDepth--;
+                }
+                CGFloat rawPostWinRight = pt_windowSuperSafeAreaInsets(window).right;
+                CGFloat postWinRight = isfinite(rawPostWinRight) ? rawPostWinRight : 0.0;
+                if (fabs(postWinRight - expectedRightInset) > 0.5 && insetState.safeAreaDriftRetryCount < 3) {
+                    pt_scheduleRefreshForWindow(window);
+                } else if (fabs(postWinRight - expectedRightInset) <= 0.5) {
+                    insetState.safeAreaDriftRetryCount = 0;
+                }
             }
         }
     } @finally {
@@ -7575,32 +7984,48 @@ static void pt_collectTopControlsInView(UIView *rootView,
         if ([view isKindOfClass:[UITabBar class]] || [clsName isEqualToString:@"_UIBottomTabBarGroupView"]) {
             continue;
         }
-        CGRect winRect = [view convertRect:view.bounds toView:window];
-        if (!CGRectIsNull(winRect) && !CGRectIsEmpty(winRect)) {
-            CGFloat w = CGRectGetWidth(winRect);
-            CGFloat h = CGRectGetHeight(winRect);
-            if (CGRectGetMinY(winRect) >= -4.0
-                && CGRectGetMaxY(winRect) <= maxBottomY
-                && CGRectGetMinX(winRect) >= minOriginX
-                && w >= 16.0 && w <= maxWidth
-                && h >= 16.0 && h <= maxHeight) {
-                UIControl *ctrl = [view isKindOfClass:[UIControl class]] ? (UIControl *)view : nil;
-                BOOL canCtrl = (ctrl && pt_controlHasDispatchableTarget(ctrl));
-                UITapGestureRecognizer *tapGR = nil;
-                id tapTarget = nil;
-                SEL tapAction = NULL;
-                BOOL canTap = (!canCtrl && view.userInteractionEnabled
-                               && pt_extractVerifiedTapGestureAction(view, 0, &tapGR, &tapTarget, &tapAction));
+        if (CGRectIsEmpty(view.bounds)) {
+            if (view.clipsToBounds) {
+                continue;
+            }
+            for (UIView *sub in view.subviews) {
+                [queue addObject:sub];
+            }
+            continue;
+        }
+        UIControl *ctrl = [view isKindOfClass:[UIControl class]] ? (UIControl *)view : nil;
+        BOOL canCtrl = (ctrl && pt_controlHasDispatchableTarget(ctrl));
+        UITapGestureRecognizer *tapGR = nil;
+        id tapTarget = nil;
+        SEL tapAction = NULL;
+        BOOL canTap = (!canCtrl && view.userInteractionEnabled
+                       && view.gestureRecognizers.count > 0
+                       && pt_extractVerifiedTapGestureAction(view, 0, &tapGR, &tapTarget, &tapAction));
+        if (canCtrl || canTap || view.clipsToBounds) {
+            CGRect winRect = [view convertRect:view.bounds toView:window];
+            if (!CGRectIsNull(winRect) && !CGRectIsEmpty(winRect)) {
+                if (view.clipsToBounds
+                    && (CGRectGetMinY(winRect) > maxBottomY || CGRectGetMaxY(winRect) < -4.0)) {
+                    continue;
+                }
                 if (canCtrl || canTap) {
-                    PTDuoGlobalBackControlHit *hit = [[PTDuoGlobalBackControlHit alloc] init];
-                    hit.view = view;
-                    hit.rectInWindow = winRect;
-                    hit.control = canCtrl ? ctrl : nil;
-                    hit.tapGesture = tapGR;
-                    hit.tapTarget = tapTarget;
-                    hit.tapAction = tapAction;
-                    hit.cue = pt_viewCueString(view, 0);
-                    [outHits addObject:hit];
+                    CGFloat w = CGRectGetWidth(winRect);
+                    CGFloat h = CGRectGetHeight(winRect);
+                    if (CGRectGetMinY(winRect) >= -4.0
+                        && CGRectGetMaxY(winRect) <= maxBottomY
+                        && CGRectGetMinX(winRect) >= minOriginX
+                        && w >= 16.0 && w <= maxWidth
+                        && h >= 16.0 && h <= maxHeight) {
+                        PTDuoGlobalBackControlHit *hit = [[PTDuoGlobalBackControlHit alloc] init];
+                        hit.view = view;
+                        hit.rectInWindow = winRect;
+                        hit.control = canCtrl ? ctrl : nil;
+                        hit.tapGesture = tapGR;
+                        hit.tapTarget = tapTarget;
+                        hit.tapAction = tapAction;
+                        hit.cue = pt_viewCueString(view, 0);
+                        [outHits addObject:hit];
+                    }
                 }
             }
         }
@@ -8163,8 +8588,16 @@ BOOL PTDuoWindowHasActiveTextInput(UIWindow * _Nullable window) {
 }
 
 static void pt_scheduleRefreshForWindow(UIWindow *window) {
-    pt_scheduleGlobalBackRefresh();
+    if (window
+        && !pt_isWindowStructuralPrimaryCandidate(window)
+        && objc_getAssociatedObject(window, kPTDuoWindowStateKey) == nil
+        && pt_hostViewForWindow(window, NO) == nil) {
+        return;
+    }
     if (!window || !PTShouldEnableDuoVerticalBar()) {
+        if (!window || pt_isEligiblePrimaryWindow(window)) {
+            pt_scheduleGlobalBackRefresh();
+        }
         return;
     }
     if (![NSThread isMainThread]) {
@@ -8186,8 +8619,8 @@ static void pt_scheduleRefreshForWindow(UIWindow *window) {
         }
         objc_setAssociatedObject(strongWin, kPTDuoWindowRefreshScheduledKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         pt_refreshDuoVerticalBarForWindow(strongWin);
-        if (pt_globalBackRefreshHandler) {
-            pt_globalBackRefreshHandler();
+        if (pt_isEligiblePrimaryWindow(strongWin)) {
+            pt_scheduleGlobalBackRefresh();
         }
     });
 }
@@ -9048,12 +9481,11 @@ static void pt_vcSetNeedsUpdateVerticalBar(UIViewController *self, SEL _cmd) {
     if (pt_origVCSetNeedsUpdateVerticalBar) {
         pt_origVCSetNeedsUpdateVerticalBar(self, _cmd);
     }
-    UIWindow *win = self.viewIfLoaded.window ?: pt_findActivePrimaryWindow();
-    if (win) {
-        PTDuoWindowInsetState *insetState = pt_insetStateForWindow(win, NO);
-        if (insetState) {
-            insetState.forceReprobe = YES;
-        }
+    if (pt_duoRefreshDepth > 0 || pt_duoInternalSafeAreaNotifyDepth > 0) {
+        return;
+    }
+    UIWindow *win = self.viewIfLoaded.window;
+    if (win && pt_isEligiblePrimaryWindow(win)) {
         pt_scheduleRefreshForWindow(win);
     }
 }
@@ -9181,12 +9613,15 @@ static void pt_vcDismissVC(UIViewController *self, SEL _cmd, BOOL flag, void (^c
 
 static void (*pt_origTabBarControllerSetSelectedIndex)(UITabBarController *, SEL, NSUInteger) = NULL;
 static void pt_tabBarControllerSetSelectedIndex(UITabBarController *self, SEL _cmd, NSUInteger index) {
+    NSUInteger prevIndex = self.selectedIndex;
     if (pt_origTabBarControllerSetSelectedIndex) {
         pt_origTabBarControllerSetSelectedIndex(self, _cmd, index);
     }
-    UIWindow *win = self.viewIfLoaded.window;
-    if (win && pt_isEligiblePrimaryWindow(win)) {
-        pt_scheduleRefreshForWindow(win);
+    if (prevIndex != self.selectedIndex) {
+        UIWindow *win = self.viewIfLoaded.window;
+        if (win && pt_isEligiblePrimaryWindow(win)) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 
@@ -9433,58 +9868,87 @@ static void pt_tabBarSetHidden(UITabBar *self, SEL _cmd, BOOL hidden) {
     }
 }
 
+static BOOL pt_barItemArrayEqual(NSArray *a, NSArray *b) {
+    if (a == b) {
+        return YES;
+    }
+    if (a.count == 0 && b.count == 0) {
+        return YES;
+    }
+    return (a != nil && b != nil && [a isEqualToArray:b]);
+}
+
 static void (*pt_origNavItemSetRightItems)(UINavigationItem *, SEL, NSArray<UIBarButtonItem *> *, BOOL) = NULL;
 static void pt_navItemSetRightItems(UINavigationItem *self, SEL _cmd, NSArray<UIBarButtonItem *> *items, BOOL animated) {
+    NSArray<UIBarButtonItem *> *prev = self.rightBarButtonItems;
+    BOOL unchanged = pt_barItemArrayEqual(prev, items);
     if (pt_origNavItemSetRightItems) {
         pt_origNavItemSetRightItems(self, _cmd, items, animated);
     }
-    UIWindow *win = pt_findActivePrimaryWindow();
-    if (win) {
-        pt_scheduleRefreshForWindow(win);
+    if (!unchanged) {
+        UIWindow *win = pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 
 static void (*pt_origNavItemSetTrailingGroups)(UINavigationItem *, SEL, NSArray *) = NULL;
 static void pt_navItemSetTrailingGroups(UINavigationItem *self, SEL _cmd, NSArray *groups) {
+    NSArray *prev = [self respondsToSelector:@selector(trailingItemGroups)] ? self.trailingItemGroups : nil;
+    BOOL unchanged = [self respondsToSelector:@selector(trailingItemGroups)] && pt_barItemArrayEqual(prev, groups);
     if (pt_origNavItemSetTrailingGroups) {
         pt_origNavItemSetTrailingGroups(self, _cmd, groups);
     }
-    UIWindow *win = pt_findActivePrimaryWindow();
-    if (win) {
-        pt_scheduleRefreshForWindow(win);
+    if (!unchanged) {
+        UIWindow *win = pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 
 static void (*pt_origNavItemSetLeftItems)(UINavigationItem *, SEL, NSArray<UIBarButtonItem *> *, BOOL) = NULL;
 static void pt_navItemSetLeftItems(UINavigationItem *self, SEL _cmd, NSArray<UIBarButtonItem *> *items, BOOL animated) {
+    NSArray<UIBarButtonItem *> *prev = self.leftBarButtonItems;
+    BOOL unchanged = pt_barItemArrayEqual(prev, items);
     if (pt_origNavItemSetLeftItems) {
         pt_origNavItemSetLeftItems(self, _cmd, items, animated);
     }
-    UIWindow *win = pt_findActivePrimaryWindow();
-    if (win) {
-        pt_scheduleRefreshForWindow(win);
+    if (!unchanged) {
+        UIWindow *win = pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 
 static void (*pt_origNavItemSetLeadingGroups)(UINavigationItem *, SEL, NSArray *) = NULL;
 static void pt_navItemSetLeadingGroups(UINavigationItem *self, SEL _cmd, NSArray *groups) {
+    NSArray *prev = [self respondsToSelector:@selector(leadingItemGroups)] ? self.leadingItemGroups : nil;
+    BOOL unchanged = [self respondsToSelector:@selector(leadingItemGroups)] && pt_barItemArrayEqual(prev, groups);
     if (pt_origNavItemSetLeadingGroups) {
         pt_origNavItemSetLeadingGroups(self, _cmd, groups);
     }
-    UIWindow *win = pt_findActivePrimaryWindow();
-    if (win) {
-        pt_scheduleRefreshForWindow(win);
+    if (!unchanged) {
+        UIWindow *win = pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 
 static void (*pt_origNavItemSetLeftItemsSupplementBack)(UINavigationItem *, SEL, BOOL) = NULL;
 static void pt_navItemSetLeftItemsSupplementBack(UINavigationItem *self, SEL _cmd, BOOL supplement) {
+    BOOL unchanged = (self.leftItemsSupplementBackButton == supplement);
     if (pt_origNavItemSetLeftItemsSupplementBack) {
         pt_origNavItemSetLeftItemsSupplementBack(self, _cmd, supplement);
     }
-    UIWindow *win = pt_findActivePrimaryWindow();
-    if (win) {
-        pt_scheduleRefreshForWindow(win);
+    if (!unchanged) {
+        UIWindow *win = pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 
@@ -9576,43 +10040,53 @@ static void pt_barItemSetHidden(UIBarButtonItem *self, SEL _cmd, BOOL hidden) {
 }
 
 static void (*pt_origNavItemSetHidesBack)(UINavigationItem *, SEL, BOOL) = NULL;
-static void pt_navItemSetHidesBack(UINavigationItem *self, SEL _cmd, BOOL hides) {
-    if (pt_duoInternalNavItemBackDepth == 0 && [objc_getAssociatedObject(self, kPTDuoNavItemSuppressedBackKey) boolValue]) {
+static void (*pt_origNavItemSetHidesBackAnimated)(UINavigationItem *, SEL, BOOL, BOOL) = NULL;
+
+static void pt_handleNavItemSetHidesBack(UINavigationItem *self,
+                                         SEL _cmd,
+                                         BOOL hides,
+                                         BOOL hasAnimated,
+                                         BOOL animated) {
+    BOOL suppressed = (pt_duoInternalNavItemBackDepth == 0
+                       && [objc_getAssociatedObject(self, kPTDuoNavItemSuppressedBackKey) boolValue]);
+    NSNumber *prevAppHides = suppressed ? objc_getAssociatedObject(self, kPTDuoNavItemAppHidesBackKey) : nil;
+    BOOL prevHides = prevAppHides ? prevAppHides.boolValue : self.hidesBackButton;
+    BOOL changed = (prevHides != hides);
+    if (suppressed) {
         objc_setAssociatedObject(self, kPTDuoNavItemAppHidesBackKey, @(hides), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        UIWindow *win = pt_findActivePrimaryWindow();
-        if (win) {
-            pt_scheduleRefreshForWindow(win);
+        if (changed) {
+            UIWindow *win = pt_findActivePrimaryWindow();
+            if (win) {
+                pt_scheduleRefreshForWindow(win);
+            }
         }
         if (!hides) {
             return;
         }
     }
-    if (pt_origNavItemSetHidesBack) {
+    if (hasAnimated) {
+        if (pt_origNavItemSetHidesBackAnimated) {
+            pt_origNavItemSetHidesBackAnimated(self, _cmd, hides, animated);
+        }
+    } else if (pt_origNavItemSetHidesBack) {
         pt_origNavItemSetHidesBack(self, _cmd, hides);
     }
-    if (pt_duoInternalNavItemBackDepth == 0) {
-        pt_scheduleGlobalBackRefresh();
+    if (!suppressed && pt_duoInternalNavItemBackDepth == 0 && changed) {
+        UIWindow *win = pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        } else {
+            pt_scheduleGlobalBackRefresh();
+        }
     }
 }
 
-static void (*pt_origNavItemSetHidesBackAnimated)(UINavigationItem *, SEL, BOOL, BOOL) = NULL;
+static void pt_navItemSetHidesBack(UINavigationItem *self, SEL _cmd, BOOL hides) {
+    pt_handleNavItemSetHidesBack(self, _cmd, hides, NO, NO);
+}
+
 static void pt_navItemSetHidesBackAnimated(UINavigationItem *self, SEL _cmd, BOOL hides, BOOL animated) {
-    if (pt_duoInternalNavItemBackDepth == 0 && [objc_getAssociatedObject(self, kPTDuoNavItemSuppressedBackKey) boolValue]) {
-        objc_setAssociatedObject(self, kPTDuoNavItemAppHidesBackKey, @(hides), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        UIWindow *win = pt_findActivePrimaryWindow();
-        if (win) {
-            pt_scheduleRefreshForWindow(win);
-        }
-        if (!hides) {
-            return;
-        }
-    }
-    if (pt_origNavItemSetHidesBackAnimated) {
-        pt_origNavItemSetHidesBackAnimated(self, _cmd, hides, animated);
-    }
-    if (pt_duoInternalNavItemBackDepth == 0) {
-        pt_scheduleGlobalBackRefresh();
-    }
+    pt_handleNavItemSetHidesBack(self, _cmd, hides, YES, animated);
 }
 
 static BOOL pt_isNavBarFullySuppressed(UINavigationController *nav) {
@@ -9683,23 +10157,29 @@ static UIEdgeInsets pt_navEdgeInsetsForChild(UINavigationController *self, SEL _
 
 static void (*pt_origNavSetNavBarHiddenAnimated)(UINavigationController *, SEL, BOOL, BOOL) = NULL;
 static void pt_navSetNavBarHiddenAnimated(UINavigationController *self, SEL _cmd, BOOL hidden, BOOL animated) {
+    BOOL prevHidden = self.isNavigationBarHidden;
     if (pt_origNavSetNavBarHiddenAnimated) {
         pt_origNavSetNavBarHiddenAnimated(self, _cmd, hidden, animated);
     }
-    UIWindow *win = self.viewIfLoaded.window ?: pt_findActivePrimaryWindow();
-    if (win) {
-        pt_scheduleRefreshForWindow(win);
+    if (prevHidden != self.isNavigationBarHidden) {
+        UIWindow *win = self.viewIfLoaded.window ?: pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 
 static void (*pt_origNavSetToolbarHiddenAnimated)(UINavigationController *, SEL, BOOL, BOOL) = NULL;
 static void pt_navSetToolbarHiddenAnimated(UINavigationController *self, SEL _cmd, BOOL hidden, BOOL animated) {
+    BOOL prevHidden = self.isToolbarHidden;
     if (pt_origNavSetToolbarHiddenAnimated) {
         pt_origNavSetToolbarHiddenAnimated(self, _cmd, hidden, animated);
     }
-    UIWindow *win = self.viewIfLoaded.window ?: pt_findActivePrimaryWindow();
-    if (win) {
-        pt_scheduleRefreshForWindow(win);
+    if (prevHidden != self.isToolbarHidden) {
+        UIWindow *win = self.viewIfLoaded.window ?: pt_findActivePrimaryWindow();
+        if (win) {
+            pt_scheduleRefreshForWindow(win);
+        }
     }
 }
 

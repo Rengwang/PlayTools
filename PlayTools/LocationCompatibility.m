@@ -18,6 +18,7 @@ static void (*pt_origSetDelegate)(id, SEL, id) = NULL;
 
 @interface PTWeakDelegateBox : NSObject
 @property (nonatomic, weak) id<CLLocationManagerDelegate> delegate;
+@property (nonatomic, assign) BOOL authDelivered;
 @end
 
 @implementation PTWeakDelegateBox
@@ -72,7 +73,10 @@ static void pt_clSetDelegate(CLLocationManager *self, SEL _cmd, id<CLLocationMan
             box = [[PTWeakDelegateBox alloc] init];
             objc_setAssociatedObject(self, kPTLocationDelegateKey, box, OBJC_ASSOCIATION_RETAIN);
         }
-        box.delegate = delegate;
+        if (box.delegate != delegate) {
+            box.delegate = delegate;
+            box.authDelivered = NO;
+        }
     } else {
         objc_setAssociatedObject(self, kPTLocationDelegateKey, nil, OBJC_ASSOCIATION_RETAIN);
     }
@@ -80,6 +84,18 @@ static void pt_clSetDelegate(CLLocationManager *self, SEL _cmd, id<CLLocationMan
     if (pt_origSetDelegate) {
         pt_origSetDelegate(self, _cmd, delegate);
     }
+}
+
+static BOOL pt_claimInitialAuthDeliveryForManager(CLLocationManager *manager) {
+    if (!manager) { return NO; }
+    [pt_managersLock lock];
+    PTWeakDelegateBox *box = objc_getAssociatedObject(manager, kPTLocationDelegateKey);
+    BOOL shouldSchedule = (box && box.delegate && !box.authDelivered);
+    if (shouldSchedule) {
+        box.authDelivered = YES;
+    }
+    [pt_managersLock unlock];
+    return shouldSchedule;
 }
 
 static void pt_deliverLocationToManager(CLLocationManager *manager) {
@@ -101,10 +117,17 @@ static void pt_deliverLocationToManager(CLLocationManager *manager) {
     }
 }
 
-static void pt_deliverAuthorizedToManager(CLLocationManager *manager) {
+static void pt_deliverAuthorizedToManager(CLLocationManager *manager, BOOL onlyIfUndelivered) {
     if (!manager) { return; }
-    id<CLLocationManagerDelegate> delegate = pt_delegateForManager(manager);
-    if (!delegate) { return; }
+    [pt_managersLock lock];
+    PTWeakDelegateBox *box = objc_getAssociatedObject(manager, kPTLocationDelegateKey);
+    id<CLLocationManagerDelegate> delegate = box ? box.delegate : nil;
+    if (!delegate || (onlyIfUndelivered && box.authDelivered)) {
+        [pt_managersLock unlock];
+        return;
+    }
+    box.authDelivered = YES;
+    [pt_managersLock unlock];
     if (@available(iOS 14.0, *)) {
         if ([delegate respondsToSelector:@selector(locationManagerDidChangeAuthorization:)]) {
             [delegate locationManagerDidChangeAuthorization:manager];
@@ -117,6 +140,15 @@ static void pt_deliverAuthorizedToManager(CLLocationManager *manager) {
         [delegate locationManager:manager didChangeAuthorizationStatus:kCLAuthorizationStatusAuthorizedAlways];
 #pragma clang diagnostic pop
     }
+}
+
+static void pt_scheduleAuthorizedDelivery(CLLocationManager *manager, BOOL onlyIfUndelivered) {
+    __weak CLLocationManager *weakSelf = manager;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        CLLocationManager *strongSelf = weakSelf;
+        if (!strongSelf) { return; }
+        pt_deliverAuthorizedToManager(strongSelf, onlyIfUndelivered);
+    });
 }
 
 static BOOL pt_clLocationServicesEnabled(id self, SEL _cmd) {
@@ -140,51 +172,59 @@ static CLLocation *pt_clLocation(CLLocationManager *self, SEL _cmd) {
 }
 
 static void pt_clRequestAuth(CLLocationManager *self, SEL _cmd) {
-    __weak CLLocationManager *weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        pt_deliverAuthorizedToManager(weakSelf);
-    });
+    if (pt_claimInitialAuthDeliveryForManager(self)) {
+        pt_scheduleAuthorizedDelivery(self, NO);
+        return;
+    }
+    // If delegate has not been set yet, defer the undelivered check until the block runs.
+    if (!pt_delegateForManager(self)) {
+        pt_scheduleAuthorizedDelivery(self, YES);
+    }
 }
 
 static void pt_clRequestLocation(CLLocationManager *self, SEL _cmd) {
+    BOOL shouldDeliverAuth = pt_claimInitialAuthDeliveryForManager(self);
     __weak CLLocationManager *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
         CLLocationManager *strongSelf = weakSelf;
         if (!strongSelf) { return; }
-        pt_deliverAuthorizedToManager(strongSelf);
+        if (shouldDeliverAuth) {
+            pt_deliverAuthorizedToManager(strongSelf, NO);
+        }
         pt_deliverLocationToManager(strongSelf);
     });
 }
 
 static void pt_clStartUpdatingLocation(CLLocationManager *self, SEL _cmd) {
-    PTLocationTimerBox *box = [[PTLocationTimerBox alloc] init];
-    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     __weak CLLocationManager *weakSelf = self;
-    dispatch_source_set_timer(timer,
-                              dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
-                              3 * NSEC_PER_SEC,
-                              250 * NSEC_PER_MSEC);
-    dispatch_source_set_event_handler(timer, ^{
-        CLLocationManager *strongSelf = weakSelf;
-        if (!strongSelf) { return; }
-        pt_deliverLocationToManager(strongSelf);
-    });
-    box.timer = timer;
 
     [pt_managersLock lock];
     [pt_activeManagers addObject:self];
     PTLocationTimerBox *existing = objc_getAssociatedObject(self, kPTLocationTimerKey);
-    objc_setAssociatedObject(self, kPTLocationTimerKey, box, OBJC_ASSOCIATION_RETAIN);
+    if (!existing) {
+        PTLocationTimerBox *box = [[PTLocationTimerBox alloc] init];
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(timer,
+                                  dispatch_time(DISPATCH_TIME_NOW, 150 * NSEC_PER_MSEC),
+                                  3 * NSEC_PER_SEC,
+                                  250 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(timer, ^{
+            CLLocationManager *strongSelf = weakSelf;
+            if (!strongSelf) { return; }
+            pt_deliverLocationToManager(strongSelf);
+        });
+        box.timer = timer;
+        objc_setAssociatedObject(self, kPTLocationTimerKey, box, OBJC_ASSOCIATION_RETAIN);
+        dispatch_resume(timer);
+    }
     [pt_managersLock unlock];
 
-    [existing invalidate];
-    dispatch_resume(timer);
-
-    dispatch_async(dispatch_get_main_queue(), ^{
-        CLLocationManager *strongSelf = weakSelf;
-        if (!strongSelf) { return; }
-        pt_deliverAuthorizedToManager(strongSelf);
-    });
+    // Deliver the initial authorization state once per (manager, delegate);
+    // re-invoking startUpdatingLocation inside the delegate callback must not
+    // re-trigger authorization delivery or reset the active location timer.
+    if (pt_claimInitialAuthDeliveryForManager(self)) {
+        pt_scheduleAuthorizedDelivery(self, NO);
+    }
 }
 
 static void pt_clStopUpdatingLocation(CLLocationManager *self, SEL _cmd) {

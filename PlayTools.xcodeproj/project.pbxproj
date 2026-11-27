@@ -48,6 +48,8 @@
 		95D474FB2C0BA77B0072797F /* JoystickElement.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95D474FA2C0BA77B0072797F /* JoystickElement.swift */; };
 		95D474FF2C0BDAB20072797F /* DraggableButtonElement.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95D474FE2C0BDAB20072797F /* DraggableButtonElement.swift */; };
 		AA71970B287A44D200623C15 /* PlayLoader.m in Sources */ = {isa = PBXBuildFile; fileRef = AA719702287A44D200623C15 /* PlayLoader.m */; };
+		E1F2A3B4C5D60718293A4B03 /* PlayEfficiencyHooks.h in Headers */ = {isa = PBXBuildFile; fileRef = E1F2A3B4C5D60718293A4B01 /* PlayEfficiencyHooks.h */; };
+		E1F2A3B4C5D60718293A4B04 /* PlayEfficiencyHooks.m in Sources */ = {isa = PBXBuildFile; fileRef = E1F2A3B4C5D60718293A4B02 /* PlayEfficiencyHooks.m */; };
 		F72BBCB236C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm in Sources */ = {isa = PBXBuildFile; fileRef = F72BBCB136C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm */; };
 		F079CA972438413D9615412B /* CameraCompatibility.m in Sources */ = {isa = PBXBuildFile; fileRef = F079CA962438413D9615412B /* CameraCompatibility.m */; };
 		E8A19B022EE41A7C0041C201 /* OneNoteSceneCompatibility.m in Sources */ = {isa = PBXBuildFile; fileRef = E8A19B012EE41A7C0041C201 /* OneNoteSceneCompatibility.m */; };
@@ -152,6 +154,8 @@
 		95D474FE2C0BDAB20072797F /* DraggableButtonElement.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraggableButtonElement.swift; sourceTree = "<group>"; };
 		AA7196D8287A447700623C15 /* PlayTools.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = PlayTools.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		AA719702287A44D200623C15 /* PlayLoader.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = PlayLoader.m; sourceTree = "<group>"; };
+		E1F2A3B4C5D60718293A4B01 /* PlayEfficiencyHooks.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; path = PlayEfficiencyHooks.h; sourceTree = "<group>"; };
+		E1F2A3B4C5D60718293A4B02 /* PlayEfficiencyHooks.m */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.objc; path = PlayEfficiencyHooks.m; sourceTree = "<group>"; };
 		F72BBCB136C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = CTPocketOutputCompatibility.mm; sourceTree = "<group>"; };
 		F079CA962438413D9615412B /* CameraCompatibility.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = CameraCompatibility.m; sourceTree = "<group>"; };
 		E8A19B012EE41A7C0041C201 /* OneNoteSceneCompatibility.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = OneNoteSceneCompatibility.m; sourceTree = "<group>"; };
@@ -460,6 +464,8 @@
 				AA719706287A44D200623C15 /* PlayCover.swift */,
 				AA719705287A44D200623C15 /* PlayLoader.h */,
 				AA719702287A44D200623C15 /* PlayLoader.m */,
+				E1F2A3B4C5D60718293A4B01 /* PlayEfficiencyHooks.h */,
+				E1F2A3B4C5D60718293A4B02 /* PlayEfficiencyHooks.m */,
 				F72BBCB136C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm */,
 				F079CA962438413D9615412B /* CameraCompatibility.m */,
 				E8A19B012EE41A7C0041C201 /* OneNoteSceneCompatibility.m */,
@@ -592,6 +598,7 @@
 				AA71986D287A81A000623C15 /* PTFakeMetaTouch.h in Headers */,
 				AA719870287A81A000623C15 /* UIEvent+Private.h in Headers */,
 				AA71970E287A44D200623C15 /* PlayLoader.h in Headers */,
+				E1F2A3B4C5D60718293A4B03 /* PlayEfficiencyHooks.h in Headers */,
 				AA719872287A81A000623C15 /* UITouch+Private.h in Headers */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -807,6 +814,7 @@
 				AA719789287A480D00623C15 /* PlayInput.swift in Sources */,
 				A9C4E1012F0B8A100051A201 /* OptionScrollZoomController.swift in Sources */,
 				AA71970B287A44D200623C15 /* PlayLoader.m in Sources */,
+				E1F2A3B4C5D60718293A4B04 /* PlayEfficiencyHooks.m in Sources */,
 				F72BBCB236C44A1EA6A48D44 /* CTPocketOutputCompatibility.mm in Sources */,
 				F079CA972438413D9615412B /* CameraCompatibility.m in Sources */,
 				E8A19B022EE41A7C0041C201 /* OneNoteSceneCompatibility.m in Sources */,

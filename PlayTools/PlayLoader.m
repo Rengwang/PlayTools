@@ -6,7 +6,10 @@
 #include <Foundation/Foundation.h>
 #include <errno.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <sys/sysctl.h>
 
 #import "PlayLoader.h"
@@ -24,6 +27,7 @@
 #import <net/if.h>
 #import <net/if_dl.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <os/lock.h>
 #import <stddef.h>
 #import <sys/stat.h>
@@ -184,14 +188,17 @@ DYLD_INTERPOSE(pt_availability_version_check, _availability_version_check)
 
 #if TARGET_OS_MACCATALYST
 typedef int (*pt_atexit_fn)(void (*)(void));
+typedef void (*pt_exit_fn)(int) __attribute__((noreturn));
 typedef const struct mach_header *(*pt_dyld_image_header_fn)(const void *);
 typedef void *_Nullable (*pt_ns_class_from_string_fn)(void *);
 typedef void (*pt_dispatch_async_fn)(void *, void *);
 extern int __cxa_atexit(void (*func)(void *), void *arg, void *dso_handle);
 PT_INTERPOSE_EXPORT int pt_atexit(void (*func)(void));
+PT_INTERPOSE_EXPORT void pt_exit(int status) __attribute__((noreturn));
 PT_INTERPOSE_EXPORT void *_Nullable pt_NSClassFromString(void *aClassName);
 PT_INTERPOSE_EXPORT void pt_dispatch_async(void *queue, void *block);
 DYLD_INTERPOSE(pt_atexit, atexit)
+DYLD_INTERPOSE(pt_exit, exit)
 DYLD_INTERPOSE(pt_NSClassFromString, NSClassFromString)
 DYLD_INTERPOSE(pt_dispatch_async, dispatch_async)
 #endif
@@ -872,12 +879,31 @@ PT_INTERPOSE_EXPORT void *pt_dlsym(void *handle, const char *symbol) {
     return orig_dlsym(handle, symbol);
 }
 
+static atomic_bool pt_appWillTerminateStarted = ATOMIC_VAR_INIT(false);
+static atomic_bool pt_nsAppWillTerminatePosted = ATOMIC_VAR_INIT(false);
+
+void pt_markAppTerminating(void) {
+    atomic_store_explicit(&pt_appWillTerminateStarted, true, memory_order_release);
+}
+
 #if TARGET_OS_MACCATALYST
 static void pt_atexit_trampoline(void *arg) {
     void (*fn)(void) = (void (*)(void))arg;
     if (fn) {
         fn();
     }
+}
+
+/// Skip `__cxa_finalize_ranges` C++ static destructors at final AppKit `exit()`
+/// teardown after `NSApplicationWillTerminateNotification` has fired on the main thread,
+/// avoiding destructor/thread mutex races (e.g. `std::mutex::~mutex()` abort).
+PT_INTERPOSE_EXPORT void pt_exit(int status) {
+    if (atomic_load_explicit(&pt_nsAppWillTerminatePosted, memory_order_acquire)
+        && pthread_main_np() != 0) {
+        fflush(NULL);
+        _exit(status);
+    }
+    DYLD_INTERPOSE_ORIG(pt_exit_fn, exit)(status);
 }
 
 /// Fast `atexit` interpose for Mac Catalyst.
@@ -2388,7 +2414,16 @@ static void pt_recordPendingOrphanWindow(UIWindow *win, BOOL wantedKey) {
     }
 }
 
+#if TARGET_OS_MACCATALYST
+static void pt_applyForcedAppearanceToWindowIfNeeded(UIWindow *window);
+#else
+static inline void pt_applyForcedAppearanceToWindowIfNeeded(UIWindow *window) {
+    (void)window;
+}
+#endif
+
 static void pt_windowMakeKeyAndVisible(UIWindow *self, SEL _cmd) {
+    pt_applyForcedAppearanceToWindowIfNeeded(self);
     if (NSThread.isMainThread && self.windowScene == nil && pt_isEligibleOrphanWindow(self)) {
         UIWindowScene *scene = pt_activeApplicationWindowScene();
         if (scene) {
@@ -2404,6 +2439,9 @@ static void pt_windowMakeKeyAndVisible(UIWindow *self, SEL _cmd) {
 }
 
 static void pt_windowSetHidden(UIWindow *self, SEL _cmd, BOOL hidden) {
+    if (!hidden) {
+        pt_applyForcedAppearanceToWindowIfNeeded(self);
+    }
     if (NSThread.isMainThread && !hidden && self.windowScene == nil && pt_isEligibleOrphanWindow(self)) {
         UIWindowScene *scene = pt_activeApplicationWindowScene();
         if (scene) {
@@ -2938,17 +2976,74 @@ static void pt_installSafeAreaReentrantLayoutGuard(void) {
     pt_safeAreaLayoutGuardInstalled = YES;
 }
 
+static void (*pt_origFvpSendOrQueue)(id, SEL, id) = NULL;
+static BOOL pt_fvpEventBridgeGuardInstalled = NO;
+
+static void pt_fvpSendOrQueue(id self, SEL _cmd, id event) {
+    if (atomic_load_explicit(&pt_appWillTerminateStarted, memory_order_acquire)) {
+        return;
+    }
+    @try {
+        if (pt_origFvpSendOrQueue) {
+            pt_origFvpSendOrQueue(self, _cmd, event);
+        }
+    } @catch (NSException *exception) {
+        if (atomic_load_explicit(&pt_appWillTerminateStarted, memory_order_acquire)) {
+            return;
+        }
+        @throw;
+    }
+}
+
+static void pt_installFlutterEventBridgeTerminationGuard(void) {
+    if (pt_fvpEventBridgeGuardInstalled) {
+        return;
+    }
+    Class cls = objc_lookUpClass("FVPEventBridge");
+    if (!cls) {
+        return;
+    }
+    SEL sel = sel_registerName("sendOrQueue:");
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m || method_getNumberOfArguments(m) != 3) {
+        return;
+    }
+    IMP origImp = method_getImplementation(m);
+    if (origImp != (IMP)pt_fvpSendOrQueue) {
+        pt_origFvpSendOrQueue = (void (*)(id, SEL, id))origImp;
+        class_replaceMethod(cls, sel, (IMP)pt_fvpSendOrQueue, method_getTypeEncoding(m));
+    }
+    pt_fvpEventBridgeGuardInstalled = YES;
+}
+
 static BOOL pt_terminationWatchdogInstalled = NO;
+static id pt_fvpLaunchObserver = nil;
 
 static void pt_installTerminationWatchdog(void) {
     if (pt_terminationWatchdogInstalled) {
         return;
     }
     pt_terminationWatchdogInstalled = YES;
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillTerminateNotification
-                                                      object:nil
-                                                       queue:nil
-                                                  usingBlock:^(NSNotification * _Nonnull note) {
+    pt_installFlutterEventBridgeTerminationGuard();
+
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    pt_fvpLaunchObserver = [nc addObserverForName:UIApplicationDidFinishLaunchingNotification
+                                           object:nil
+                                            queue:nil
+                                       usingBlock:^(NSNotification * _Nonnull note) {
+        pt_installFlutterEventBridgeTerminationGuard();
+        if (pt_fvpLaunchObserver) {
+            [[NSNotificationCenter defaultCenter] removeObserver:pt_fvpLaunchObserver];
+            pt_fvpLaunchObserver = nil;
+        }
+    }];
+
+    [nc addObserverForName:UIApplicationWillTerminateNotification
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification * _Nonnull note) {
+        pt_installFlutterEventBridgeTerminationGuard();
+        atomic_store_explicit(&pt_appWillTerminateStarted, true, memory_order_release);
         static dispatch_once_t onceToken;
         dispatch_once(&onceToken, ^{
             // UIApplicationWillTerminateNotification is posted after UINSAppLifecycleStateTerminatingPastPointOfNoReturn.
@@ -2959,6 +3054,14 @@ static void pt_installTerminationWatchdog(void) {
                 _exit(0);
             });
         });
+    }];
+
+    [nc addObserverForName:@"NSApplicationWillTerminateNotification"
+                    object:nil
+                     queue:nil
+                usingBlock:^(NSNotification * _Nonnull note) {
+        atomic_store_explicit(&pt_appWillTerminateStarted, true, memory_order_release);
+        atomic_store_explicit(&pt_nsAppWillTerminatePosted, true, memory_order_release);
     }];
 }
 
@@ -3146,11 +3249,17 @@ static id (*pt_origVisualEffectInitWithEffect)(id, SEL, id) = NULL;
 static void (*pt_origVisualEffectSetEffect)(id, SEL, id) = NULL;
 static void (*pt_origVisualEffectTraitCollectionDidChange)(id, SEL, UITraitCollection *) = NULL;
 static void (*pt_origVisualEffectLayoutSubviews)(id, SEL) = NULL;
+static void (*pt_origVisualEffectDidMoveToWindow)(id, SEL) = NULL;
 static void (*pt_origVisualEffectSetCornerConfiguration)(id, SEL, id) = NULL;
 static Class pt_glassEffectClass = Nil;
 static BOOL pt_glassEffectGuardInstalled = NO;
+static BOOL pt_powerSavingMaterialEnabled = NO;
 static const void *kPTAppliedGlassEffectKey = &kPTAppliedGlassEffectKey;
+static const void *kPTAppliedPowerSaveBlurEffectKey = &kPTAppliedPowerSaveBlurEffectKey;
 static const void *kPTAppliedGlassOverlayKey = &kPTAppliedGlassOverlayKey;
+static const void *kPTAppliedPowerSaveSolidBgKey = &kPTAppliedPowerSaveSolidBgKey;
+static const void *kPTAppliedPowerSaveOrigOpaqueKey = &kPTAppliedPowerSaveOrigOpaqueKey;
+static const void *kPTAppliedPowerSaveIsDarkKey = &kPTAppliedPowerSaveIsDarkKey;
 static const void *kPTAppliedGlassCornersKey = &kPTAppliedGlassCornersKey;
 static const void *kPTAppliedGlassBorderKey = &kPTAppliedGlassBorderKey;
 static const void *kPTAppliedGlassStateKey = &kPTAppliedGlassStateKey;
@@ -3163,9 +3272,229 @@ typedef struct {
     BOOL isDark;
 } PTGlassLayoutState;
 
-static UIBlurEffect *pt_fallbackBlurEffectForGlassEffect(id glassEffect,
-                                                          UITraitCollection *traitCollection,
-                                                          UIColor * __autoreleasing *outTintOverlay) {
+static BOOL pt_isPowerSavingModeEnabled(void) {
+    const char *disable = getenv("PLAYTOOLS_DISABLE_POWER_SAVING");
+    if (disable && disable[0] == '1' && disable[1] == '\0') {
+        return NO;
+    }
+    return [[PlaySettings shared] powerSavingMode];
+}
+
+static BOOL pt_isBlurEffectDark(UIBlurEffect *blurEffect, UITraitCollection *traitCollection) {
+    UITraitCollection *effectiveTraits = traitCollection ?: [UITraitCollection currentTraitCollection];
+    BOOL isDark = (effectiveTraits != nil && effectiveTraits.userInterfaceStyle == UIUserInterfaceStyleDark);
+    if (!blurEffect) {
+        return isDark;
+    }
+    SEL styleSel = sel_registerName("_style");
+    if ([blurEffect respondsToSelector:styleSel]) {
+        NSInteger style = ((NSInteger (*)(id, SEL))objc_msgSend)(blurEffect, styleSel);
+        switch (style) {
+            case UIBlurEffectStyleExtraLight:
+            case UIBlurEffectStyleLight:
+            case UIBlurEffectStyleSystemUltraThinMaterialLight:
+            case UIBlurEffectStyleSystemThinMaterialLight:
+            case UIBlurEffectStyleSystemMaterialLight:
+            case UIBlurEffectStyleSystemThickMaterialLight:
+            case UIBlurEffectStyleSystemChromeMaterialLight:
+                return NO;
+            case UIBlurEffectStyleDark:
+            case UIBlurEffectStyleSystemUltraThinMaterialDark:
+            case UIBlurEffectStyleSystemThinMaterialDark:
+            case UIBlurEffectStyleSystemMaterialDark:
+            case UIBlurEffectStyleSystemThickMaterialDark:
+            case UIBlurEffectStyleSystemChromeMaterialDark:
+                return YES;
+            default:
+                break;
+        }
+    }
+    return isDark;
+}
+
+static BOOL pt_resolveColorRGBA(UIColor *color,
+                                UITraitCollection *traits,
+                                CGFloat *outR,
+                                CGFloat *outG,
+                                CGFloat *outB,
+                                CGFloat *outA,
+                                CGFloat *outLuma) {
+    if (!color) {
+        return NO;
+    }
+    UIColor *resolved = color;
+    if (traits && [resolved respondsToSelector:@selector(resolvedColorWithTraitCollection:)]) {
+        resolved = [resolved resolvedColorWithTraitCollection:traits];
+    }
+    CGFloat r = 0.0, g = 0.0, b = 0.0, alpha = 0.0;
+    if (![resolved getRed:&r green:&g blue:&b alpha:&alpha]) {
+        CGFloat white = 0.0;
+        if ([resolved getWhite:&white alpha:&alpha]) {
+            r = white;
+            g = white;
+            b = white;
+        } else {
+            return NO;
+        }
+    }
+    CGFloat luma = 0.299 * r + 0.587 * g + 0.114 * b;
+    if (outR) { *outR = r; }
+    if (outG) { *outG = g; }
+    if (outB) { *outB = b; }
+    if (outA) { *outA = alpha; }
+    if (outLuma) { *outLuma = luma; }
+    return YES;
+}
+
+static BOOL pt_colorIsBrightLight(UIColor *color, UITraitCollection *traits) {
+    CGFloat alpha = 0.0, luma = 0.0;
+    if (!pt_resolveColorRGBA(color, traits, NULL, NULL, NULL, &alpha, &luma)) {
+        return NO;
+    }
+    return (alpha > 0.5 && luma > 0.72);
+}
+
+static BOOL pt_imageHasBrightForegroundOnTransparent(UIImage *image) {
+    if (!image || !image.CGImage) {
+        return NO;
+    }
+    if (image.renderingMode == UIImageRenderingModeAlwaysTemplate || image.isSymbolImage) {
+        return NO;
+    }
+    CGImageRef cg = image.CGImage;
+    size_t w = CGImageGetWidth(cg);
+    size_t h = CGImageGetHeight(cg);
+    if (w < 4 || h < 4) {
+        return NO;
+    }
+    unsigned char pixels[8 * 8 * 4] = {0};
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    if (!cs) {
+        return NO;
+    }
+    CGContextRef ctx = CGBitmapContextCreate(pixels, 8, 8, 8, 8 * 4, cs,
+                                             (CGBitmapInfo)((uint32_t)kCGImageAlphaPremultipliedLast | (uint32_t)kCGBitmapByteOrder32Big));
+    CGColorSpaceRelease(cs);
+    if (!ctx) {
+        return NO;
+    }
+    CGContextDrawImage(ctx, CGRectMake(0.0, 0.0, 8.0, 8.0), cg);
+    CGContextRelease(ctx);
+
+    NSInteger visibleCount = 0;
+    NSInteger chromaticCount = 0;
+    CGFloat lumaSum = 0.0;
+    for (int i = 0; i < 64; i++) {
+        int base = i * 4;
+        unsigned char a = pixels[base + 3];
+        if (a < 20) {
+            continue;
+        }
+        CGFloat alphaF = (CGFloat)a / 255.0;
+        CGFloat r = MIN(1.0, ((CGFloat)pixels[base + 0] / 255.0) / alphaF);
+        CGFloat g = MIN(1.0, ((CGFloat)pixels[base + 1] / 255.0) / alphaF);
+        CGFloat b = MIN(1.0, ((CGFloat)pixels[base + 2] / 255.0) / alphaF);
+        CGFloat maxC = MAX(r, MAX(g, b));
+        CGFloat minC = MIN(r, MIN(g, b));
+        if ((maxC - minC) > 0.16) {
+            chromaticCount++;
+        }
+        lumaSum += (0.299 * r + 0.587 * g + 0.114 * b);
+        visibleCount++;
+    }
+    CGFloat opaqueRatio = (CGFloat)visibleCount / 64.0;
+    if (visibleCount == 0 || opaqueRatio >= 0.70 || chromaticCount > MAX(1, visibleCount / 8)) {
+        return NO;
+    }
+    CGFloat avgLuma = lumaSum / (CGFloat)visibleCount;
+    return (avgLuma > 0.72);
+}
+
+static BOOL pt_subtreeHasBrightForeground(UIView *node,
+                                          UITraitCollection *traits,
+                                          NSInteger depth,
+                                          NSInteger maxDepth,
+                                          UIVisualEffectView *originEffectView,
+                                          BOOL requireOverlapWithOrigin) {
+    if (!node || depth > maxDepth || node.hidden || node.alpha <= 0.01) {
+        return NO;
+    }
+    if (depth > 0 && [node isKindOfClass:[UIVisualEffectView class]]) {
+        return NO;
+    }
+    if (requireOverlapWithOrigin && depth > 0 && originEffectView && originEffectView.superview) {
+        CGRect rectInSuper = [node convertRect:node.bounds toView:originEffectView.superview];
+        if (!CGRectIntersectsRect(originEffectView.frame, rectInSuper)) {
+            return NO;
+        }
+    }
+    if ([node isKindOfClass:[UILabel class]]) {
+        UILabel *label = (UILabel *)node;
+        if (label.text.length > 0 || label.attributedText.length > 0) {
+            if (pt_colorIsBrightLight(label.textColor, traits)) {
+                return YES;
+            }
+        }
+    } else if ([node isKindOfClass:[UIImageView class]]) {
+        UIImageView *iv = (UIImageView *)node;
+        if (iv.image) {
+            if (pt_colorIsBrightLight(iv.tintColor, traits)) {
+                return YES;
+            }
+            if (pt_imageHasBrightForegroundOnTransparent(iv.image)) {
+                return YES;
+            }
+        }
+    }
+    for (UIView *sub in node.subviews) {
+        if (sub == originEffectView) {
+            continue;
+        }
+        if (pt_subtreeHasBrightForeground(sub, traits, depth + 1, maxDepth, originEffectView, requireOverlapWithOrigin)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static BOOL pt_hasDarkOpaqueAncestorOrLightStatusBar(UIView *view, UITraitCollection *traits) {
+    UIView *ancestor = view.superview;
+    for (NSInteger depth = 0; ancestor && depth < 6; depth++, ancestor = ancestor.superview) {
+        if ([ancestor isKindOfClass:[UIWindow class]]) {
+            break;
+        }
+        id nextResp = ancestor.nextResponder;
+        if ([nextResp isKindOfClass:[UIViewController class]]) {
+            UIViewController *vc = (UIViewController *)nextResp;
+            if (vc.preferredStatusBarStyle == UIStatusBarStyleLightContent ||
+                vc.overrideUserInterfaceStyle == UIUserInterfaceStyleDark) {
+                return YES;
+            }
+        }
+        UIColor *bg = ancestor.backgroundColor;
+        if (!bg && ancestor.layer.backgroundColor != NULL) {
+            bg = [UIColor colorWithCGColor:ancestor.layer.backgroundColor];
+        }
+        CGFloat alpha = 0.0, luma = 0.0;
+        if (pt_resolveColorRGBA(bg, traits, NULL, NULL, NULL, &alpha, &luma)) {
+            if (alpha >= 0.65 && luma > 0.65) {
+                return NO;
+            }
+            if (alpha >= 0.55 && luma < 0.22) {
+                return YES;
+            }
+        }
+    }
+    return NO;
+}
+
+static void pt_resolveGlassEffectTint(id glassEffect,
+                                      UITraitCollection *traitCollection,
+                                      NSInteger *outGlassStyle,
+                                      BOOL *outUseDarkMaterial,
+                                      UIColor * __autoreleasing *outResolvedTint,
+                                      CGFloat *outAlpha,
+                                      CGFloat *outLuminance) {
     NSInteger glassStyle = 0; // 0 = Regular, 1 = Clear
     SEL styleSel = sel_registerName("style");
     if ([glassEffect respondsToSelector:styleSel]) {
@@ -3185,28 +3514,132 @@ static UIBlurEffect *pt_fallbackBlurEffectForGlassEffect(id glassEffect,
         resolved = [resolved resolvedColorWithTraitCollection:effectiveTraits];
     }
 
-    CGFloat r = 0.0, g = 0.0, b = 0.0, alpha = 0.0;
-    if (resolved) {
-        if (![resolved getRed:&r green:&g blue:&b alpha:&alpha]) {
-            CGFloat white = 0.0;
-            if ([resolved getWhite:&white alpha:&alpha]) {
-                r = white;
-                g = white;
-                b = white;
-            } else {
-                alpha = 0.0;
-            }
-        }
+    CGFloat alpha = 0.0, luminance = 0.0;
+    if (!pt_resolveColorRGBA(resolved, effectiveTraits, NULL, NULL, NULL, &alpha, &luminance)) {
+        alpha = 0.0;
+        luminance = 0.0;
     }
 
     BOOL isDarkMode = (effectiveTraits != nil && effectiveTraits.userInterfaceStyle == UIUserInterfaceStyleDark);
-    CGFloat luminance = 0.299 * r + 0.587 * g + 0.114 * b;
     BOOL useDarkMaterial = isDarkMode;
     if (!isDarkMode && alpha >= 0.55 && luminance < 0.35) {
         useDarkMaterial = YES;
     } else if (isDarkMode && alpha >= 0.55 && luminance > 0.65) {
         useDarkMaterial = NO;
     }
+
+    if (outGlassStyle) { *outGlassStyle = glassStyle; }
+    if (outUseDarkMaterial) { *outUseDarkMaterial = useDarkMaterial; }
+    if (outResolvedTint) { *outResolvedTint = resolved; }
+    if (outAlpha) { *outAlpha = alpha; }
+    if (outLuminance) { *outLuminance = luminance; }
+}
+
+static BOOL pt_powerSavingContextNeedsDarkSurface(UIVisualEffectView *view,
+                                                  id effect,
+                                                  BOOL isGlass,
+                                                  UITraitCollection *traits) {
+    UITraitCollection *effectiveTraits = traits ?: [UITraitCollection currentTraitCollection];
+    BOOL useDark = (effectiveTraits != nil && effectiveTraits.userInterfaceStyle == UIUserInterfaceStyleDark);
+    if (isGlass) {
+        BOOL glassDark = NO;
+        CGFloat alpha = 0.0, luminance = 0.0;
+        pt_resolveGlassEffectTint(effect, effectiveTraits, NULL, &glassDark, NULL, &alpha, &luminance);
+        useDark = glassDark || (alpha >= 0.12 && luminance < 0.25);
+    } else {
+        useDark = pt_isBlurEffectDark((UIBlurEffect *)effect, effectiveTraits);
+    }
+    if (useDark) {
+        return YES;
+    }
+    if (view && (view.window != nil || view.superview != nil)) {
+        if (pt_subtreeHasBrightForeground(view.contentView, effectiveTraits, 0, 5, nil, NO)) {
+            return YES;
+        }
+        if (view.superview && pt_subtreeHasBrightForeground(view.superview, effectiveTraits, 0, 3, view, YES)) {
+            return YES;
+        }
+        if (pt_hasDarkOpaqueAncestorOrLightStatusBar(view, effectiveTraits)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+static UIColor *pt_solidOpaqueColorForEffect(id effect,
+                                             BOOL isGlass,
+                                             UITraitCollection *traitCollection,
+                                             BOOL useDark) {
+    if (isGlass) {
+        UIColor *resolved = nil;
+        CGFloat alpha = 0.0;
+        pt_resolveGlassEffectTint(effect, traitCollection, NULL, NULL, &resolved, &alpha, NULL);
+        CGFloat baseR = useDark ? 0.15 : 0.94;
+        CGFloat baseG = useDark ? 0.15 : 0.94;
+        CGFloat baseB = useDark ? 0.17 : 0.96;
+        if (resolved && alpha > 0.05) {
+            CGFloat tr = 0.0, tg = 0.0, tb = 0.0, ta = 0.0;
+            if (pt_resolveColorRGBA(resolved, traitCollection, &tr, &tg, &tb, &ta, NULL)) {
+                CGFloat blend = MIN(alpha * 0.24, 0.22);
+                baseR = baseR * (1.0 - blend) + tr * blend;
+                baseG = baseG * (1.0 - blend) + tg * blend;
+                baseB = baseB * (1.0 - blend) + tb * blend;
+            }
+        }
+        return [UIColor colorWithRed:baseR green:baseG blue:baseB alpha:1.0];
+    }
+
+    return useDark
+        ? [UIColor colorWithRed:0.14 green:0.14 blue:0.16 alpha:1.0]
+        : [UIColor colorWithRed:0.95 green:0.95 blue:0.97 alpha:1.0];
+}
+
+static void pt_clearGlassOverlayIfNeeded(UIVisualEffectView *view) {
+    if (objc_getAssociatedObject(view, kPTAppliedGlassOverlayKey) != nil) {
+        view.contentView.backgroundColor = nil;
+        objc_setAssociatedObject(view, kPTAppliedGlassOverlayKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static void pt_applyPowerSavingSolidBackground(UIVisualEffectView *view,
+                                               id effect,
+                                               BOOL isGlass,
+                                               UITraitCollection *traitCollection) {
+    pt_clearGlassOverlayIfNeeded(view);
+    if (objc_getAssociatedObject(view, kPTAppliedPowerSaveSolidBgKey) == nil) {
+        objc_setAssociatedObject(view, kPTAppliedPowerSaveOrigOpaqueKey, @(view.opaque), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, kPTAppliedPowerSaveSolidBgKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    BOOL useDark = pt_powerSavingContextNeedsDarkSurface(view, effect, isGlass, traitCollection);
+    NSNumber *prevDark = objc_getAssociatedObject(view, kPTAppliedPowerSaveIsDarkKey);
+    if (prevDark != nil && prevDark.boolValue == useDark && view.backgroundColor != nil && view.opaque) {
+        return;
+    }
+    objc_setAssociatedObject(view, kPTAppliedPowerSaveIsDarkKey, @(useDark), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    view.backgroundColor = pt_solidOpaqueColorForEffect(effect, isGlass, traitCollection, useDark);
+    view.opaque = YES;
+}
+
+static void pt_clearPowerSavingSolidBackgroundIfNeeded(UIVisualEffectView *view) {
+    if (objc_getAssociatedObject(view, kPTAppliedPowerSaveSolidBgKey) != nil) {
+        NSNumber *origOpaque = objc_getAssociatedObject(view, kPTAppliedPowerSaveOrigOpaqueKey);
+        view.backgroundColor = nil;
+        view.opaque = origOpaque ? origOpaque.boolValue : NO;
+        objc_setAssociatedObject(view, kPTAppliedPowerSaveSolidBgKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, kPTAppliedPowerSaveOrigOpaqueKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(view, kPTAppliedPowerSaveIsDarkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+}
+
+static UIBlurEffect *pt_fallbackBlurEffectForGlassEffect(id glassEffect,
+                                                          UITraitCollection *traitCollection,
+                                                          UIColor * __autoreleasing *outTintOverlay) {
+    NSInteger glassStyle = 0;
+    BOOL useDarkMaterial = NO;
+    UIColor *resolved = nil;
+    CGFloat alpha = 0.0;
+    CGFloat luminance = 0.0;
+    pt_resolveGlassEffectTint(glassEffect, traitCollection, &glassStyle, &useDarkMaterial, &resolved, &alpha, &luminance);
 
     UIBlurEffectStyle style;
     UIColor *overlay = nil;
@@ -3361,7 +3794,10 @@ static void pt_updateGlassGeometryAndRim(UIVisualEffectView *view) {
     if (bl > 0.5) { mask |= kCALayerMinXMaxYCorner; }
     if (br > 0.5) { mask |= kCALayerMaxXMaxYCorner; }
 
-    BOOL isDark = (view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
+    NSNumber *powerSaveDark = (pt_powerSavingMaterialEnabled && objc_getAssociatedObject(view, kPTAppliedPowerSaveSolidBgKey) != nil)
+        ? objc_getAssociatedObject(view, kPTAppliedPowerSaveIsDarkKey)
+        : nil;
+    BOOL isDark = powerSaveDark ? powerSaveDark.boolValue : (view.traitCollection.userInterfaceStyle == UIUserInterfaceStyleDark);
     NSValue *prevVal = objc_getAssociatedObject(view, kPTAppliedGlassStateKey);
     if (prevVal) {
         PTGlassLayoutState prev;
@@ -3401,11 +3837,31 @@ static void pt_updateGlassGeometryAndRim(UIVisualEffectView *view) {
 
 static id pt_visualEffectInitWithEffect(UIVisualEffectView *self, SEL _cmd, id effect) {
     BOOL isGlass = (pt_glassEffectClass != Nil && effect != nil && [effect isKindOfClass:pt_glassEffectClass]);
-    if (!isGlass) {
+    BOOL isBlur = (!isGlass && effect != nil && [effect isKindOfClass:[UIBlurEffect class]] && ![effect isKindOfClass:[UIVibrancyEffect class]]);
+    if (!isGlass && (!pt_powerSavingMaterialEnabled || !isBlur)) {
         return pt_origVisualEffectInitWithEffect ? pt_origVisualEffectInitWithEffect(self, _cmd, effect) : nil;
     }
-    UIColor *overlay = nil;
     UITraitCollection *currentTraits = [UITraitCollection currentTraitCollection];
+    if (pt_powerSavingMaterialEnabled) {
+        id instance = pt_origVisualEffectInitWithEffect ? pt_origVisualEffectInitWithEffect(self, _cmd, nil) : nil;
+        if (instance) {
+            UIVisualEffectView *effectView = (UIVisualEffectView *)instance;
+            UITraitCollection *effectiveTraits = effectView.traitCollection ?: currentTraits;
+            if (isGlass) {
+                objc_setAssociatedObject(effectView, kPTAppliedGlassEffectKey, effect, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(effectView, kPTAppliedPowerSaveBlurEffectKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                pt_applyPowerSavingSolidBackground(effectView, effect, YES, effectiveTraits);
+                pt_updateGlassGeometryAndRim(effectView);
+            } else {
+                objc_setAssociatedObject(effectView, kPTAppliedPowerSaveBlurEffectKey, effect, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(effectView, kPTAppliedGlassEffectKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                pt_applyPowerSavingSolidBackground(effectView, effect, NO, effectiveTraits);
+            }
+        }
+        return instance;
+    }
+
+    UIColor *overlay = nil;
     UIBlurEffect *fallback = pt_fallbackBlurEffectForGlassEffect(effect, currentTraits, &overlay);
     id instance = pt_origVisualEffectInitWithEffect ? pt_origVisualEffectInitWithEffect(self, _cmd, fallback) : nil;
     if (instance) {
@@ -3428,18 +3884,40 @@ static id pt_visualEffectInitWithEffect(UIVisualEffectView *self, SEL _cmd, id e
 
 static void pt_visualEffectSetEffect(UIVisualEffectView *self, SEL _cmd, id effect) {
     BOOL isGlass = (pt_glassEffectClass != Nil && effect != nil && [effect isKindOfClass:pt_glassEffectClass]);
-    if (!isGlass) {
+    BOOL isBlur = (!isGlass && effect != nil && [effect isKindOfClass:[UIBlurEffect class]] && ![effect isKindOfClass:[UIVibrancyEffect class]]);
+    if (!isGlass && (!pt_powerSavingMaterialEnabled || !isBlur)) {
         objc_setAssociatedObject(self, kPTAppliedGlassEffectKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (objc_getAssociatedObject(self, kPTAppliedGlassOverlayKey) != nil) {
-            self.contentView.backgroundColor = nil;
-            objc_setAssociatedObject(self, kPTAppliedGlassOverlayKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        }
+        objc_setAssociatedObject(self, kPTAppliedPowerSaveBlurEffectKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        pt_clearGlassOverlayIfNeeded(self);
+        pt_clearPowerSavingSolidBackgroundIfNeeded(self);
         pt_removeGlassDecorationLayers(self);
         if (pt_origVisualEffectSetEffect) {
             pt_origVisualEffectSetEffect(self, _cmd, effect);
         }
         return;
     }
+    if (pt_powerSavingMaterialEnabled) {
+        objc_setAssociatedObject(self, kPTAppliedPowerSaveIsDarkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (isGlass) {
+            objc_setAssociatedObject(self, kPTAppliedGlassEffectKey, effect, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            objc_setAssociatedObject(self, kPTAppliedPowerSaveBlurEffectKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (pt_origVisualEffectSetEffect) {
+                pt_origVisualEffectSetEffect(self, _cmd, nil);
+            }
+            pt_applyPowerSavingSolidBackground(self, effect, YES, self.traitCollection);
+            pt_updateGlassGeometryAndRim(self);
+        } else {
+            objc_setAssociatedObject(self, kPTAppliedGlassEffectKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            pt_removeGlassDecorationLayers(self);
+            objc_setAssociatedObject(self, kPTAppliedPowerSaveBlurEffectKey, effect, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (pt_origVisualEffectSetEffect) {
+                pt_origVisualEffectSetEffect(self, _cmd, nil);
+            }
+            pt_applyPowerSavingSolidBackground(self, effect, NO, self.traitCollection);
+        }
+        return;
+    }
+
     objc_setAssociatedObject(self, kPTAppliedGlassEffectKey, effect, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     UIColor *overlay = nil;
     UIBlurEffect *fallback = pt_fallbackBlurEffectForGlassEffect(effect, self.traitCollection, &overlay);
@@ -3457,13 +3935,25 @@ static void pt_visualEffectTraitCollectionDidChange(UIVisualEffectView *self,
         pt_origVisualEffectTraitCollectionDidChange(self, _cmd, previousTraitCollection);
     }
     id glassEffect = objc_getAssociatedObject(self, kPTAppliedGlassEffectKey);
-    if (!glassEffect) {
+    id blurEffect = objc_getAssociatedObject(self, kPTAppliedPowerSaveBlurEffectKey);
+    if (!glassEffect && !blurEffect) {
         return;
     }
     if (previousTraitCollection &&
         previousTraitCollection.userInterfaceStyle == self.traitCollection.userInterfaceStyle) {
         return;
     }
+    if (pt_powerSavingMaterialEnabled) {
+        objc_setAssociatedObject(self, kPTAppliedPowerSaveIsDarkKey, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (glassEffect) {
+            pt_applyPowerSavingSolidBackground(self, glassEffect, YES, self.traitCollection);
+            pt_updateGlassGeometryAndRim(self);
+        } else if (blurEffect) {
+            pt_applyPowerSavingSolidBackground(self, blurEffect, NO, self.traitCollection);
+        }
+        return;
+    }
+
     UIColor *overlay = nil;
     UIBlurEffect *fallback = pt_fallbackBlurEffectForGlassEffect(glassEffect, self.traitCollection, &overlay);
     if (pt_origVisualEffectSetEffect) {
@@ -3473,13 +3963,38 @@ static void pt_visualEffectTraitCollectionDidChange(UIVisualEffectView *self,
     pt_updateGlassGeometryAndRim(self);
 }
 
+static void pt_refreshPowerSavingVisualEffectAppearanceIfNeeded(UIVisualEffectView *view) {
+    if (!pt_powerSavingMaterialEnabled || !view || (!view.window && !view.superview)) {
+        return;
+    }
+    if (objc_getAssociatedObject(view, kPTAppliedPowerSaveSolidBgKey) == nil) {
+        return;
+    }
+    id glassEffect = objc_getAssociatedObject(view, kPTAppliedGlassEffectKey);
+    id blurEffect = objc_getAssociatedObject(view, kPTAppliedPowerSaveBlurEffectKey);
+    if (glassEffect) {
+        pt_applyPowerSavingSolidBackground(view, glassEffect, YES, view.traitCollection);
+        pt_updateGlassGeometryAndRim(view);
+    } else if (blurEffect) {
+        pt_applyPowerSavingSolidBackground(view, blurEffect, NO, view.traitCollection);
+    }
+}
+
 static void pt_visualEffectLayoutSubviews(UIVisualEffectView *self, SEL _cmd) {
     if (pt_origVisualEffectLayoutSubviews) {
         pt_origVisualEffectLayoutSubviews(self, _cmd);
     }
+    pt_refreshPowerSavingVisualEffectAppearanceIfNeeded(self);
     if (objc_getAssociatedObject(self, kPTAppliedGlassEffectKey) != nil) {
         pt_updateGlassGeometryAndRim(self);
     }
+}
+
+static void pt_visualEffectDidMoveToWindow(UIVisualEffectView *self, SEL _cmd) {
+    if (pt_origVisualEffectDidMoveToWindow) {
+        pt_origVisualEffectDidMoveToWindow(self, _cmd);
+    }
+    pt_refreshPowerSavingVisualEffectAppearanceIfNeeded(self);
 }
 
 static void pt_visualEffectSetCornerConfiguration(UIVisualEffectView *self, SEL _cmd, id cornerConfiguration) {
@@ -3496,13 +4011,15 @@ static void pt_installGlassEffectCompatibilityGuard(void) {
         return;
     }
     pt_glassEffectGuardInstalled = YES;
+    pt_powerSavingMaterialEnabled = pt_isPowerSavingModeEnabled();
 
     // On Mac Catalyst, UIGlassEffect views can fail to create backdrop sublayers and fall back to
     // an opaque white fill. Map UIGlassEffect to native UIBlurEffect materials preserving tint polarity,
     // continuous corner configuration radii, and a lightweight specular rim/sheen.
+    // When Power Saving Mode is active, downgrade both UIGlassEffect and UIBlurEffect to opaque solid colors.
     pt_glassEffectClass = NSClassFromString(@"UIGlassEffect");
     Class effectViewCls = objc_getClass("UIVisualEffectView");
-    if (!pt_glassEffectClass || !effectViewCls) {
+    if (!effectViewCls || (!pt_glassEffectClass && !pt_powerSavingMaterialEnabled)) {
         return;
     }
 
@@ -3543,6 +4060,16 @@ static void pt_installGlassEffectCompatibilityGuard(void) {
             pt_origVisualEffectLayoutSubviews = (void (*)(id, SEL))origImp;
             class_replaceMethod(effectViewCls, @selector(layoutSubviews),
                                 (IMP)pt_visualEffectLayoutSubviews, method_getTypeEncoding(layoutM));
+        }
+    }
+
+    Method moveWinM = class_getInstanceMethod(effectViewCls, @selector(didMoveToWindow));
+    if (moveWinM) {
+        IMP origImp = method_getImplementation(moveWinM);
+        if (origImp != (IMP)pt_visualEffectDidMoveToWindow) {
+            pt_origVisualEffectDidMoveToWindow = (void (*)(id, SEL))origImp;
+            class_replaceMethod(effectViewCls, @selector(didMoveToWindow),
+                                (IMP)pt_visualEffectDidMoveToWindow, method_getTypeEncoding(moveWinM));
         }
     }
 
@@ -3929,6 +4456,9 @@ static const char * const pt_csjFailSels[] = {
 };
 static const char * const pt_csjVoid0[] = { "loadAdData" };
 static const char * const pt_csjVoid1[] = { "showSplashViewInRootViewController:" };
+static const char * const pt_gmVoid1[] = {
+    "showSplashViewInRootViewController:", "showCardViewInRootViewController:"
+};
 
 static const char * const pt_abuFailSels[] = {
     "splashAdLoadFail:error:", "splashAdDidShowFailed:error:", "splashAdRenderFail:error:"
@@ -3999,11 +4529,20 @@ static const char * const pt_jadFailSels[] = {
 static const char * const pt_jadVoid0[] = { "loadAdData", "preloadAdData" };
 
 static const char * const pt_windFailSels[] = {
-    "onSplashAdLoadFail:error:", "splashAdDidFailToLoad:error:"
+    "onSplashAdLoadFail:error:", "splashAdDidFailToLoad:error:", "onSplashAdFailToPresent:withError:"
 };
-static const char * const pt_windBoolNo[] = { "isAdReady" };
-static const char * const pt_windVoid0[] = { "loadAdData", "loadAndShow" };
-static const char * const pt_windVoid1[] = { "loadAdAndShowSplashAdWithWindow:" };
+static const char * const pt_windBoolNo[] = { "isAdReady", "ready", "isAdValid" };
+static const char * const pt_windVoid0[] = {
+    "loadAdData", "loadAndShow", "loadAd", "loadAdAndShow", "loadWaterfall"
+};
+static const char * const pt_windVoid1[] = {
+    "loadAdAndShowSplashAdWithWindow:", "loadAdAndShowWithBottomView:",
+    "showAdInWindow:", "loadAdDataWithBidToken:", "loadAdDataWithExtra:"
+};
+static const char * const pt_windVoid2[] = {
+    "loadAdAndShowWithTitle:description:", "showAdInWindow:withBottomView:"
+};
+static const char * const pt_windVoid3[] = { "showAdInWindow:title:desc:" };
 
 static const char * const pt_abusFailSels[] = {
     "splashAd:didLoadFailWithError:", "splashAdLoadFail:error:", "splashAd:didFailWithError:", "splashAdDidShowFailed:error:"
@@ -4080,6 +4619,39 @@ static const char * const pt_miguBoolNo[] = { "shouldRequestServer", "isAdMateri
 static const char * const pt_miguVoid0[] = { "showMiguLaunchAd", "startAdProcess" };
 static const char * const pt_miguVoid1[] = { "showThirdPlatformLaunchAd:" };
 
+static const char * const pt_asnpFailSels[] = {
+    "asnpSplashAdLoadFail:error:", "asnpSplashAdShowFail:error:",
+    "asnpSplashAdRenderFail:error:", "asnpSplashAdDidClose:"
+};
+static const char * const pt_asnpBoolNo[] = { "checkAdAvailable" };
+static const char * const pt_asnpBoolNo1Fail[] = { "prepareShowInWindow:" };
+static const char * const pt_asnpVoid0[] = { "loadSplashAd" };
+static const char * const pt_asnpVoid1[] = { "showSplashViewInWindow:" };
+static const char * const pt_asnpVoid2[] = { "showSplashViewInWindow:bottomView:" };
+
+static const char * const pt_adscopeFailSels[] = {
+    "adnSplashAdLoadFail:error:", "adnSplashAdRenderFail:error:", "adnSplashAdDidClose:"
+};
+static const char * const pt_adscopeBoolNo[] = { "checkADNAdAvailable" };
+static const char * const pt_adscopeVoid0[] = { "loadAd" };
+static const char * const pt_adscopeVoid1[] = {
+    "loadAdWithResponse:", "showSplashViewInRootViewController:", "showZoomOutViewInRootViewController:"
+};
+static const char * const pt_adscopeVoid2[] = { "showSplashViewInRootViewController:bottomView:" };
+
+static const char * const pt_ujuFailSels[] = {
+    "onMgcSplashAdError:error:", "onMgcSplashAdTimeOut:",
+    "onMgcSplashAdDidFinish:", "onMgcSplashAdHidden:"
+};
+static const char * const pt_ujuBoolNo[] = { "isReady" };
+static const char * const pt_ujuVoid0[] = { "loadAd", "show" };
+
+static const char * const pt_mppFailSels[] = {
+    "mpp_splashAd:didFailWithError:", "mpp_splashAdDidClose:"
+};
+static const char * const pt_mppBoolNo[] = { "isPreloadAd" };
+static const char * const pt_mppVoid0[] = { "loadAd" };
+
 #define PT_COUNT(arr) (sizeof(arr) / sizeof((arr)[0]))
 
 static PTSplashSDKSpec pt_splashSpecs[] = {
@@ -4087,6 +4659,8 @@ static PTSplashSDKSpec pt_splashSpecs[] = {
       pt_csjVoid0, PT_COUNT(pt_csjVoid0), pt_csjVoid1, PT_COUNT(pt_csjVoid1), NULL, 0, NULL, 0, NULL, 0 },
     { "BUSplashAd", Nil, "BUAdError", "CSJAdError", pt_csjFailSels, PT_COUNT(pt_csjFailSels), NULL, 0, NULL, 0, NULL, 0,
       pt_csjVoid0, PT_COUNT(pt_csjVoid0), pt_csjVoid1, PT_COUNT(pt_csjVoid1), NULL, 0, NULL, 0, NULL, 0 },
+    { "GMSplashAd", Nil, "BUAdError", "CSJAdError", pt_csjFailSels, PT_COUNT(pt_csjFailSels), NULL, 0, NULL, 0, NULL, 0,
+      pt_csjVoid0, PT_COUNT(pt_csjVoid0), pt_gmVoid1, PT_COUNT(pt_gmVoid1), NULL, 0, NULL, 0, NULL, 0 },
     { "BUSplashAdView", Nil, "BUAdError", "CSJAdError", pt_buViewFailSels, PT_COUNT(pt_buViewFailSels), NULL, 0, NULL, 0, NULL, 0,
       pt_csjVoid0, PT_COUNT(pt_csjVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
     { "BUNativeExpressSplashView", Nil, "BUAdError", "CSJAdError", pt_buExpressFailSels, PT_COUNT(pt_buExpressFailSels), NULL, 0, NULL, 0, NULL, 0,
@@ -4114,10 +4688,16 @@ static PTSplashSDKSpec pt_splashSpecs[] = {
       pt_jadVoid0, PT_COUNT(pt_jadVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
     { "WindSplashAd", Nil, NULL, NULL, pt_windFailSels, PT_COUNT(pt_windFailSels), pt_windBoolNo, PT_COUNT(pt_windBoolNo), NULL, 0,
       NULL, 0, pt_windVoid0, PT_COUNT(pt_windVoid0), pt_windVoid1, PT_COUNT(pt_windVoid1),
-      NULL, 0, NULL, 0, NULL, 0 },
+      NULL, 0, pt_windVoid2, PT_COUNT(pt_windVoid2), pt_windVoid3, PT_COUNT(pt_windVoid3) },
     { "WindMillSplashAd", Nil, NULL, NULL, pt_windFailSels, PT_COUNT(pt_windFailSels), pt_windBoolNo, PT_COUNT(pt_windBoolNo), NULL, 0,
       NULL, 0, pt_windVoid0, PT_COUNT(pt_windVoid0), pt_windVoid1, PT_COUNT(pt_windVoid1),
-      NULL, 0, NULL, 0, NULL, 0 },
+      NULL, 0, pt_windVoid2, PT_COUNT(pt_windVoid2), pt_windVoid3, PT_COUNT(pt_windVoid3) },
+    { "_TtC11WindMillSDK16WindMillSplashAd", Nil, NULL, NULL, pt_windFailSels, PT_COUNT(pt_windFailSels), pt_windBoolNo, PT_COUNT(pt_windBoolNo), NULL, 0,
+      NULL, 0, pt_windVoid0, PT_COUNT(pt_windVoid0), pt_windVoid1, PT_COUNT(pt_windVoid1),
+      NULL, 0, pt_windVoid2, PT_COUNT(pt_windVoid2), pt_windVoid3, PT_COUNT(pt_windVoid3) },
+    { "WindSplashAdManager", Nil, NULL, NULL, pt_windFailSels, PT_COUNT(pt_windFailSels), pt_windBoolNo, PT_COUNT(pt_windBoolNo), NULL, 0,
+      NULL, 0, pt_windVoid0, PT_COUNT(pt_windVoid0), pt_windVoid1, PT_COUNT(pt_windVoid1),
+      NULL, 0, pt_windVoid2, PT_COUNT(pt_windVoid2), pt_windVoid3, PT_COUNT(pt_windVoid3) },
     { "AMPSSplashAd", Nil, NULL, NULL, pt_ampsFailSels, PT_COUNT(pt_ampsFailSels), pt_ampsBoolNo, PT_COUNT(pt_ampsBoolNo), NULL, 0,
       NULL, 0, pt_ampsVoid0, PT_COUNT(pt_ampsVoid0), pt_ampsVoid1, PT_COUNT(pt_ampsVoid1), NULL, 0, NULL, 0, NULL, 0 },
     { "AdProfSplashAd", Nil, NULL, NULL, pt_adprofFailSels, PT_COUNT(pt_adprofFailSels), NULL, 0, NULL, 0,
@@ -4148,6 +4728,20 @@ static PTSplashSDKSpec pt_splashSpecs[] = {
     { "MGPolymerAdSDKFastLaunchAdRequestSerialization", Nil, NULL, NULL, NULL, 0, pt_miguBoolNo, PT_COUNT(pt_miguBoolNo), NULL, 0,
       NULL, 0, pt_miguVoid0, PT_COUNT(pt_miguVoid0), pt_miguVoid1, PT_COUNT(pt_miguVoid1),
       NULL, 0, NULL, 0, NULL, 0 },
+    { "ASNPSplashAd", Nil, "ASNPAdSDKError", NULL, pt_asnpFailSels, PT_COUNT(pt_asnpFailSels),
+      pt_asnpBoolNo, PT_COUNT(pt_asnpBoolNo), pt_asnpBoolNo1Fail, PT_COUNT(pt_asnpBoolNo1Fail), NULL, 0,
+      pt_asnpVoid0, PT_COUNT(pt_asnpVoid0), pt_asnpVoid1, PT_COUNT(pt_asnpVoid1),
+      NULL, 0, pt_asnpVoid2, PT_COUNT(pt_asnpVoid2), NULL, 0 },
+    { "AdScopeADNSplashAd", Nil, NULL, NULL, pt_adscopeFailSels, PT_COUNT(pt_adscopeFailSels),
+      pt_adscopeBoolNo, PT_COUNT(pt_adscopeBoolNo), NULL, 0, NULL, 0,
+      pt_adscopeVoid0, PT_COUNT(pt_adscopeVoid0), pt_adscopeVoid1, PT_COUNT(pt_adscopeVoid1),
+      NULL, 0, pt_adscopeVoid2, PT_COUNT(pt_adscopeVoid2), NULL, 0 },
+    { "UjuMagicSplashAd", Nil, NULL, NULL, pt_ujuFailSels, PT_COUNT(pt_ujuFailSels),
+      pt_ujuBoolNo, PT_COUNT(pt_ujuBoolNo), NULL, 0, NULL, 0,
+      pt_ujuVoid0, PT_COUNT(pt_ujuVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
+    { "MPPSplashAd", Nil, NULL, NULL, pt_mppFailSels, PT_COUNT(pt_mppFailSels),
+      pt_mppBoolNo, PT_COUNT(pt_mppBoolNo), NULL, 0, NULL, 0,
+      pt_mppVoid0, PT_COUNT(pt_mppVoid0), NULL, 0, NULL, 0, NULL, 0, NULL, 0 },
 };
 
 static NSError *pt_splashNoFillErrorForSpec(const PTSplashSDKSpec *spec) {
@@ -4324,11 +4918,62 @@ static BOOL pt_splashBoolNO(id self, SEL _cmd) {
     return NO;
 }
 
+static BOOL pt_splashBoolYES(id self, SEL _cmd) {
+    (void)self;
+    (void)_cmd;
+    return YES;
+}
+
 static BOOL pt_splashBoolNo1(id self, SEL _cmd, id a1) {
     (void)self;
     (void)_cmd;
     (void)a1;
     return NO;
+}
+
+static BOOL pt_splashBoolNo1Bool(id self, SEL _cmd, BOOL a1) {
+    (void)self;
+    (void)_cmd;
+    (void)a1;
+    return NO;
+}
+
+static BOOL pt_splashBoolYes1Bool(id self, SEL _cmd, BOOL a1) {
+    (void)self;
+    (void)_cmd;
+    (void)a1;
+    return YES;
+}
+
+static BOOL pt_splashBoolYes1UInt(id self, SEL _cmd, NSUInteger a1) {
+    (void)self;
+    (void)_cmd;
+    (void)a1;
+    return YES;
+}
+
+static BOOL pt_splashBoolNo2Bool(id self, SEL _cmd, BOOL a1, BOOL a2) {
+    (void)self;
+    (void)_cmd;
+    (void)a1;
+    (void)a2;
+    return NO;
+}
+
+static BOOL pt_splashBoolNo2Ptr(id self, SEL _cmd, void *p1, void *p2) {
+    (void)self;
+    (void)_cmd;
+    (void)p1;
+    (void)p2;
+    return NO;
+}
+
+static id pt_splashReturnNil2(id self, SEL _cmd, id a1, id a2) {
+    (void)self;
+    (void)_cmd;
+    (void)a1;
+    (void)a2;
+    return nil;
 }
 
 static BOOL pt_splashBoolNo1AndFail(id self, SEL _cmd, id a1) {
@@ -4382,6 +5027,18 @@ static void pt_splashLoadWindowViewTokenTimeout(id self, SEL _cmd, id w, id v, i
     (void)tok;
     (void)t;
     pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashLoadIdInt(id self, SEL _cmd, id a1, NSInteger a2) {
+    (void)_cmd;
+    (void)a1;
+    (void)a2;
+    pt_splashDispatchSpecFailure(self);
+}
+
+static void pt_splashNoop0(id self, SEL _cmd) {
+    (void)self;
+    (void)_cmd;
 }
 
 static void pt_splashNoop1(id self, SEL _cmd, id a1) {
@@ -4479,7 +5136,550 @@ static BOOL pt_atSplashReadyWithoutLog2(id self, SEL _cmd, id placementID, BOOL 
     return NO;
 }
 
-static BOOL pt_replaceSplashMethod(Class cls, const char *selName, unsigned int expectedArgs, IMP replacement, BOOL isClassMethod) {
+static void pt_notifyAnyThinkShowFail(id delegate, id placementID) {
+    if (!delegate) {
+        return;
+    }
+    __strong id strongDelegate = delegate;
+    id pidCopy = [placementID respondsToSelector:@selector(copyWithZone:)] ? [placementID copy] : placementID;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        SEL failSel = @selector(splashDidShowFailedForPlacementID:error:extra:);
+        SEL closeSel = @selector(splashDidCloseForPlacementID:extra:);
+        if ([strongDelegate respondsToSelector:failSel]) {
+            ((void (*)(id, SEL, id, id, id))objc_msgSend)(strongDelegate, failSel, pidCopy, pt_splashNoFillError(), @{});
+        } else if ([strongDelegate respondsToSelector:closeSel]) {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(strongDelegate, closeSel, pidCopy, @{});
+        }
+    });
+}
+
+static void pt_atShowSplash6(id self, SEL _cmd, id placementID, id a2, id a3, id delegate) {
+    (void)self;
+    (void)_cmd;
+    (void)a2;
+    (void)a3;
+    pt_notifyAnyThinkShowFail(delegate, placementID);
+}
+
+static void pt_atShowSplash7(id self, SEL _cmd, id placementID, id a2, id a3, id a4, id delegate) {
+    (void)self;
+    (void)_cmd;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    pt_notifyAnyThinkShowFail(delegate, placementID);
+}
+
+static void pt_atShowSplash8(id self, SEL _cmd, id placementID, id a2, id a3, id a4, id a5, id delegate) {
+    (void)self;
+    (void)_cmd;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    pt_notifyAnyThinkShowFail(delegate, placementID);
+}
+
+static void pt_atShowSplash9(id self, SEL _cmd, id placementID, id a2, id a3, id a4, id a5, id delegate, id a7) {
+    (void)self;
+    (void)_cmd;
+    (void)a2;
+    (void)a3;
+    (void)a4;
+    (void)a5;
+    (void)a7;
+    pt_notifyAnyThinkShowFail(delegate, placementID);
+}
+
+static id pt_maSplashError(void) {
+    Class maErrCls = objc_getClass("MAError");
+    if (maErrCls) {
+        if ([maErrCls isSubclassOfClass:[NSError class]]) {
+            return [maErrCls errorWithDomain:@"com.playtools.splashblock"
+                                        code:204
+                                    userInfo:@{NSLocalizedDescriptionKey: @"No splash ad available"}];
+        }
+        SEL clsSel2 = sel_registerName("errorWithCode:message:");
+        Method m = class_getClassMethod(maErrCls, clsSel2);
+        if (m && method_getNumberOfArguments(m) == 4) {
+            char arg2[16] = {0}, arg3[16] = {0};
+            method_getArgumentType(m, 2, arg2, sizeof(arg2));
+            method_getArgumentType(m, 3, arg3, sizeof(arg3));
+            if ((arg2[0] == 'q' || arg2[0] == 'Q' || arg2[0] == 'i' || arg2[0] == 'I') && arg3[0] == '@') {
+                id err = ((id (*)(id, SEL, NSInteger, id))objc_msgSend)(maErrCls, clsSel2, (NSInteger)204, @"No splash ad available");
+                if (err) {
+                    return err;
+                }
+            }
+        }
+        SEL clsSel1 = sel_registerName("errorWithCode:");
+        m = class_getClassMethod(maErrCls, clsSel1);
+        if (m && method_getNumberOfArguments(m) == 3) {
+            char arg2[16] = {0};
+            method_getArgumentType(m, 2, arg2, sizeof(arg2));
+            if (arg2[0] == 'q' || arg2[0] == 'Q' || arg2[0] == 'i' || arg2[0] == 'I') {
+                id err = ((id (*)(id, SEL, NSInteger))objc_msgSend)(maErrCls, clsSel1, (NSInteger)204);
+                if (err) {
+                    return err;
+                }
+            }
+        }
+    }
+    return pt_splashNoFillError();
+}
+
+static id pt_maAdUnitIdentifier(id ad) {
+    if (!ad) {
+        return nil;
+    }
+    SEL adUnitSel = sel_registerName("adUnitIdentifier");
+    if (![ad respondsToSelector:adUnitSel]) {
+        return nil;
+    }
+    Method m = class_getInstanceMethod(object_getClass(ad), adUnitSel);
+    if (!m || method_getNumberOfArguments(m) != 2) {
+        return nil;
+    }
+    char retType[16] = {0};
+    method_getReturnType(m, retType, sizeof(retType));
+    if (retType[0] != '@') {
+        return nil;
+    }
+    return ((id (*)(id, SEL))objc_msgSend)(ad, adUnitSel);
+}
+
+static void pt_maLoadAd(id self, SEL _cmd) {
+    (void)_cmd;
+    if (!self) {
+        return;
+    }
+    __strong id strongAd = self;
+    __weak id weakInitialDelegate = pt_splashDelegateForObject(strongAd);
+    id adUnitID = pt_maAdUnitIdentifier(strongAd);
+    id adUnitCopy = [adUnitID respondsToSelector:@selector(copyWithZone:)] ? [adUnitID copy] : adUnitID;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = pt_splashDelegateForObject(strongAd) ?: weakInitialDelegate;
+        if (!delegate) {
+            return;
+        }
+        SEL failSel = @selector(didFailToLoadAdForAdUnitIdentifier:withError:);
+        SEL failCodeSel = @selector(didFailToLoadAdForAdUnitIdentifier:withErrorCode:);
+        @try {
+            if ([delegate respondsToSelector:failSel]) {
+                ((void (*)(id, SEL, id, id))objc_msgSend)(delegate, failSel, adUnitCopy, pt_maSplashError());
+            } else if ([delegate respondsToSelector:failCodeSel]) {
+                Method m = class_getInstanceMethod(object_getClass(delegate), failCodeSel);
+                if (m && method_getNumberOfArguments(m) == 4) {
+                    char argType[16] = {0};
+                    method_getArgumentType(m, 3, argType, sizeof(argType));
+                    if (argType[0] == 'i' || argType[0] == 'I' || argType[0] == 'q' || argType[0] == 'Q') {
+                        ((void (*)(id, SEL, id, NSInteger))objc_msgSend)(delegate, failCodeSel, adUnitCopy, (NSInteger)-1);
+                    }
+                }
+            }
+        } @catch (NSException *ex) {
+            NSLog(@"[PlayTools] MAAppOpenAd load fail callback exception: %@", ex);
+        }
+    });
+}
+
+static void pt_notifyMADisplayFail(id ad) {
+    if (!ad) {
+        return;
+    }
+    __strong id strongAd = ad;
+    __weak id weakInitialDelegate = pt_splashDelegateForObject(strongAd);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = pt_splashDelegateForObject(strongAd) ?: weakInitialDelegate;
+        if (!delegate) {
+            return;
+        }
+        SEL failSel = @selector(didFailToDisplayAd:withError:);
+        SEL hideSel = @selector(didHideAd:);
+        @try {
+            if ([delegate respondsToSelector:failSel]) {
+                ((void (*)(id, SEL, id, id))objc_msgSend)(delegate, failSel, strongAd, pt_maSplashError());
+            } else if ([delegate respondsToSelector:hideSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(delegate, hideSel, strongAd);
+            }
+        } @catch (NSException *ex) {
+            NSLog(@"[PlayTools] MAAppOpenAd display fail callback exception: %@", ex);
+        }
+    });
+}
+
+static void pt_maShowAd0(id self, SEL _cmd) {
+    (void)_cmd;
+    pt_notifyMADisplayFail(self);
+}
+
+static void pt_maShowAd1(id self, SEL _cmd, id placement) {
+    (void)_cmd;
+    (void)placement;
+    pt_notifyMADisplayFail(self);
+}
+
+static void pt_maShowAd2(id self, SEL _cmd, id placement, id customData) {
+    (void)_cmd;
+    (void)placement;
+    (void)customData;
+    pt_notifyMADisplayFail(self);
+}
+
+static void pt_txInvokeSplashBlockFail(void (^block)(id _Nullable, NSError * _Nullable)) {
+    if (!block) {
+        return;
+    }
+    void (^copied)(id _Nullable, NSError * _Nullable) = [block copy];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        copied(nil, pt_splashNoFillError());
+    });
+}
+
+static void pt_txSplashBlock1(id self, SEL _cmd, void (^block)(id _Nullable, NSError * _Nullable)) {
+    (void)self;
+    (void)_cmd;
+    pt_txInvokeSplashBlockFail(block);
+}
+
+static void pt_txSplashBlockRenderMode(id self, SEL _cmd, void (^block)(id _Nullable, NSError * _Nullable), NSUInteger renderMode) {
+    (void)self;
+    (void)_cmd;
+    (void)renderMode;
+    pt_txInvokeSplashBlockFail(block);
+}
+
+static id pt_miguBootAdError(void) {
+    Class codeCls = objc_getClass("MIGUAdErrorCode");
+    if (codeCls) {
+        SEL genSel = sel_registerName("generateErrorDescriptionByCode:");
+        if ([codeCls respondsToSelector:genSel]) {
+            Method m = class_getClassMethod(codeCls, genSel);
+            if (m && method_getNumberOfArguments(m) == 3) {
+                char arg2[16] = {0}, retType[16] = {0};
+                method_getArgumentType(m, 2, arg2, sizeof(arg2));
+                method_getReturnType(m, retType, sizeof(retType));
+                if ((arg2[0] == 'i' || arg2[0] == 'I' || arg2[0] == 'q' || arg2[0] == 'Q') && retType[0] == '@') {
+                    id err = ((id (*)(id, SEL, NSInteger))objc_msgSend)(codeCls, genSel, (NSInteger)70000);
+                    if (err) {
+                        return err;
+                    }
+                }
+            }
+        }
+    }
+    Class errCls = objc_getClass("MIGUAdError");
+    if (errCls) {
+        id err = [[errCls alloc] init];
+        if (err) {
+            SEL setCodeSel = sel_registerName("setErrorCode:");
+            if ([err respondsToSelector:setCodeSel]) {
+                Method m = class_getInstanceMethod(object_getClass(err), setCodeSel);
+                if (m && method_getNumberOfArguments(m) == 3) {
+                    char arg2[16] = {0};
+                    method_getArgumentType(m, 2, arg2, sizeof(arg2));
+                    if (arg2[0] == 'i' || arg2[0] == 'I' || arg2[0] == 'q' || arg2[0] == 'Q') {
+                        ((void (*)(id, SEL, NSInteger))objc_msgSend)(err, setCodeSel, (NSInteger)70000);
+                    }
+                }
+            }
+            SEL setDescSel = sel_registerName("setErrorDescription:");
+            if ([err respondsToSelector:setDescSel]) {
+                Method m = class_getInstanceMethod(object_getClass(err), setDescSel);
+                if (m && method_getNumberOfArguments(m) == 3) {
+                    char arg2[16] = {0};
+                    method_getArgumentType(m, 2, arg2, sizeof(arg2));
+                    if (arg2[0] == '@') {
+                        ((void (*)(id, SEL, id))objc_msgSend)(err, setDescSel, @"No splash ad available");
+                    }
+                }
+            }
+            return err;
+        }
+    }
+    return pt_splashNoFillError();
+}
+
+static void pt_miguBootLoadAd(id self, SEL _cmd, int adType) {
+    (void)_cmd;
+    (void)adType;
+    if (!self) {
+        return;
+    }
+    __strong id strongAd = self;
+    __weak id weakInitialDelegate = pt_splashDelegateForObject(strongAd);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = pt_splashDelegateForObject(strongAd) ?: weakInitialDelegate;
+        if (!delegate) {
+            return;
+        }
+        SEL failSel = @selector(bootScreenAdFailToLoad:);
+        SEL recvSel = @selector(bootScreenAdReceived:);
+        @try {
+            if ([delegate respondsToSelector:failSel]) {
+                Method m = class_getInstanceMethod(object_getClass(delegate), failSel);
+                if (m && method_getNumberOfArguments(m) == 3) {
+                    char arg2[16] = {0};
+                    method_getArgumentType(m, 2, arg2, sizeof(arg2));
+                    if (arg2[0] == '@') {
+                        ((void (*)(id, SEL, id))objc_msgSend)(delegate, failSel, pt_miguBootAdError());
+                    }
+                }
+            } else if ([delegate respondsToSelector:recvSel]) {
+                Method m = class_getInstanceMethod(object_getClass(delegate), recvSel);
+                if (m && method_getNumberOfArguments(m) == 3) {
+                    char arg2[16] = {0};
+                    method_getArgumentType(m, 2, arg2, sizeof(arg2));
+                    if (arg2[0] == '@') {
+                        ((void (*)(id, SEL, id))objc_msgSend)(delegate, recvSel, strongAd);
+                    }
+                }
+            }
+        } @catch (NSException *ex) {
+            NSLog(@"[PlayTools] MIGUBootScreenAd fail callback exception: %@", ex);
+        }
+    });
+}
+
+static void pt_dcBasicSplashFail(id vc, SEL _cmd, id arg) {
+    (void)_cmd;
+    (void)arg;
+    if (!vc) {
+        return;
+    }
+    __strong id strongVC = vc;
+    __weak id weakInitialDelegate = pt_splashDelegateForObject(strongVC);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if ([strongVC isKindOfClass:[UIViewController class]] && [(UIViewController *)strongVC isViewLoaded]) {
+            [[(UIViewController *)strongVC view] removeFromSuperview];
+        }
+        id delegate = pt_splashDelegateForObject(strongVC) ?: weakInitialDelegate;
+        if (!delegate) {
+            return;
+        }
+        id adObj = nil;
+        SEL splashAdSel = sel_registerName("splashAd");
+        if ([strongVC respondsToSelector:splashAdSel]) {
+            Method m = class_getInstanceMethod(object_getClass(strongVC), splashAdSel);
+            if (m && method_getNumberOfArguments(m) == 2) {
+                char retType[16] = {0};
+                method_getReturnType(m, retType, sizeof(retType));
+                if (retType[0] == '@') {
+                    adObj = ((id (*)(id, SEL))objc_msgSend)(strongVC, splashAdSel);
+                }
+            }
+        }
+        id reportedAd = adObj ?: strongVC;
+        SEL failSel = @selector(splashAd:didFailWithError:);
+        SEL closeSel = @selector(splashAdDidClose:);
+        @try {
+            if ([delegate respondsToSelector:failSel]) {
+                ((void (*)(id, SEL, id, id))objc_msgSend)(delegate, failSel, reportedAd, pt_splashNoFillError());
+            } else if ([delegate respondsToSelector:closeSel]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(delegate, closeSel, reportedAd);
+            }
+        } @catch (NSException *ex) {
+            NSLog(@"[PlayTools] DCBasicSplashAdViewController fail callback exception: %@", ex);
+        }
+    });
+}
+
+static BOOL pt_qyCheckAndShowStartAd(id self, SEL _cmd, id del, id opts, id scene, BOOL silent) {
+    (void)self;
+    (void)_cmd;
+    (void)del;
+    (void)opts;
+    (void)scene;
+    (void)silent;
+    return NO;
+}
+
+static BOOL pt_qyCheckAndShowHotStartAd5(id self, SEL _cmd, id del, double bgTime, NSUInteger opt, id ctx, id scene) {
+    (void)self;
+    (void)_cmd;
+    (void)del;
+    (void)bgTime;
+    (void)opt;
+    (void)ctx;
+    (void)scene;
+    return NO;
+}
+
+static BOOL pt_qyCheckAndShowHotStartAd4(id self, SEL _cmd, id del, double bgTime, id opt, id ctx) {
+    (void)self;
+    (void)_cmd;
+    (void)del;
+    (void)bgTime;
+    (void)opt;
+    (void)ctx;
+    return NO;
+}
+
+static BOOL pt_winShouldSplashScreenShow(id self, SEL _cmd, id __autoreleasing *outError, BOOL launchCheck) {
+    (void)self;
+    (void)_cmd;
+    (void)launchCheck;
+    if (outError) {
+        Class errCls = objc_getClass("WINSplashScreenError");
+        SEL errSel = sel_registerName("errorWithCode:reason:");
+        id err = nil;
+        if (errCls && [errCls respondsToSelector:errSel]) {
+            Method m = class_getClassMethod(errCls, errSel);
+            if (m && method_getNumberOfArguments(m) == 4) {
+                char arg2[16] = {0}, arg3[16] = {0};
+                method_getArgumentType(m, 2, arg2, sizeof(arg2));
+                method_getArgumentType(m, 3, arg3, sizeof(arg3));
+                if ((arg2[0] == 'q' || arg2[0] == 'Q' || arg2[0] == 'i' || arg2[0] == 'I') && arg3[0] == '@') {
+                    err = ((id (*)(id, SEL, NSInteger, id))objc_msgSend)(errCls, errSel, (NSInteger)2, @"PlayTools");
+                }
+            }
+        }
+        *outError = err;
+    }
+    return NO;
+}
+
+static void pt_fishSplashLoadAd(id self, SEL _cmd) {
+    (void)_cmd;
+    if (!self) {
+        return;
+    }
+    __strong id strongLoader = self;
+    __weak id weakInitialDelegate = pt_splashDelegateForObject(strongLoader);
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id delegate = pt_splashDelegateForObject(strongLoader) ?: weakInitialDelegate;
+        if (!delegate) {
+            return;
+        }
+        SEL finishSel = sel_registerName("fishSplashAdDidFinish");
+        if ([delegate respondsToSelector:finishSel]) {
+            Method m = class_getInstanceMethod(object_getClass(delegate), finishSel);
+            if (m && method_getNumberOfArguments(m) == 2) {
+                @try {
+                    ((void (*)(id, SEL))objc_msgSend)(delegate, finishSel);
+                } @catch (NSException *ex) {
+                    NSLog(@"[PlayTools] FishSplashAdLoader finish callback exception: %@", ex);
+                }
+            }
+        }
+    });
+}
+
+typedef struct {
+    const char *className;
+    const char *selName;
+    unsigned int expectedArgs;
+    const char *expectedRetTypes;
+    IMP replacement;
+    BOOL isClassMethod;
+} PTSplashDirectHook;
+
+static const PTSplashDirectHook pt_directSplashHooks[] = {
+    { "PAGLAppOpenAd", "loadAdWithSlotID:request:completionHandler:", 5, NULL, (IMP)pt_gadLoadWithAdUnitID, YES },
+
+    { "BDASplashManager", "hasPreloadOrRealtimeModel", 2, NULL, (IMP)pt_splashBoolNO, YES },
+    { "BDASplashManager", "shouldShowSplashAccordingToUDPAndPreloadData:", 3, NULL, (IMP)pt_splashBoolNo1, NO },
+
+    { "GADAppOpenAd", "loadWithAdUnitID:request:completionHandler:", 5, NULL, (IMP)pt_gadLoadWithAdUnitID, YES },
+    { "GADAppOpenAd", "loadWithAdResponseString:completionHandler:", 4, NULL, (IMP)pt_gadLoadWithAdResponseString, YES },
+    { "GADAppOpenAd", "isPreloadedAdAvailable:", 3, NULL, (IMP)pt_gadIsPreloadedAdAvailable, YES },
+
+    { "ATAdManager", "loadADWithPlacementID:extra:delegate:containerView:", 6, NULL, (IMP)pt_atLoadSplash4, NO },
+    { "ATAdManager", "loadADWithPlacementID:extra:tkExtra:adxFloorPrice:delegate:containerView:", 8, NULL, (IMP)pt_atLoadSplash6, NO },
+    { "ATAdManager", "splashReadyForPlacementID:", 3, NULL, (IMP)pt_atSplashReady1, NO },
+    { "ATAdManager", "splashReadyForPlacementID:showConfig:caller:sendTK:", 6, NULL, (IMP)pt_atSplashReady4, NO },
+    { "ATAdManager", "splashReadyWithoutLogForPlacementID:sendTK:", 4, NULL, (IMP)pt_atSplashReadyWithoutLog2, NO },
+    { "ATAdManager", "showSplashWithPlacementID:scene:window:delegate:", 6, "v", (IMP)pt_atShowSplash6, NO },
+    { "ATAdManager", "showSplashWithPlacementID:scene:window:extra:delegate:", 7, "v", (IMP)pt_atShowSplash7, NO },
+    { "ATAdManager", "showSplashWithPlacementID:scene:window:inViewController:delegate:", 7, "v", (IMP)pt_atShowSplash7, NO },
+    { "ATAdManager", "showSplashWithPlacementID:scene:window:inViewController:extra:delegate:", 8, "v", (IMP)pt_atShowSplash8, NO },
+    { "ATAdManager", "showSplashWithPlacementID:config:window:inViewController:extra:delegate:", 8, "v", (IMP)pt_atShowSplash8, NO },
+    { "ATAdManager", "showSplashWithPlacementID:config:window:inViewController:extra:delegate:nativeMixViewBlock:", 9, "v", (IMP)pt_atShowSplash9, NO },
+
+    { "MAAppOpenAd", "isReady", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "MAAppOpenAd", "loadAd", 2, "v", (IMP)pt_maLoadAd, NO },
+    { "MAAppOpenAd", "showAd", 2, "v", (IMP)pt_maShowAd0, NO },
+    { "MAAppOpenAd", "showAdForPlacement:", 3, "v", (IMP)pt_maShowAd1, NO },
+    { "MAAppOpenAd", "showAdForPlacement:customData:", 4, "v", (IMP)pt_maShowAd2, NO },
+
+    { "QLAppLaunchMananger", "shouldShowSplashWhenAppStart", 2, NULL, (IMP)pt_splashBoolNO, NO },
+
+    { "TXAdSplashManager", "getSplashAdsWithAdsDataBlock:", 3, "v", (IMP)pt_txSplashBlock1, NO },
+    { "TXAdSplashManager", "getSplashAdsWithAdsDataBlock:renderMode:", 4, "v", (IMP)pt_txSplashBlockRenderMode, NO },
+    { "TXAdSplashManager", "preGetSplashAdData", 2, "v", (IMP)pt_splashNoop0, NO },
+
+    { "TXAdSplashModule", "getSplashAdsWithDataBlock:renderMode:", 4, "v", (IMP)pt_txSplashBlockRenderMode, NO },
+    { "TXAdSplashModule", "preGetSplashAdData", 2, "v", (IMP)pt_splashNoop0, NO },
+
+    { "MIGUBootScreenAd", "isNecessaryToRequestServery", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "MIGUBootScreenAd", "loadAd:", 3, "v", (IMP)pt_miguBootLoadAd, NO },
+
+    { "DCBasicSplashAdViewController", "loadAdData:", 3, "v", (IMP)pt_dcBasicSplashFail, NO },
+    { "DCBasicSplashAdViewController", "showInView:", 3, "v", (IMP)pt_dcBasicSplashFail, NO },
+
+    { "KWSplashManager", "canShowSplashAd", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "UMESplashCommercialModel", "showSplashCommercial", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "MPPSplashViewManager", "isPreLoadAd", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+
+    { "BFCSplashManager", "showEventSplashWithDelegate:launchInfo:", 4, "@", (IMP)pt_splashReturnNil2, NO },
+    { "BFCSplashManager", "showBrandSplashWithDelegate:launchInfo:", 4, "@", (IMP)pt_splashReturnNil2, NO },
+    { "BFCSplashManager", "overseasSplashTakeOver", 2, "Bc", (IMP)pt_splashBoolYES, NO },
+
+    { "_TtC11XYAdsSplash30SplashAdsMultiFrequencyControl", "shouldShowAdsWithAdsInfo:", 3, "Bc", (IMP)pt_splashBoolNo1, NO },
+    { "XYSplashAdsCherryPickManager", "willShowSplash", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+
+    { "NMLaunchAdViewManager", "shouldSkipColdBootAdForSVIP", 2, "Bc", (IMP)pt_splashBoolYES, NO },
+    { "NMLaunchAdViewManager", "checkoutIfShouldShowAdWhenBecomeActive", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+
+    { "WBAdSdkLauncher", "loadAdSync", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "WBAdSdkLauncher", "hasEnoughIntervalsToShow", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "WBAdSdkLauncher", "hasEnoughIntervalsToShowWithAdIntervals:backgroundIntervals:", 4, "Bc", (IMP)pt_splashBoolNo2Ptr, NO },
+    { "WBAdSdkFlashAdControl", "loadAdSync", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "WBAdSdkFlashAdControl", "hasEnoughIntervalsToShowWithAdIntervals:backgroundIntervals:", 4, "Bc", (IMP)pt_splashBoolNo2Ptr, NO },
+
+    { "QYPhoneStartADManager", "checkAndShowStartAdWithDelegate:connectionOptions:windowScene:isSlientDownload:", 6, "Bc", (IMP)pt_qyCheckAndShowStartAd, YES },
+    { "QYPhoneStartADManager", "checkAndShowHotStartAdWithDelegate:backgroundTime:launchOption:adContext:windowScene:", 7, "Bc", (IMP)pt_qyCheckAndShowHotStartAd5, YES },
+    { "QYPhoneStartADManager", "checkAndShowHotStartAdWithDelegate:backgroundTime:launchOption:adContext:", 6, "Bc", (IMP)pt_qyCheckAndShowHotStartAd4, YES },
+    { "QYPhoneStartADManager", "shouldSkipAdForLaunchOption:", 3, "Bc", (IMP)pt_splashBoolYes1UInt, YES },
+    { "QYPhoneStartADManager", "checkAndShowAd", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "CupidSplashViewModel", "canLoadSplash", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+
+    { "PDDSplashManager", "shouldShowSplash", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "PDDSplashManager", "resumeShouldShowSplash", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+
+    { "WINSplashScreenVAppService", "shouldSplashScreenShow:launchCheck:", 4, "Bc", (IMP)pt_winShouldSplashScreenShow, YES },
+
+    { "SplashManager", "canShowColdSplash", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "SplashManager", "showColdStartSplash:", 3, "Bc", (IMP)pt_splashBoolNo1, NO },
+    { "SplashManager", "showHotSplash", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+
+    { "ZHZADLaunchDisable", "disableLaunchingAD:", 3, "Bc", (IMP)pt_splashBoolYes1Bool, NO },
+    { "_TtC7ZHADSDK15LaunchADDisable", "disableLaunchingAD:", 3, "Bc", (IMP)pt_splashBoolYes1Bool, NO },
+
+    { "TMEAdOperateIntervalManager", "canShowSplash:", 3, "Bc", (IMP)pt_splashBoolNo1Bool, NO },
+    { "TMEAdOperateSplash", "needShowSplashWithLaunchType:", 3, "Bc", (IMP)pt_splashBoolNo1Bool, YES },
+    { "QMTMEAdSplashPrePickManager", "checkSplashIntervalToPick:", 3, "Bc", (IMP)pt_splashBoolNo1Bool, NO },
+
+    { "GdtSplashAdManager", "canShowGdtSplashAdAndIsNeedReport:isColdlaunch:", 4, "Bc", (IMP)pt_splashBoolNo2Bool, NO },
+    { "GdtSplashAdManager", "canShowGdtHotlaunchSplashAd", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+
+    { "BootImageConfigModel", "isColdStartEnabled", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "BootImageConfigModel", "isHotStartEnabled", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "TBBootImageManager", "showBootImageAtHotStart", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "TBBootImageManager", "isColdStartBootImageWillShow", 2, "Bc", (IMP)pt_splashBoolNO, YES },
+    { "TBBootImageManager", "isColdStartBootImageWillShow", 2, "Bc", (IMP)pt_splashBoolNO, NO },
+    { "TBBootImageManager", "isHotStartTaobaoSplashAdvWillShow", 2, "Bc", (IMP)pt_splashBoolNO, YES },
+
+    { "_TtC6FishAd18FishSplashAdLoader", "loadAd", 2, "v", (IMP)pt_fishSplashLoadAd, NO },
+    { "_TtC6FishAd18FishSplashAdConfig", "disableHotStartAd", 2, "Bc", (IMP)pt_splashBoolYES, NO },
+};
+
+static BOOL pt_replaceSplashMethodWithRetType(Class cls,
+                                              const char *selName,
+                                              unsigned int expectedArgs,
+                                              const char *expectedRetTypes,
+                                              IMP replacement,
+                                              BOOL isClassMethod) {
     if (!cls || !selName || !replacement) {
         return NO;
     }
@@ -4492,12 +5692,23 @@ static BOOL pt_replaceSplashMethod(Class cls, const char *selName, unsigned int 
     if (!m || method_getNumberOfArguments(m) != expectedArgs || method_getImplementation(m) == replacement) {
         return NO;
     }
+    if (expectedRetTypes && expectedRetTypes[0] != '\0') {
+        char retType[16] = {0};
+        method_getReturnType(m, retType, sizeof(retType));
+        if (strchr(expectedRetTypes, retType[0]) == NULL) {
+            return NO;
+        }
+    }
     Class targetClass = isClassMethod ? object_getClass(cls) : cls;
     if (!targetClass) {
         return NO;
     }
     class_replaceMethod(targetClass, sel, replacement, method_getTypeEncoding(m));
     return YES;
+}
+
+static BOOL pt_replaceSplashMethod(Class cls, const char *selName, unsigned int expectedArgs, IMP replacement, BOOL isClassMethod) {
+    return pt_replaceSplashMethodWithRetType(cls, selName, expectedArgs, NULL, replacement, isClassMethod);
 }
 
 static BOOL pt_replaceSplashMethodList(Class cls, const char * const *sels, size_t count, unsigned int args, IMP replacement) {
@@ -4544,62 +5755,40 @@ static void pt_installSplashAdBlockerIfNeeded(void) {
         if (strcmp(spec->className, "MTGSplashAD") == 0) {
             hooked |= pt_replaceSplashMethod(cls, "loadAndShowInKeyWindow:customView:timeout:", 5, (IMP)pt_splashLoadWindowViewTimeout, NO);
             hooked |= pt_replaceSplashMethod(cls, "loadAndShowInKeyWindow:customView:bidToken:timeout:", 6, (IMP)pt_splashLoadWindowViewTokenTimeout, NO);
+        } else if (strcmp(spec->className, "GMSplashAd") == 0) {
+            hooked |= pt_replaceSplashMethod(cls, "loadAdDataWithMediaSlotConfigIDs:sign:", 4, (IMP)pt_splashLoadIdInt, NO);
         } else if (strcmp(spec->className, "GDTSplashAd") == 0) {
             hooked |= pt_replaceSplashMethod(cls, "showSplashWithOrder:withCustomUI:inContainerView:", 5, (IMP)pt_splashBoolNo3AndFail, NO);
         } else if (strcmp(spec->className, "DCUniSplashAd") == 0) {
             hooked |= pt_replaceSplashMethod(cls, "showInWindow:withBottomView:andDelegate:", 5, (IMP)pt_dcUniShowInWindow, YES);
+        } else if (strcmp(spec->className, "MPPSplashAd") == 0) {
+            hooked |= pt_replaceSplashMethod(cls, "preloadAd", 2, (IMP)pt_splashNoop0, NO);
         }
         if (hooked) {
             hookedClasses++;
         }
     }
 
-    Class pagCls = objc_getClass("PAGLAppOpenAd");
-    if (pagCls) {
-        if (pt_replaceSplashMethod(pagCls, "loadAdWithSlotID:request:completionHandler:", 5, (IMP)pt_gadLoadWithAdUnitID, YES)) {
-            hookedClasses++;
+    Class prevDirectCls = Nil;
+    BOOL prevDirectHooked = NO;
+    for (size_t i = 0; i < PT_COUNT(pt_directSplashHooks); i++) {
+        const PTSplashDirectHook *h = &pt_directSplashHooks[i];
+        Class cls = objc_getClass(h->className);
+        if (!cls) {
+            continue;
         }
+        if (cls != prevDirectCls) {
+            if (prevDirectHooked) {
+                hookedClasses++;
+            }
+            prevDirectCls = cls;
+            prevDirectHooked = NO;
+        }
+        prevDirectHooked |= pt_replaceSplashMethodWithRetType(
+            cls, h->selName, h->expectedArgs, h->expectedRetTypes, h->replacement, h->isClassMethod);
     }
-
-    Class bdaCls = objc_getClass("BDASplashManager");
-    if (bdaCls) {
-        BOOL hooked = NO;
-        hooked |= pt_replaceSplashMethod(bdaCls, "hasPreloadOrRealtimeModel", 2, (IMP)pt_splashBoolNO, YES);
-        hooked |= pt_replaceSplashMethod(bdaCls, "shouldShowSplashAccordingToUDPAndPreloadData:", 3, (IMP)pt_splashBoolNo1, NO);
-        if (hooked) {
-            hookedClasses++;
-        }
-    }
-
-    Class gadCls = objc_getClass("GADAppOpenAd");
-    if (gadCls) {
-        BOOL hooked = NO;
-        hooked |= pt_replaceSplashMethod(gadCls, "loadWithAdUnitID:request:completionHandler:", 5, (IMP)pt_gadLoadWithAdUnitID, YES);
-        hooked |= pt_replaceSplashMethod(gadCls, "loadWithAdResponseString:completionHandler:", 4, (IMP)pt_gadLoadWithAdResponseString, YES);
-        hooked |= pt_replaceSplashMethod(gadCls, "isPreloadedAdAvailable:", 3, (IMP)pt_gadIsPreloadedAdAvailable, YES);
-        if (hooked) {
-            hookedClasses++;
-        }
-    }
-
-    Class atCls = objc_getClass("ATAdManager");
-    if (atCls) {
-        BOOL hooked = NO;
-        hooked |= pt_replaceSplashMethod(atCls, "loadADWithPlacementID:extra:delegate:containerView:", 6, (IMP)pt_atLoadSplash4, NO);
-        hooked |= pt_replaceSplashMethod(atCls, "loadADWithPlacementID:extra:tkExtra:adxFloorPrice:delegate:containerView:", 8, (IMP)pt_atLoadSplash6, NO);
-        hooked |= pt_replaceSplashMethod(atCls, "splashReadyForPlacementID:", 3, (IMP)pt_atSplashReady1, NO);
-        hooked |= pt_replaceSplashMethod(atCls, "splashReadyForPlacementID:showConfig:caller:sendTK:", 6, (IMP)pt_atSplashReady4, NO);
-        hooked |= pt_replaceSplashMethod(atCls, "splashReadyWithoutLogForPlacementID:sendTK:", 4, (IMP)pt_atSplashReadyWithoutLog2, NO);
-        if (hooked) {
-            hookedClasses++;
-        }
-    }
-
-    Class qlLaunchCls = objc_getClass("QLAppLaunchMananger");
-    if (qlLaunchCls) {
-        if (pt_replaceSplashMethod(qlLaunchCls, "shouldShowSplashWhenAppStart", 2, (IMP)pt_splashBoolNO, NO)) {
-            hookedClasses++;
-        }
+    if (prevDirectHooked) {
+        hookedClasses++;
     }
 
     if (hookedClasses > 0) {
@@ -4746,7 +5935,39 @@ static void pt_installNSDataURLTypeGuard(void) {
 static NSInteger pt_systemAppearanceUpdateDepth = 0;
 static void (*pt_origUpdateFromSystemAppearance)(id, SEL, id) = NULL;
 static void (*pt_origWindowSetOverrideUserInterfaceStyle)(UIWindow *, SEL, UIUserInterfaceStyle) = NULL;
+static id (*pt_origWindowInitWithFrame)(UIWindow *, SEL, CGRect) = NULL;
+static id (*pt_origWindowInitWithWindowScene)(UIWindow *, SEL, UIWindowScene *) = NULL;
+static void (*pt_origWindowBecomeKeyWindow)(UIWindow *, SEL) = NULL;
+static UIUserInterfaceStyle pt_forcedWindowUIStyle = UIUserInterfaceStyleUnspecified;
 static BOOL pt_appearanceReentrancyGuardInstalled = NO;
+
+static UIUserInterfaceStyle pt_configuredOverrideUserInterfaceStyle(void) {
+    const char *disable = getenv("PT_DISABLE_APPEARANCE_OVERRIDE");
+    if (disable && disable[0] == '1' && disable[1] == '\0') {
+        return UIUserInterfaceStyleUnspecified;
+    }
+    NSInteger style = [[PlaySettings shared] appearanceStyle];
+    if (style == 1) {
+        return UIUserInterfaceStyleLight;
+    }
+    if (style == 2) {
+        return UIUserInterfaceStyleDark;
+    }
+    return UIUserInterfaceStyleUnspecified;
+}
+
+static void pt_applyForcedAppearanceToWindowIfNeeded(UIWindow *window) {
+    if (pt_forcedWindowUIStyle == UIUserInterfaceStyleUnspecified || !window) {
+        return;
+    }
+    if (window.overrideUserInterfaceStyle != pt_forcedWindowUIStyle) {
+        if (pt_origWindowSetOverrideUserInterfaceStyle) {
+            pt_origWindowSetOverrideUserInterfaceStyle(window, @selector(setOverrideUserInterfaceStyle:), pt_forcedWindowUIStyle);
+        } else {
+            window.overrideUserInterfaceStyle = pt_forcedWindowUIStyle;
+        }
+    }
+}
 
 static void pt_updateFromSystemAppearance(id self, SEL _cmd, id sender) {
     pt_systemAppearanceUpdateDepth++;
@@ -4760,21 +5981,47 @@ static void pt_updateFromSystemAppearance(id self, SEL _cmd, id sender) {
 }
 
 static void pt_windowSetOverrideUserInterfaceStyle(UIWindow *self, SEL _cmd, UIUserInterfaceStyle style) {
+    UIUserInterfaceStyle targetStyle = (pt_forcedWindowUIStyle != UIUserInterfaceStyleUnspecified)
+        ? pt_forcedWindowUIStyle
+        : style;
     if (pt_systemAppearanceUpdateDepth > 0 && [NSThread isMainThread]) {
-        if (self.overrideUserInterfaceStyle == style) {
+        if (self.overrideUserInterfaceStyle == targetStyle) {
             return;
         }
         __weak UIWindow *weakWin = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             UIWindow *win = weakWin;
-            if (win && win.overrideUserInterfaceStyle != style && pt_origWindowSetOverrideUserInterfaceStyle) {
-                pt_origWindowSetOverrideUserInterfaceStyle(win, _cmd, style);
+            if (win && win.overrideUserInterfaceStyle != targetStyle && pt_origWindowSetOverrideUserInterfaceStyle) {
+                pt_origWindowSetOverrideUserInterfaceStyle(win, _cmd, targetStyle);
             }
         });
         return;
     }
     if (pt_origWindowSetOverrideUserInterfaceStyle) {
-        pt_origWindowSetOverrideUserInterfaceStyle(self, _cmd, style);
+        pt_origWindowSetOverrideUserInterfaceStyle(self, _cmd, targetStyle);
+    }
+}
+
+static id pt_windowInitWithFrame(UIWindow *self, SEL _cmd, CGRect frame) {
+    id instance = pt_origWindowInitWithFrame ? pt_origWindowInitWithFrame(self, _cmd, frame) : nil;
+    if (instance) {
+        pt_applyForcedAppearanceToWindowIfNeeded((UIWindow *)instance);
+    }
+    return instance;
+}
+
+static id pt_windowInitWithWindowScene(UIWindow *self, SEL _cmd, UIWindowScene *windowScene) {
+    id instance = pt_origWindowInitWithWindowScene ? pt_origWindowInitWithWindowScene(self, _cmd, windowScene) : nil;
+    if (instance) {
+        pt_applyForcedAppearanceToWindowIfNeeded((UIWindow *)instance);
+    }
+    return instance;
+}
+
+static void pt_windowBecomeKeyWindow(UIWindow *self, SEL _cmd) {
+    pt_applyForcedAppearanceToWindowIfNeeded(self);
+    if (pt_origWindowBecomeKeyWindow) {
+        pt_origWindowBecomeKeyWindow(self, _cmd);
     }
 }
 
@@ -4783,6 +6030,7 @@ static void pt_installWindowAppearanceReentrancyGuard(void) {
         return;
     }
     pt_appearanceReentrancyGuardInstalled = YES;
+    pt_forcedWindowUIStyle = pt_configuredOverrideUserInterfaceStyle();
 
     Class uiApp = objc_getClass("UIApplication");
     SEL updateSel = sel_registerName("_updateFromSystemAppearance:");
@@ -4804,6 +6052,46 @@ static void pt_installWindowAppearanceReentrancyGuard(void) {
             pt_origWindowSetOverrideUserInterfaceStyle = (void (*)(UIWindow *, SEL, UIUserInterfaceStyle))origImp;
             class_replaceMethod(uiWin, styleSel, (IMP)pt_windowSetOverrideUserInterfaceStyle, method_getTypeEncoding(styleM));
         }
+    }
+
+    if (uiWin && pt_forcedWindowUIStyle != UIUserInterfaceStyleUnspecified) {
+        Method initFrameM = class_getInstanceMethod(uiWin, @selector(initWithFrame:));
+        if (initFrameM) {
+            IMP origImp = method_getImplementation(initFrameM);
+            if (origImp != (IMP)pt_windowInitWithFrame) {
+                pt_origWindowInitWithFrame = (id (*)(UIWindow *, SEL, CGRect))origImp;
+                class_replaceMethod(uiWin, @selector(initWithFrame:), (IMP)pt_windowInitWithFrame, method_getTypeEncoding(initFrameM));
+            }
+        }
+        Method initSceneM = class_getInstanceMethod(uiWin, @selector(initWithWindowScene:));
+        if (initSceneM) {
+            IMP origImp = method_getImplementation(initSceneM);
+            if (origImp != (IMP)pt_windowInitWithWindowScene) {
+                pt_origWindowInitWithWindowScene = (id (*)(UIWindow *, SEL, UIWindowScene *))origImp;
+                class_replaceMethod(uiWin, @selector(initWithWindowScene:), (IMP)pt_windowInitWithWindowScene, method_getTypeEncoding(initSceneM));
+            }
+        }
+        Method becomeKeyM = class_getInstanceMethod(uiWin, @selector(becomeKeyWindow));
+        if (becomeKeyM) {
+            IMP origImp = method_getImplementation(becomeKeyM);
+            if (origImp != (IMP)pt_windowBecomeKeyWindow) {
+                pt_origWindowBecomeKeyWindow = (void (*)(UIWindow *, SEL))origImp;
+                class_replaceMethod(uiWin, @selector(becomeKeyWindow), (IMP)pt_windowBecomeKeyWindow, method_getTypeEncoding(becomeKeyM));
+            }
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            UIApplication *app = [UIApplication sharedApplication];
+            for (UIScene *scene in app.connectedScenes) {
+                if ([scene isKindOfClass:[UIWindowScene class]]) {
+                    for (UIWindow *win in ((UIWindowScene *)scene).windows) {
+                        pt_applyForcedAppearanceToWindowIfNeeded(win);
+                    }
+                }
+            }
+            for (UIWindow *win in app.windows) {
+                pt_applyForcedAppearanceToWindowIfNeeded(win);
+            }
+        });
     }
 }
 
@@ -4904,6 +6192,11 @@ static void pt_installUniversalCompatibilityGuards(void) {
 #endif
     pt_installNavigationAppearanceBalanceGuard();
     pt_installGlassEffectCompatibilityGuard();
+    Class efficiencyHooksCls = NSClassFromString(@"PTEfficiencyHooks");
+    SEL efficiencyInstallSel = NSSelectorFromString(@"installIfNeeded");
+    if (efficiencyHooksCls && [efficiencyHooksCls respondsToSelector:efficiencyInstallSel]) {
+        ((void (*)(id, SEL))objc_msgSend)(efficiencyHooksCls, efficiencyInstallSel);
+    }
     pt_installFloatingTabBarCapsuleGuard();
     pt_installSafeAreaReentrantLayoutGuard();
     pt_installTerminationWatchdog();
