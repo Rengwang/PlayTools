@@ -11,6 +11,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 + (void)installIfNeeded;
 + (void)trimRegisteredNSCaches;
++ (NSInteger)currentEffectiveFPSCeiling;
++ (BOOL)isFPSOverlayInstalled;
++ (BOOL)isAdaptiveMotionHoldActive;
 
 @end
 

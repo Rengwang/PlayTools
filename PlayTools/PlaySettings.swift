@@ -168,6 +168,7 @@ let settings = PlaySettings.shared
     @objc lazy var frameRateCap = settingsData.frameRateCap
     @objc lazy var metalMemorySaver = settingsData.metalMemorySaver
     @objc lazy var avMediaSaver = settingsData.avMediaSaver
+    @objc lazy var fpsOverlay = settingsData.fpsOverlay
     @objc lazy var appearanceStyle = settingsData.appearanceStyle
     @objc lazy var spoofPowerState = (powerStatePolicy == 1)
     @objc lazy var blockSplashAds = settingsData.blockSplashAds
@@ -245,6 +246,7 @@ struct AppSettingsData: Codable {
     var frameRateCap = 0
     var metalMemorySaver = false
     var avMediaSaver = false
+    var fpsOverlay = false
     var appearanceStyle = 0
     var blockSplashAds = true
     var mockLocationEnabled = false
@@ -315,6 +317,7 @@ struct AppSettingsData: Codable {
         frameRateCap = try container.decodeIfPresent(Int.self, forKey: .frameRateCap) ?? 0
         metalMemorySaver = try container.decodeIfPresent(Bool.self, forKey: .metalMemorySaver) ?? false
         avMediaSaver = try container.decodeIfPresent(Bool.self, forKey: .avMediaSaver) ?? false
+        fpsOverlay = try container.decodeIfPresent(Bool.self, forKey: .fpsOverlay) ?? false
         appearanceStyle = try container.decodeIfPresent(Int.self, forKey: .appearanceStyle) ?? 0
         blockSplashAds = try container.decodeIfPresent(Bool.self, forKey: .blockSplashAds) ?? true
         mockLocationEnabled = try container.decodeIfPresent(Bool.self, forKey: .mockLocationEnabled) ?? false
