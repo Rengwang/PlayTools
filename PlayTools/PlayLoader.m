@@ -1706,12 +1706,47 @@ static uintptr_t pt_adrpTarget(uint32_t insn, uintptr_t pc) {
     return (pc & ~(uintptr_t)0xFFF) + (uintptr_t)(imm << 12);
 }
 
-static BOOL pt_gotSlotIndex(const pt_image_layout_t *layout, uintptr_t addr, size_t *outIndex) {
+// Resolve the sensitive imports to their live addresses. Interposed symbols
+// resolve to the PlayTools shim, which is exactly what the SDK's GOT is bound to,
+// so comparing slot contents identifies the slots that matter regardless of where
+// they sit inside __got (the previous 64-slot window silently dropped later slots).
+#define PT_MAX_SENSITIVE_SLOTS 256
+
+static size_t pt_collectSensitiveGotSlots(const pt_image_layout_t *layout,
+                                          uintptr_t *slots, size_t maxSlots) {
+    uintptr_t targets[PT_SENSITIVE_SYMBOL_COUNT];
+    size_t targetCount = 0;
+    for (size_t i = 0; i < PT_SENSITIVE_SYMBOL_COUNT; i++) {
+        // Names in this table are Mach-O symbol names (one leading underscore for
+        // C symbols, two for the private _dyld_* pair); dlsym wants the C name.
+        const char *symbol = pt_sensitiveSymbols[i];
+        if (symbol[0] == '_') symbol++;
+        void *resolved = dlsym(RTLD_DEFAULT, symbol);
+        if (resolved != NULL) targets[targetCount++] = (uintptr_t)resolved;
+    }
+    if (targetCount == 0) return 0;
+
+    size_t count = 0;
     for (size_t g = 0; g < layout->gotCount; g++) {
-        if (addr < layout->gotStart[g] || addr >= layout->gotEnd[g]) continue;
-        size_t slot = (size_t)((addr - layout->gotStart[g]) / 8);
-        if (slot >= 64) return NO;                 // mask has 64 bits per section
-        *outIndex = g * 64 + slot;
+        for (uintptr_t slot = layout->gotStart[g];
+             slot + sizeof(uintptr_t) <= layout->gotEnd[g] && count < maxSlots; slot += 8) {
+            uintptr_t value = *(const uintptr_t *)slot;
+            if (value == 0) continue;
+            for (size_t t = 0; t < targetCount; t++) {
+                if (value != targets[t]) continue;
+                slots[count++] = slot;
+                break;
+            }
+        }
+    }
+    return count;
+}
+
+static BOOL pt_sensitiveSlotIndex(const uintptr_t *slots, size_t slotCount,
+                                  uintptr_t addr, size_t *outIndex) {
+    for (size_t i = 0; i < slotCount; i++) {
+        if (slots[i] != addr) continue;
+        *outIndex = i;
         return YES;
     }
     return NO;
@@ -1746,8 +1781,11 @@ typedef struct {
     uint64_t slotMask[4];   // 256 bits: 4 sections x 64 slots
 } pt_callgraph_hit_t;
 
-static uintptr_t pt_findPredicateByCallgraph(const pt_image_layout_t *layout, size_t *outDistinct) {
-    if (layout->gotCount == 0) return 0;
+static uintptr_t pt_findPredicateByCallgraph(const pt_image_layout_t *layout,
+                                             const uintptr_t *sensitiveSlots,
+                                             size_t sensitiveSlotCount,
+                                             size_t *outDistinct) {
+    if (sensitiveSlotCount == 0) return 0;
     pt_callgraph_hit_t hits[PT_CALLGRAPH_MAX_TARGETS];
     size_t hitCount = 0;
     memset(hits, 0, sizeof(hits));
@@ -1776,7 +1814,7 @@ static uintptr_t pt_findPredicateByCallgraph(const pt_image_layout_t *layout, si
             }
             if (skip == 0) continue;
             size_t slotIndex = 0;
-            if (!pt_gotSlotIndex(layout, slotAddr, &slotIndex)) continue;
+            if (!pt_sensitiveSlotIndex(sensitiveSlots, sensitiveSlotCount, slotAddr, &slotIndex)) continue;
             if (slotIndex >= 256) continue;
 
             for (size_t m = skip + 1; m <= skip + 16; m++) {
@@ -1885,9 +1923,13 @@ static int pt_neutralizeRiskPredicate(void) {
         }
         if (exitStubs < 1) continue;
 
+        uintptr_t sensitiveSlots[PT_MAX_SENSITIVE_SLOTS];
+        size_t sensitiveSlotCount = pt_collectSensitiveGotSlots(&layout, sensitiveSlots,
+                                                                PT_MAX_SENSITIVE_SLOTS);
         size_t evidence = 0;
         const char *matcher = "callgraph";
-        uintptr_t predicate = pt_findPredicateByCallgraph(&layout, &evidence);
+        uintptr_t predicate = pt_findPredicateByCallgraph(&layout, sensitiveSlots,
+                                                          sensitiveSlotCount, &evidence);
         if (predicate == 0) {
             matcher = "prologue";
             predicate = pt_findPredicateByPrologue(&layout, &evidence);
@@ -1900,8 +1942,8 @@ static int pt_neutralizeRiskPredicate(void) {
         patched++;
         if (pt_riskProbeVerbose()) {
             NSString *line = [NSString stringWithFormat:
-                @"neutralize predicate matcher=%s imports=%d exitStubs=%zu evidence=%zu image=%s off=0x%lx",
-                matcher, sensitiveImports, exitStubs, evidence, name,
+                @"neutralize predicate matcher=%s imports=%d exitStubs=%zu gotSlots=%zu evidence=%zu image=%s off=0x%lx",
+                matcher, sensitiveImports, exitStubs, sensitiveSlotCount, evidence, name,
                 (long)(predicate - (uintptr_t)rawHeader)];
             NSLog(@"[PC] %@", line);
             pt_riskProbeEmit(line);

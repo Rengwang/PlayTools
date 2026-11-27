@@ -176,12 +176,25 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("RiskBanner:offSwitch",
          'environment][@"PT_RISK_BANNER"]',
          loader),
+        ("RiskNeutralize:slotContentMatch",
+         "pt_collectSensitiveGotSlots",
+         loader),
+        ("RiskNeutralize:dlsymNameNormalised",
+         "if (symbol[0] == '_') symbol++;",
+         loader),
     ]
     for name, token, content in risk_contract:
         if token in content:
             passed.append(name)
         else:
             failures.append(f"{name}: missing token '{token}'")
+
+    # The old fixed 64-slot window silently dropped later __got entries; slot
+    # identity must come from content matching instead.
+    if "slot >= 64" not in loader and "pt_gotSlotIndex" not in loader:
+        passed.append("RiskNeutralize:noSlotWindowCap")
+    else:
+        failures.append("RiskNeutralize:noSlotWindowCap: fixed 64-slot window came back")
 
     # Ensure App Group path resolves under Library/PlayCoverGroupContainers (space-free), not Library/Application Support
     if 'URLByAppendingPathComponent:@"PlayCoverGroupContainers"' in loader and "NSLibraryDirectory" in loader:
