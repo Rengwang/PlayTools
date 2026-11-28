@@ -44,6 +44,7 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
     ak_loader = read_text(pt_dir / "Utils" / "AKPluginLoader.swift")
     location = read_text(pt_dir / "LocationCompatibility.m")
     duo_vbar = read_text(pt_dir / "DuoVerticalBarCompatibility.m")
+    eff_hooks = read_text(pt_dir / "PlayEfficiencyHooks.m")
     pbxproj = read_text(root / "PlayTools" / "PlayTools.xcodeproj" / "project.pbxproj")
 
     required_tokens = [
@@ -96,6 +97,8 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("PlayLoader:fishSplash", loader, "_TtC6FishAd18FishSplashAdLoader"),
         ("PlayLoader:customTabBarPlatterGuard", loader, "pt_updateCustomTabBarPlatterVisibility"),
         ("PlayLoader:customTabBarPlatterClass", loader, "_UITabBarItemPlatterView"),
+        ("PlayLoader:customTabBarMultiSubview", loader, "pt_tabBarHasCustomReplacementSubviews"),
+        ("PlayLoader:customTabBarSetSelectedItem", loader, "pt_tabBarSetSelectedItem"),
         ("PlayLoader:duoDefaultModel", loader, 'pt_cached_device_model_buf[128] = "iPhone19,4"'),
         ("PlaySettings:duoEffectiveModel", settings, 'return "iPhone19,4"'),
         ("PlaySettings:duoVerticalBarDefault", settings, "var duoVerticalBar = false"),
@@ -146,6 +149,10 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("Swizzle:cmVirtualAlmondDeallocGuard", swizzle, "pt_CMMotionManager_dealloc"),
         ("PlayLoader:skylightPrewarm", loader, "pt_ensure_skylight_prewarmed"),
         ("PlayLoader:notificationRecursionGuard", loader, "pt_installNotificationRecursionGuard"),
+        ("PlayEfficiency:liveResizeWake", eff_hooks, "pt_hostWindowLiveResizing"),
+        ("DuoVerticalBar:liveResizeDefer", duo_vbar, "pt_duoHostLiveResizing"),
+        ("PlayScreen:liveResizePacing", screen, "nextAdaptiveResizePacingInterval"),
+        ("Swizzle:liveResizeBoundsCoalesce", swizzle, "pt_isPlayScreenAdaptiveLiveResizePacing"),
     ]
     for name, content, token in required_tokens:
         if token in content:
@@ -238,6 +245,7 @@ def check_source_invariants(root: Path, failures: list[str], passed: list[str]) 
         ("OptionScrollZoom:noBundleIdHardcode", option_zoom, "bundleIdentifier"),
         ("PlayLoader:noAJXSidebarDuoGuard", loader, "pt_installAJXSidebarDuoGuard"),
         ("PlayLoader:noXhsBundleHardcode", loader, "com.xingin.discover"),
+        ("PlayLoader:noAwemeBundleHardcode", loader, "com.ss.iphone.ugc.Aweme"),
         ("PlayLoader:noAmapBundleHardcode", loader, "com.autonavi.amap"),
         ("PlayLoader:noWinSplashPlainNSError", loader, "WINSplashForbidden"),
         ("PlaySettings:noAmapBundleHardcode", settings, "com.autonavi.amap"),

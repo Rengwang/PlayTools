@@ -179,6 +179,10 @@ def check_source_contract(pt_root: Path) -> list[str]:
         ("Duo:inspectOpaqueBadgeMath", duo, "PTDuoInspectOpaqueBadgeResult"),
         ("Duo:tabSlotActionKindMath", duo, "PTDuoResolveTabOverlayActionKind"),
         ("Duo:savedViewStateRestoreMath", duo, "PTDuoRestoreSavedViewState"),
+        ("Duo:tabSlotNeedsOverlayMath", duo, "PTDuoTabItemSlotNeedsOverlay"),
+        ("Duo:alphaBufferVisibleMath", duo, "PTDuoAlphaBufferHasVisiblePixels"),
+        ("Duo:tabBarItemSetSelectedImageHook", duo, "pt_tabBarItemSetSelectedImage"),
+        ("Duo:tabBarItemSetImageHook", duo, "pt_tabBarItemSetImage"),
         ("Duo:playScreenDuoSnapshotAction", read_text(pt_dir / "PlayScreen.swift"), '"duoSnapshot"'),
         ("PlayScreen:dumpTreeSafeArea", read_text(pt_dir / "PlayScreen.swift"), '"safeAreaInsets"'),
         ("PlayScreen:dumpTreeLayoutGuide", read_text(pt_dir / "PlayScreen.swift"), '"safeAreaLayoutGuideFrame"'),
@@ -272,7 +276,7 @@ static inline NSDirectionalEdgeInsets NSDirectionalEdgeInsetsMake(CGFloat top, C
     return i;
 }
 
-static const CGFloat kPTDuoVerticalBarWidth = 60.0;
+static const CGFloat kPTDuoVerticalBarWidth = 52.0;
 static const CGFloat kPTDuoVerticalBarMinWindowWidth = 600.0;
 static const CGFloat kPTDuoVerticalBarMinWindowHeight = 320.0;
 
@@ -299,10 +303,10 @@ int main(void) {
 
     // 3. Extent resolution & clamping
     assert(fabs(PTDuoResolveBarExtent(YES, 48.0, 900.0) - 48.0) < 0.001);
-    assert(fabs(PTDuoResolveBarExtent(NO, 0.0, 900.0) - 60.0) < 0.001);
-    assert(fabs(PTDuoResolveBarExtent(YES, -5.0, 900.0) - 60.0) < 0.001);
-    assert(fabs(PTDuoResolveBarExtent(YES, NAN, 900.0) - 60.0) < 0.001);
-    assert(fabs(PTDuoResolveBarExtent(YES, 60.0, 40.0) - 40.0) < 0.001);
+    assert(fabs(PTDuoResolveBarExtent(NO, 0.0, 900.0) - 52.0) < 0.001);
+    assert(fabs(PTDuoResolveBarExtent(YES, -5.0, 900.0) - 52.0) < 0.001);
+    assert(fabs(PTDuoResolveBarExtent(YES, NAN, 900.0) - 52.0) < 0.001);
+    assert(fabs(PTDuoResolveBarExtent(YES, 52.0, 40.0) - 40.0) < 0.001);
 
     // 4. App-rendered custom sidebar auto-yield geometry candidate checks
     CGRect win = CGRectMake(0, 0, 900, 700);
@@ -399,7 +403,7 @@ int main(void) {
     assert(PTDuoShouldCollapseEmptyRightInset(NO, NO, NO, NO, NO) == NO);
 
     // Effective right safe-area inset calculation
-    assert(fabs(PTDuoEffectiveRightSafeAreaInset(YES, NO, 0.0) - 60.0) < 0.001);
+    assert(fabs(PTDuoEffectiveRightSafeAreaInset(YES, NO, 0.0) - 52.0) < 0.001);
     assert(fabs(PTDuoEffectiveRightSafeAreaInset(YES, NO, 72.0) - 72.0) < 0.001);
     assert(fabs(PTDuoEffectiveRightSafeAreaInset(YES, YES, 0.0) - 0.0) < 0.001);
     assert(fabs(PTDuoEffectiveRightSafeAreaInset(YES, YES, 12.0) - 12.0) < 0.001);
@@ -427,34 +431,34 @@ int main(void) {
     assert(PTDuoInferRightBarExtentFromEdgeInsets(UIEdgeInsetsMake(44, 0, 0, 0), 1000.0, &inferred) == NO);
 
     // 10. Occupied right bar width & safeAreaInsets.right separation
-    assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, NO, YES, NO, 0.0, NO, 0.0) - 60.0) < 0.001);
-    assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, NO, NO, YES, 48.0, NO, 0.0) - 60.0) < 0.001);
+    assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, NO, YES, NO, 0.0, NO, 0.0) - 52.0) < 0.001);
+    assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, NO, NO, YES, 48.0, NO, 0.0) - 52.0) < 0.001);
     assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, NO, NO, YES, 68.0, NO, 0.0) - 68.0) < 0.001);
     assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, NO, NO, NO, 0.0, YES, 68.0) - 68.0) < 0.001);
     assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, NO, NO, NO, 0.0, NO, 0.0) - 0.0) < 0.001);
-    assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, YES, NO, NO, 0.0, NO, 0.0) - 60.0) < 0.001);
+    assert(fabs(PTDuoResolveOccupiedRightBarWidth(YES, YES, NO, NO, 0.0, NO, 0.0) - 52.0) < 0.001);
     assert(fabs(PTDuoEffectiveRightSafeAreaInsetForOccupiedWidth(YES, 68.0, 0.0) - 68.0) < 0.001);
     assert(fabs(PTDuoEffectiveRightSafeAreaInsetForOccupiedWidth(YES, 68.0, 80.0) - 80.0) < 0.001);
     assert(fabs(PTDuoEffectiveRightSafeAreaInsetForOccupiedWidth(YES, 0.0, 0.0) - 0.0) < 0.001);
 
     // 11. Top-right occlusion region rect for UIView.reservedRegions(kind: .occlusion)
     CGRect occDefault = PTDuoTopRightOcclusionRect(CGRectMake(0, 0, 1000, 720), 32.0, 0.0);
-    assert(fabs(occDefault.origin.x - 940.0) < 0.001 && fabs(occDefault.origin.y - 0.0) < 0.001
-           && fabs(occDefault.size.width - 60.0) < 0.001 && fabs(occDefault.size.height - 32.0) < 0.001);
-    // Downstream trailing-rail view positioned via maxY+12, midX-6 (48x106) -> {940, 44, 48, 106}
+    assert(fabs(occDefault.origin.x - 948.0) < 0.001 && fabs(occDefault.origin.y - 0.0) < 0.001
+           && fabs(occDefault.size.width - 52.0) < 0.001 && fabs(occDefault.size.height - 32.0) < 0.001);
+    // Downstream trailing-rail view positioned via maxY+12, midX-6 (48x106) -> {944, 44, 48, 106}
     CGRect vfRect = CGRectMake(CGRectGetMidX(occDefault) - 6.0 - 24.0, CGRectGetMaxY(occDefault) + 12.0, 48.0, 106.0);
-    assert(fabs(vfRect.origin.x - 940.0) < 0.001 && fabs(vfRect.origin.y - 44.0) < 0.001);
+    assert(fabs(vfRect.origin.x - 944.0) < 0.001 && fabs(vfRect.origin.y - 44.0) < 0.001);
     assert(PTDuoRectLooksLikeSubstantialSidebar(vfRect, CGRectMake(0, 0, 1000, 720), NO, 2) == YES);
     // With visible top pill reaching y=56 -> occlusion expands to 56pt
     CGRect occPill = PTDuoTopRightOcclusionRect(CGRectMake(0, 0, 1000, 720), 32.0, 56.0);
     assert(fabs(occPill.size.height - 56.0) < 0.001);
     // Narrow window -> CGRectNull
     assert(CGRectIsNull(PTDuoTopRightOcclusionRect(CGRectMake(0, 0, 500, 720), 32.0, 0.0)));
-    // Width sync with occupiedRightBarWidth: 72pt floating rail -> 72pt occlusion; 0pt collapsed -> stays 60pt
+    // Width sync with occupiedRightBarWidth: 72pt floating rail -> 72pt occlusion; 0pt collapsed -> stays 52pt
     CGRect occ72 = PTDuoTopRightOcclusionRectForOccupiedWidth(CGRectMake(0, 0, 1000, 720), 32.0, 0.0, 72.0);
     assert(fabs(occ72.origin.x - 928.0) < 0.001 && fabs(occ72.size.width - 72.0) < 0.001 && fabs(occ72.size.height - 32.0) < 0.001);
     CGRect occ0 = PTDuoTopRightOcclusionRectForOccupiedWidth(CGRectMake(0, 0, 1000, 720), 32.0, 0.0, 0.0);
-    assert(fabs(occ0.origin.x - 940.0) < 0.001 && fabs(occ0.size.width - 60.0) < 0.001 && fabs(occ0.size.height - 32.0) < 0.001);
+    assert(fabs(occ0.origin.x - 948.0) < 0.001 && fabs(occ0.size.width - 52.0) < 0.001 && fabs(occ0.size.height - 32.0) < 0.001);
     CGRect occClamped = PTDuoTopRightOcclusionRectForOccupiedWidth(CGRectMake(0, 0, 1000, 720), 32.0, 0.0, 110.0);
     assert(fabs(occClamped.origin.x - 916.0) < 0.001 && fabs(occClamped.size.width - 84.0) < 0.001);
 
@@ -467,17 +471,17 @@ int main(void) {
 
     // 13. Safe-area drift reconciliation & post-mount notification rules
     // Occupied width change triggers notification
-    assert(PTDuoShouldNotifySafeAreaChange(0.0, 60.0, 0.0, 60.0, NO, NO, 0) == YES);
-    assert(PTDuoShouldNotifySafeAreaChange(60.0, 0.0, 60.0, 0.0, NO, NO, 0) == YES);
-    // Steady occupied width (60 -> 60) with actual window inset drifted to 0 triggers reconciliation up to 3 retries
-    assert(PTDuoShouldNotifySafeAreaChange(60.0, 60.0, 0.0, 60.0, NO, NO, 0) == YES);
-    assert(PTDuoShouldNotifySafeAreaChange(60.0, 60.0, 0.0, 60.0, NO, NO, 2) == YES);
-    assert(PTDuoShouldNotifySafeAreaChange(60.0, 60.0, 0.0, 60.0, NO, NO, 3) == NO);
+    assert(PTDuoShouldNotifySafeAreaChange(0.0, 52.0, 0.0, 52.0, NO, NO, 0) == YES);
+    assert(PTDuoShouldNotifySafeAreaChange(52.0, 0.0, 52.0, 0.0, NO, NO, 0) == YES);
+    // Steady occupied width (52 -> 52) with actual window inset drifted to 0 triggers reconciliation up to 3 retries
+    assert(PTDuoShouldNotifySafeAreaChange(52.0, 52.0, 0.0, 52.0, NO, NO, 0) == YES);
+    assert(PTDuoShouldNotifySafeAreaChange(52.0, 52.0, 0.0, 52.0, NO, NO, 2) == YES);
+    assert(PTDuoShouldNotifySafeAreaChange(52.0, 52.0, 0.0, 52.0, NO, NO, 3) == NO);
     // Post-mount host visibility or epoch transition while occupied > 0 triggers notification even at retry cap
-    assert(PTDuoShouldNotifySafeAreaChange(60.0, 60.0, 60.0, 60.0, NO, YES, 3) == YES);
-    assert(PTDuoShouldNotifySafeAreaChange(60.0, 60.0, 60.0, 60.0, YES, NO, 3) == YES);
+    assert(PTDuoShouldNotifySafeAreaChange(52.0, 52.0, 52.0, 52.0, NO, YES, 3) == YES);
+    assert(PTDuoShouldNotifySafeAreaChange(52.0, 52.0, 52.0, 52.0, YES, NO, 3) == YES);
     // Steady state with matching actual inset and no mount/epoch edge -> NO churn
-    assert(PTDuoShouldNotifySafeAreaChange(60.0, 60.0, 60.0, 60.0, NO, NO, 0) == NO);
+    assert(PTDuoShouldNotifySafeAreaChange(52.0, 52.0, 52.0, 52.0, NO, NO, 0) == NO);
     assert(PTDuoShouldNotifySafeAreaChange(0.0, 0.0, 0.0, 0.0, YES, NO, 0) == NO);
 
     // 14. Settled window-resize viewWillTransitionToSize:withTransitionCoordinator: dispatch rules
@@ -685,6 +689,18 @@ int main(void) {
     assert(PTDuoColorsHaveContrast(1.0, 1.0, 1.0, 1.0, 0.06, 0.62, 0.35, 1.0) == YES); // white '+' on green pill
     assert(PTDuoColorsHaveContrast(0.06, 0.62, 0.35, 1.0, 0.07, 0.61, 0.36, 1.0) == NO); // no contrast
     assert(PTDuoColorsHaveContrast(1.0, 1.0, 1.0, 0.0, 0.06, 0.62, 0.35, 1.0) == NO); // transparent
+
+    // 31. Selected-tab blank placeholder & transparent-alpha placeholder helpers
+    assert(PTDuoTabItemSlotNeedsOverlay(YES, YES, YES, NO, YES) == YES);  // Selected tab uses blank selectedImage even if unselected image exists
+    assert(PTDuoTabItemSlotNeedsOverlay(YES, YES, NO, YES, YES) == NO);   // Selected tab has real selectedImage
+    assert(PTDuoTabItemSlotNeedsOverlay(YES, NO, YES, YES, YES) == YES);  // Selected tab falls back to blank image
+    assert(PTDuoTabItemSlotNeedsOverlay(NO, YES, YES, NO, YES) == NO);    // Unselected tab uses real image
+    assert(PTDuoTabItemSlotNeedsOverlay(YES, YES, YES, YES, NO) == NO);   // Non-blank title does not need blank-slot overlay
+    uint8_t emptyAlpha[16] = {0};
+    assert(PTDuoAlphaBufferHasVisiblePixels(emptyAlpha, 16) == NO);
+    uint8_t visibleAlpha[16] = {0};
+    visibleAlpha[7] = 12;
+    assert(PTDuoAlphaBufferHasVisiblePixels(visibleAlpha, 16) == YES);
 
     printf("ALL_MATH_CHECKS_PASSED\n");
     return 0;

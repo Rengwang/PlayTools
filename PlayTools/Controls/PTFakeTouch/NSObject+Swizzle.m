@@ -424,16 +424,24 @@ static double pt_cachedCustomScaler(void) {
     }
 }
 
+static __thread NSInteger pt_insideAllowedWindowSetFrameDepth = 0;
+
 - (void) pt_hook_UIWindow_setFrame:(CGRect)frame {
     if ([self isKindOfClass:[UIWindow class]]
         && [PlayScreen interceptWindowSetFrame:(UIWindow *)self frame:frame]) {
         return;
     }
-    [self pt_hook_UIWindow_setFrame:frame];
+    pt_insideAllowedWindowSetFrameDepth++;
+    @try {
+        [self pt_hook_UIWindow_setFrame:frame];
+    } @finally {
+        pt_insideAllowedWindowSetFrameDepth--;
+    }
 }
 
 - (void) pt_hook_UIWindow_setBounds:(CGRect)bounds {
-    if (pt_isPlayScreenScaledMode()
+    if (pt_insideAllowedWindowSetFrameDepth == 0
+        && (pt_isPlayScreenScaledMode() || pt_isPlayScreenAdaptiveLiveResizePacing())
         && [self isKindOfClass:[UIWindow class]]
         && [PlayScreen interceptWindowSetBounds:(UIWindow *)self bounds:bounds]) {
         return;

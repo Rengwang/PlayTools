@@ -3086,6 +3086,7 @@ static void pt_installTerminationWatchdog(void) {
 }
 
 static _Atomic(bool) pt_playScreenScaledMode = false;
+static _Atomic(bool) pt_playScreenAdaptiveLiveResizePacing = false;
 
 void pt_setPlayScreenScaledMode(BOOL isScaled) {
     atomic_store_explicit(&pt_playScreenScaledMode, isScaled ? true : false, memory_order_relaxed);
@@ -3093,6 +3094,14 @@ void pt_setPlayScreenScaledMode(BOOL isScaled) {
 
 BOOL pt_isPlayScreenScaledMode(void) {
     return atomic_load_explicit(&pt_playScreenScaledMode, memory_order_relaxed) ? YES : NO;
+}
+
+void pt_setPlayScreenAdaptiveLiveResizePacing(BOOL active) {
+    atomic_store_explicit(&pt_playScreenAdaptiveLiveResizePacing, active ? true : false, memory_order_relaxed);
+}
+
+BOOL pt_isPlayScreenAdaptiveLiveResizePacing(void) {
+    return atomic_load_explicit(&pt_playScreenAdaptiveLiveResizePacing, memory_order_relaxed) ? YES : NO;
 }
 
 static void (*pt_origVBLogTestedFaults)(id, SEL, const void *) = NULL;
@@ -4107,18 +4116,22 @@ static void pt_installGlassEffectCompatibilityGuard(void) {
 
 static void (*pt_origTabBarLayoutSubviews)(id, SEL) = NULL;
 static void (*pt_origTabBarTraitCollectionDidChange)(id, SEL, UITraitCollection *) = NULL;
+static void (*pt_origTabBarSetSelectedItem)(id, SEL, UITabBarItem *) = NULL;
 static BOOL pt_floatingTabBarGuardInstalled = NO;
 static const void *kPTFloatingTabBarStyledKey = &kPTFloatingTabBarStyledKey;
 static const void *kPTFloatingTabBarStateKey = &kPTFloatingTabBarStateKey;
 static const void *kPTCustomTabBarHiddenPlattersKey = &kPTCustomTabBarHiddenPlattersKey;
+static const void *kPTCustomTabBarPlatterDeferredKey = &kPTCustomTabBarPlatterDeferredKey;
 
 static BOOL pt_isSystemTabBarSubviewClassName(NSString *clsName) {
     if (clsName.length == 0) {
         return YES;
     }
+    if ([clsName hasPrefix:@"_Tt"]) {
+        return [clsName containsString:@"UIKit"] || [clsName containsString:@"SwiftUI"];
+    }
     return [clsName hasPrefix:@"UI"] ||
            [clsName hasPrefix:@"_UI"] ||
-           [clsName hasPrefix:@"_Tt"] ||
            [clsName hasPrefix:@"NS"] ||
            [clsName hasPrefix:@"CA"];
 }
@@ -4137,13 +4150,17 @@ static BOOL pt_isVisuallyEmptyTabBarImage(UIImage *image) {
         return YES;
     }
     CGSize size = image.size;
+    if (!isfinite(size.width) || !isfinite(size.height)) {
+        return YES;
+    }
     return size.width <= 2.0 && size.height <= 2.0;
 }
 
 static BOOL pt_tabBarItemsAreEmpty(UITabBar *tabBar) {
     NSArray<UITabBarItem *> *items = tabBar.items;
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
     for (UITabBarItem *item in items) {
-        if (item.title.length > 0) {
+        if ([item.title stringByTrimmingCharactersInSet:ws].length > 0) {
             return NO;
         }
         if (!pt_isVisuallyEmptyTabBarImage(item.image) ||
@@ -4154,33 +4171,104 @@ static BOOL pt_tabBarItemsAreEmpty(UITabBar *tabBar) {
     return YES;
 }
 
+typedef struct {
+    CGFloat x0;
+    CGFloat x1;
+} PTCustomTabBarSpan;
+
+static BOOL pt_tabBarHasCustomReplacementSubviews(UITabBar *tabBar) {
+    CGFloat width = CGRectGetWidth(tabBar.bounds);
+    if (width <= 1.0) {
+        return NO;
+    }
+
+    enum { kPTMaxCustomTabSpans = 32 };
+    PTCustomTabBarSpan spans[kPTMaxCustomTabSpans];
+    NSUInteger spanCount = 0;
+    NSUInteger customCount = 0;
+    CGFloat minX = width;
+    CGFloat maxX = 0.0;
+
+    for (UIView *subview in tabBar.subviews) {
+        if (subview.hidden || subview.alpha <= 0.01) {
+            continue;
+        }
+        NSString *clsName = NSStringFromClass([subview class]);
+        if (pt_isSystemTabBarSubviewClassName(clsName) ||
+            pt_isTabBarPlatterClassName(clsName)) {
+            continue;
+        }
+        CGRect frame = subview.frame;
+        if (CGRectGetHeight(frame) < 28.0) {
+            continue;
+        }
+        CGFloat x0 = MAX(0.0, CGRectGetMinX(frame));
+        CGFloat x1 = MIN(width, CGRectGetMaxX(frame));
+        CGFloat clampedW = x1 - x0;
+        if (clampedW >= width * 0.75) {
+            return YES;
+        }
+        if (clampedW >= 20.0) {
+            customCount++;
+            if (x0 < minX) {
+                minX = x0;
+            }
+            if (x1 > maxX) {
+                maxX = x1;
+            }
+            if (spanCount < kPTMaxCustomTabSpans) {
+                spans[spanCount++] = (PTCustomTabBarSpan){ x0, x1 };
+            }
+        }
+    }
+
+    if (customCount < 2 || spanCount == 0) {
+        return NO;
+    }
+
+    for (NSUInteger i = 1; i < spanCount; i++) {
+        PTCustomTabBarSpan key = spans[i];
+        NSUInteger j = i;
+        while (j > 0 && spans[j - 1].x0 > key.x0) {
+            spans[j] = spans[j - 1];
+            j--;
+        }
+        spans[j] = key;
+    }
+
+    CGFloat coveredWidth = 0.0;
+    CGFloat curStart = spans[0].x0;
+    CGFloat curEnd = spans[0].x1;
+    for (NSUInteger i = 1; i < spanCount; i++) {
+        if (spans[i].x0 <= curEnd) {
+            if (spans[i].x1 > curEnd) {
+                curEnd = spans[i].x1;
+            }
+        } else {
+            coveredWidth += (curEnd - curStart);
+            curStart = spans[i].x0;
+            curEnd = spans[i].x1;
+        }
+    }
+    coveredWidth += (curEnd - curStart);
+
+    return coveredWidth >= width * 0.50 ||
+           (customCount >= 3 && (maxX - minX) >= width * 0.55);
+}
+
 // On iOS 26/27 Catalyst, _UITabBarVisualProvider_Floating still installs a floating
 // _UITabBarItemPlatterView/_UILiquidLensView selection pill even when an app replaces
-// UITabBar with a full-width custom subview and leaves all native UITabBarItems empty.
-static void pt_updateCustomTabBarPlatterVisibility(UITabBar *tabBar) {
+// UITabBar with a full-width custom subview (or multiple per-item custom buttons)
+// and leaves all native UITabBarItems empty.
+static void pt_updateCustomTabBarPlatterVisibilityInternal(UITabBar *tabBar, BOOL allowDeferred) {
     CGFloat width = CGRectGetWidth(tabBar.bounds);
     CGFloat height = CGRectGetHeight(tabBar.bounds);
     if (width <= 1.0 || height <= 1.0) {
         return;
     }
 
-    BOOL hasCustomReplacement = NO;
-    for (UIView *subview in tabBar.subviews) {
-        if (subview.hidden || subview.alpha <= 0.01) {
-            continue;
-        }
-        NSString *clsName = NSStringFromClass([subview class]);
-        if (pt_isSystemTabBarSubviewClassName(clsName)) {
-            continue;
-        }
-        CGRect frame = subview.frame;
-        if (CGRectGetWidth(frame) >= width * 0.75 && CGRectGetHeight(frame) >= 28.0) {
-            hasCustomReplacement = YES;
-            break;
-        }
-    }
-
-    BOOL shouldHidePlatter = hasCustomReplacement && pt_tabBarItemsAreEmpty(tabBar);
+    BOOL itemsEmpty = pt_tabBarItemsAreEmpty(tabBar);
+    BOOL shouldHidePlatter = itemsEmpty && pt_tabBarHasCustomReplacementSubviews(tabBar);
     NSHashTable<UIView *> *hiddenPlatters = objc_getAssociatedObject(tabBar, kPTCustomTabBarHiddenPlattersKey);
 
     if (shouldHidePlatter) {
@@ -4201,18 +4289,48 @@ static void pt_updateCustomTabBarPlatterVisibility(UITabBar *tabBar) {
             }
         }
         [CATransaction commit];
-    } else if (hiddenPlatters.count > 0) {
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        for (UIView *platter in hiddenPlatters) {
-            if (platter.superview == tabBar && platter.hidden) {
-                platter.hidden = NO;
+    } else {
+        if (hiddenPlatters.count > 0) {
+            [CATransaction begin];
+            [CATransaction setDisableActions:YES];
+            for (UIView *platter in hiddenPlatters) {
+                if (platter.superview == tabBar && platter.hidden) {
+                    platter.hidden = NO;
+                }
+            }
+            objc_setAssociatedObject(tabBar, kPTCustomTabBarHiddenPlattersKey,
+                                     nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            [CATransaction commit];
+        }
+        if (allowDeferred && itemsEmpty &&
+            objc_getAssociatedObject(tabBar, kPTCustomTabBarPlatterDeferredKey) == nil) {
+            BOOL hasVisiblePlatter = NO;
+            for (UIView *subview in tabBar.subviews) {
+                if (!subview.hidden && pt_isTabBarPlatterClassName(NSStringFromClass([subview class]))) {
+                    hasVisiblePlatter = YES;
+                    break;
+                }
+            }
+            if (hasVisiblePlatter) {
+                objc_setAssociatedObject(tabBar, kPTCustomTabBarPlatterDeferredKey,
+                                         @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                __weak UITabBar *weakTabBar = tabBar;
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    UITabBar *strongTabBar = weakTabBar;
+                    if (!strongTabBar) {
+                        return;
+                    }
+                    objc_setAssociatedObject(strongTabBar, kPTCustomTabBarPlatterDeferredKey,
+                                             nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    pt_updateCustomTabBarPlatterVisibilityInternal(strongTabBar, NO);
+                });
             }
         }
-        objc_setAssociatedObject(tabBar, kPTCustomTabBarHiddenPlattersKey,
-                                 nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        [CATransaction commit];
     }
+}
+
+static void pt_updateCustomTabBarPlatterVisibility(UITabBar *tabBar) {
+    pt_updateCustomTabBarPlatterVisibilityInternal(tabBar, YES);
 }
 
 typedef struct {
@@ -4314,6 +4432,13 @@ static void pt_tabBarLayoutSubviews(UITabBar *self, SEL _cmd) {
     pt_updateFloatingTabBarCapsule(self);
 }
 
+static void pt_tabBarSetSelectedItem(UITabBar *self, SEL _cmd, UITabBarItem *item) {
+    if (pt_origTabBarSetSelectedItem) {
+        pt_origTabBarSetSelectedItem(self, _cmd, item);
+    }
+    pt_updateCustomTabBarPlatterVisibility(self);
+}
+
 static void pt_tabBarTraitCollectionDidChange(UITabBar *self,
                                               SEL _cmd,
                                               UITraitCollection *previousTraitCollection) {
@@ -4344,6 +4469,16 @@ static void pt_installFloatingTabBarCapsuleGuard(void) {
             pt_origTabBarLayoutSubviews = (void (*)(id, SEL))origImp;
             class_replaceMethod(tabBarCls, @selector(layoutSubviews),
                                 (IMP)pt_tabBarLayoutSubviews, method_getTypeEncoding(layoutM));
+        }
+    }
+
+    Method selectedItemM = class_getInstanceMethod(tabBarCls, @selector(setSelectedItem:));
+    if (selectedItemM) {
+        IMP origImp = method_getImplementation(selectedItemM);
+        if (origImp != (IMP)pt_tabBarSetSelectedItem) {
+            pt_origTabBarSetSelectedItem = (void (*)(id, SEL, UITabBarItem *))origImp;
+            class_replaceMethod(tabBarCls, @selector(setSelectedItem:),
+                                (IMP)pt_tabBarSetSelectedItem, method_getTypeEncoding(selectedItemM));
         }
     }
 

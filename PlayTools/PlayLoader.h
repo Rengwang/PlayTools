@@ -21,6 +21,8 @@ __attribute__((visibility("hidden"))) void pt_initializePlatformIdentity(void);
 void pt_markAppTerminating(void);
 void pt_setPlayScreenScaledMode(BOOL isScaled);
 BOOL pt_isPlayScreenScaledMode(void);
+void pt_setPlayScreenAdaptiveLiveResizePacing(BOOL active);
+BOOL pt_isPlayScreenAdaptiveLiveResizePacing(void);
 BOOL PTShouldEnableDuoVerticalBar(void);
 void pt_seedWindowTransitionSizeBaselineIfNeeded(UIWindow *window, CGSize baselineSize);
 void pt_recordRootViewControllerSizeTransition(UIViewController *viewController, CGSize size);
