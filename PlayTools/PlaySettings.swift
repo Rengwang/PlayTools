@@ -125,6 +125,8 @@ let settings = PlaySettings.shared
 
     @objc lazy var enableScrollWheel = settingsData.enableScrollWheel
 
+    lazy var scrollWheelSpeed = CGFloat(settingsData.scrollWheelSpeed ?? 4)
+
     @objc lazy var optionScrollZoom = settingsData.optionScrollZoom
 
     @objc lazy var touchAlternatives = settingsData.touchAlternatives
@@ -219,6 +221,7 @@ struct AppSettingsData: Codable {
     var rootWorkDir = true
     var noKMOnInput = false
     var enableScrollWheel = true
+    var scrollWheelSpeed: Float?
     var optionScrollZoom = true
     var touchAlternatives = true
     var hideTitleBar = true
@@ -279,6 +282,7 @@ struct AppSettingsData: Codable {
         rootWorkDir = try container.decodeIfPresent(Bool.self, forKey: .rootWorkDir) ?? true
         noKMOnInput = try container.decodeIfPresent(Bool.self, forKey: .noKMOnInput) ?? false
         enableScrollWheel = try container.decodeIfPresent(Bool.self, forKey: .enableScrollWheel) ?? true
+        scrollWheelSpeed = try container.decodeIfPresent(Float.self, forKey: .scrollWheelSpeed)
         optionScrollZoom = try container.decodeIfPresent(Bool.self, forKey: .optionScrollZoom) ?? true
         touchAlternatives = try container.decodeIfPresent(Bool.self, forKey: .touchAlternatives) ?? true
         hideTitleBar = try container.decodeIfPresent(Bool.self, forKey: .hideTitleBar) ?? true

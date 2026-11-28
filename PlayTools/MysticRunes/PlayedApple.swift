@@ -257,11 +257,22 @@ extension PlayKeychain {
 
         // Generate ephemeral native keys. On macOS the legacy pair API may write to the
         // system keychain even when its permanence flags are false.
+        // Also strip Secure Enclave token/access-control attributes when persisting into
+        // PlayChain so software keys can be exported into the local database.
         var nativeParameters = topLevel
         let permanenceKey = kSecAttrIsPermanent as String
+        var nativePrivateOverrides = privateOverrides
+        var nativePublicOverrides = publicOverrides
+        if permanent.keyPrivate || permanent.keyPublic {
+            nativeParameters.removeValue(forKey: kSecAttrTokenID as String)
+            nativePrivateOverrides.removeValue(forKey: kSecAttrAccessControl as String)
+            nativePublicOverrides.removeValue(forKey: kSecAttrAccessControl as String)
+        }
         nativeParameters[permanenceKey] = false
-        nativeParameters[kSecPrivateKeyAttrs as String] = privateOverrides.merging([permanenceKey: false]) { _, off in off }
-        nativeParameters[kSecPublicKeyAttrs as String] = publicOverrides.merging([permanenceKey: false]) { _, off in off }
+        nativeParameters[kSecPrivateKeyAttrs as String] = nativePrivateOverrides
+            .merging([permanenceKey: false]) { _, off in off }
+        nativeParameters[kSecPublicKeyAttrs as String] = nativePublicOverrides
+            .merging([permanenceKey: false]) { _, off in off }
         guard let privateKey = SecKeyCreateRandomKey(nativeParameters as CFDictionary, &error) else {
             if error == nil { error = keyError(errSecInternalError) }
             return nil

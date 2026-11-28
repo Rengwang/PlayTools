@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/sysctl.h>
+#include <sys/syscall.h>
 
 #import "PlayLoader.h"
 #import <QuartzCore/QuartzCore.h>
@@ -1359,6 +1360,19 @@ static char const* ue_fix_filename(char const* filename) {
     return last_p;
 }
 
+// Reach the real filesystem implementations through raw syscalls so in-app
+// SDKs that rebind libc symbols (fishhook) cannot recurse back into us.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+static inline int pt_real_open(const char *p, int f, int m) { return (int)syscall(SYS_open, p, f, m); }
+static inline int pt_real_stat(const char *p, struct stat *b) { return (int)syscall(SYS_stat64, p, b); }
+static inline int pt_real_access(const char *p, int m) { return (int)syscall(SYS_access, p, m); }
+static inline int pt_real_rename(const char *o, const char *n) { return (int)syscall(SYS_rename, o, n); }
+static inline int pt_real_unlink(const char *p) { return (int)syscall(SYS_unlink, p); }
+#pragma clang diagnostic pop
+
+static inline BOOL pt_fs_passthrough(void) { return ue_status != 2 || !ue_pattern_ready; }
+
 typedef int (*pt_open_fn)(char const* restrict, int, ...);
 typedef int (*pt_stat_fn)(char const* restrict, struct stat* restrict);
 typedef int (*pt_access_fn)(char const*, int);
@@ -1381,8 +1395,9 @@ DYLD_INTERPOSE(pt_unlink, unlink)
 DYLD_INTERPOSE(pt_usleep, usleep)
 
 PT_INTERPOSE_EXPORT int pt_open(char const* restrict filename, int oflag, ... ) {
-    filename = ue_fix_filename(filename);
-    pt_open_fn orig_fn = DYLD_INTERPOSE_ORIG(pt_open_fn, open);
+    if (!pt_fs_passthrough()) {
+        filename = ue_fix_filename(filename);
+    }
 
     if (oflag & O_CREAT) {
         int mod;
@@ -1391,26 +1406,31 @@ PT_INTERPOSE_EXPORT int pt_open(char const* restrict filename, int oflag, ... ) 
         mod = va_arg(ap, int);
         va_end(ap);
 
-        return orig_fn(filename, oflag, mod);
+        return pt_real_open(filename, oflag, mod);
     }
 
-    return orig_fn(filename, oflag);
+    return pt_real_open(filename, oflag, 0);
 }
 
 PT_INTERPOSE_EXPORT int pt_stat(char const* restrict path, struct stat* restrict buf) {
-    return DYLD_INTERPOSE_ORIG(pt_stat_fn, stat)(ue_fix_filename(path), buf);
+    char const* p = pt_fs_passthrough() ? path : ue_fix_filename(path);
+    return pt_real_stat(p, buf);
 }
 
 PT_INTERPOSE_EXPORT int pt_access(char const* path, int mode) {
-    return DYLD_INTERPOSE_ORIG(pt_access_fn, access)(ue_fix_filename(path), mode);
+    char const* p = pt_fs_passthrough() ? path : ue_fix_filename(path);
+    return pt_real_access(p, mode);
 }
 
 PT_INTERPOSE_EXPORT int pt_rename(char const* restrict old_name, char const* restrict new_name) {
-    return DYLD_INTERPOSE_ORIG(pt_rename_fn, rename)(ue_fix_filename(old_name), ue_fix_filename(new_name));
+    char const* o = pt_fs_passthrough() ? old_name : ue_fix_filename(old_name);
+    char const* n = pt_fs_passthrough() ? new_name : ue_fix_filename(new_name);
+    return pt_real_rename(o, n);
 }
 
 PT_INTERPOSE_EXPORT int pt_unlink(char const* path) {
-    return DYLD_INTERPOSE_ORIG(pt_unlink_fn, unlink)(ue_fix_filename(path));
+    char const* p = pt_fs_passthrough() ? path : ue_fix_filename(path);
+    return pt_real_unlink(p);
 }
 
 static NSMutableDictionary *thread_sleep_counters = nil;
